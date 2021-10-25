@@ -2,7 +2,6 @@ use bitcoincore_rpc::bitcoin as btc;
 use bitcoincore_rpc::{Auth, Client, RpcApi};
 use crossbeam_channel::Sender;
 use diesel::prelude::PgConnection;
-use diesel::Connection;
 use crate::Block;
 use log::{debug, error, info};
 use std::str::FromStr;
@@ -68,9 +67,7 @@ pub struct ForkScanner {
 }
 
 impl ForkScanner {
-    pub fn new(host: impl Into<String>, auth: Auth) -> ForkScannerResult<ForkScanner> {
-        let db_url = std::env::var("BLOCK_DATABASE_URL")?;
-        let db_conn = PgConnection::establish(&db_url)?;
+    pub fn new(db_conn: PgConnection, host: impl Into<String>, auth: Auth) -> ForkScannerResult<ForkScanner> {
         let client = Client::new(host.into(), auth)?;
         let best_hash = client.get_best_block_hash()?;
         let should_exit = Arc::new(AtomicBool::new(false));
@@ -99,6 +96,7 @@ impl ForkScanner {
                 Ok(block) => block.hash,
                 Err(e) => {
                     error!("Waiting for new block: {:#?}", e);
+                    println!("TJDEBUUUUUG erreasdf");
                     continue;
                 }
             };

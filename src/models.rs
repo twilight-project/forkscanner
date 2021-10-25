@@ -17,8 +17,9 @@ pub struct Block {
 impl Block {
     pub fn get_or_create(conn: &PgConnection, header: &GetBlockHeaderResult) -> QueryResult<Block> {
         use crate::schema::blocks::dsl::*;
-        let block = blocks.filter(hash.eq(header.hash.to_string()))
-            .get_result(conn);
+        let block = blocks
+            .find(header.hash.to_string())
+            .first::<Block>(conn);
 
         if let Err(diesel::result::Error::NotFound) = block {
             let prev_hash = header.previous_block_hash.map(|h| h.to_string());

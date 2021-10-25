@@ -6,4 +6,4 @@ mod schema;
 mod models;
 
 pub use models::Block;
-pub use scanner::ForkScanner;
+pub use scanner::{ForkScanner, ReorgMessage};
