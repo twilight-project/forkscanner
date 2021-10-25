@@ -1,0 +1,3 @@
+vec![
+"{\"hash\": \"\", \"confirmations\": 1, \"height\": 1, \"version\": 1, \"versionHex\": null, \"merkleroot\": \"\", \"time\": 4, \"mediantime\": null, \"nonce\": 6, \"bits\": \"8475757\", \"difficulty\": 98, \"chainwork\": \"7264\", \"n_tx\": 98, \"previous_block_hash\": \"\", \"next_block_hash\": null}"
+]
