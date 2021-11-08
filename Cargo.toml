@@ -6,7 +6,7 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-bitcoincore-rpc = "0.13.0"
+bitcoincore-rpc = "0.14.0"
 crossbeam-channel = "0.5.1"
 diesel = { version = "1.4.8", features = ["postgres"] }
 dotenv = "0.15.0"

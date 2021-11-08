@@ -1,14 +1,17 @@
 use bitcoincore_rpc::bitcoin as btc;
 use bitcoincore_rpc::{Auth, Client, RpcApi};
+use bitcoincore_rpc::bitcoincore_rpc_json::GetChainTipsResultStatus;
 use crossbeam_channel::Sender;
 use diesel::prelude::PgConnection;
-use crate::Block;
+use crate::{Block, Chaintip};
 use log::{debug, error, info};
 use std::str::FromStr;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
+use std::time::Duration;
+use std::thread::sleep;
 use thiserror::Error;
 
 const MAX_BLOCK_DEPTH: usize = 10;
@@ -37,8 +40,8 @@ pub enum ReorgMessage {
     ReorgDetected(String, Vec<(i64, String)>),
 }
 
-fn create_block_and_ancestors(client: &Client, conn: &PgConnection, block_hash: btc::BlockHash) -> ForkScannerResult<()> {
-    let mut hash = block_hash;
+fn create_block_and_ancestors(client: &Client, conn: &PgConnection, block_hash: &String) -> ForkScannerResult<()> {
+    let mut hash = btc::BlockHash::from_str(block_hash)?;
 
     for _ in 0..MAX_BLOCK_DEPTH {
         let bh = client.get_block_header_info(&hash)?;
@@ -60,26 +63,107 @@ fn create_block_and_ancestors(client: &Client, conn: &PgConnection, block_hash: 
 }
 
 pub struct ForkScanner {
-    best_hash: btc::BlockHash,
-    client: Client,
+    host: String,
+    clients: Vec<Client>,
     db_conn: PgConnection,
     should_exit: Arc<AtomicBool>,
 }
 
 impl ForkScanner {
-    pub fn new(db_conn: PgConnection, host: impl Into<String>, auth: Auth) -> ForkScannerResult<ForkScanner> {
-        let client = Client::new(host.into(), auth)?;
-        let best_hash = client.get_best_block_hash()?;
+    pub fn new(db_conn: PgConnection, host: &str, auth: Auth) -> ForkScannerResult<ForkScanner> {
+        let client = Client::new(host, auth)?;
         let should_exit = Arc::new(AtomicBool::new(false));
 
-        create_block_and_ancestors(&client, &db_conn, best_hash)?;
-
         Ok(ForkScanner {
-            best_hash,
-            client,
+            host: host.to_string(),
+            clients: vec![client],
             db_conn,
             should_exit,
         })
+    }
+
+    fn process_client(&self, client: &Client) {
+        let tips = match client.get_chain_tips() {
+            Ok(tips) => tips,
+            Err(e) => {
+                error!("rpc error {:?}", e);
+                sleep(Duration::from_millis(500));
+                return;
+            }
+        };
+
+        if let Err(e) = Chaintip::purge(&self.db_conn) {
+            error!("Error purging database {:?}", e);
+            sleep(Duration::from_millis(500));
+            return;
+        }
+
+        for tip in tips {
+            let hash = tip.hash.to_string();
+
+            match tip.status {
+                GetChainTipsResultStatus::HeadersOnly => {
+                    if let Err(e) = create_block_and_ancestors(client, &self.db_conn, &hash) {
+                        error!("Failed fetching ancestors {:?}", e);
+                        break;
+                    }
+                }
+                GetChainTipsResultStatus::ValidHeaders => {
+                    if let Err(e) = create_block_and_ancestors(client, &self.db_conn, &hash) {
+                        error!("Failed fetching ancestors {:?}", e);
+                        break;
+                    }
+                }
+                GetChainTipsResultStatus::Invalid => {
+                    if let Err(e) = Chaintip::set_invalid_fork(&self.db_conn, tip.height as i64, &hash, &self.host) {
+                        error!("Failed setting chaintip {:?}", e);
+                        break;
+                    }
+
+                    if let Err(e) = create_block_and_ancestors(client, &self.db_conn, &hash) {
+                        error!("Failed fetching ancestors {:?}", e);
+                        break;
+                    }
+
+                    if let Err(e) = Block::set_invalid(&self.db_conn, &hash, &self.host) {
+                        error!("Failed setting valid {:?}", e);
+                        break;
+                    }
+                }
+                GetChainTipsResultStatus::ValidFork => {
+                    if let Err(e) = Chaintip::set_valid_fork(&self.db_conn, tip.height as i64, &hash, &self.host) {
+                        error!("Failed setting chaintip {:?}", e);
+                        break;
+                    }
+
+                    if let Err(e) = create_block_and_ancestors(client, &self.db_conn, &hash) {
+                        error!("Failed fetching ancestors {:?}", e);
+                        break;
+                    }
+
+                    if let Err(e) = Block::set_valid(&self.db_conn, &hash, &self.host) {
+                        error!("Failed setting valid {:?}", e);
+                        break;
+                    }
+                }
+                GetChainTipsResultStatus::Active => {
+                    if let Err(e) = Chaintip::set_active_tip(&self.db_conn, tip.height as i64, &hash, &self.host) {
+                        error!("Failed setting chaintip {:?}", e);
+                        break;
+                    }
+
+                    if let Err(e) = create_block_and_ancestors(client, &self.db_conn, &hash) {
+                        error!("Failed fetching ancestors {:?}", e);
+                        break;
+                    }
+
+                    if let Err(e) = Block::set_valid(&self.db_conn, &hash, &self.host) {
+                        error!("Failed setting valid {:?}", e);
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     // We initialized with get_best_block_hash, now we just poll continually
@@ -92,44 +176,13 @@ impl ForkScanner {
                 break;
             }
 
-            let latest = match self.client.wait_for_new_block(5000) {
-                Ok(block) => block.hash,
-                Err(e) => {
-                    error!("Waiting for new block: {:#?}", e);
-                    println!("TJDEBUUUUUG erreasdf");
-                    continue;
-                }
-            };
-
-            if latest == self.best_hash {
-                debug!("Nothing changed");
-                continue;
+            for client in &self.clients {
+                self.process_client(&client);
             }
 
-            match create_block_and_ancestors(&self.client, &self.db_conn, latest) {
-                Err(e) => error!("Failed fetching ancestors {:?}", e),
-                _ => ()
-            }
 
-            self.best_hash = latest;
-
-            match Block::find_fork(&self.db_conn) {
-                Ok(result) => {
-                    debug!("Got result {:?}", result);
-                    if result.len() > 0 {
-                        // find_fork filters on parent_hash not null, so unwrap is ok
-                        let hash = &result[0].0.as_ref().unwrap();
-                        let tips = Block::find_tips(&self.db_conn, &hash).expect("Database error.");
-
-                        let message = ReorgMessage::ReorgDetected(hash.to_string(), tips);
-                        channel.send(message).expect("broken channel");
-                    } else {
-                        let message = ReorgMessage::TipUpdated(latest.to_string());
-                        channel.send(message).expect("broken channel");
-                    }
-                }
-                Err(e) => error!("Fork query failed: {:?}", e),
-            }
+            // TODO: check ancestries....
+            sleep(Duration::from_millis(10000));
         }
     }
 }
