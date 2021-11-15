@@ -1,5 +1,5 @@
 -- This file should undo anything in `up.sql`
+DROP TABLE valid_blocks;
+DROP TABLE invalid_blocks;
 DROP TABLE chaintips;
-
-ALTER TABLE blocks DROP COLUMN marked_valid;
-ALTER TABLE blocks DROP COLUMN marked_invalid;
+DROP TABLE nodes;

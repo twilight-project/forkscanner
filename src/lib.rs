@@ -1,9 +1,9 @@
 #[macro_use]
 extern crate diesel;
 
+mod models;
 mod scanner;
 mod schema;
-mod models;
 
-pub use models::{Block, Chaintip};
+pub use models::{Block, Chaintip, InvalidBlock, Node, ValidBlock};
 pub use scanner::{ForkScanner, ReorgMessage};

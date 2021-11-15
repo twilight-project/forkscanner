@@ -1,15 +1,15 @@
 use bitcoincore_rpc::bitcoincore_rpc_json::GetBlockHeaderResult;
+use chrono::prelude::*;
 use diesel::prelude::*;
 use diesel::result::QueryResult;
 
-use crate::schema::{blocks, chaintips};
+use crate::schema::{blocks, chaintips, invalid_blocks, nodes, valid_blocks};
 
-
-#[derive(Debug, QueryableByName, Queryable, Insertable)]
+#[derive(Debug, AsChangeset, QueryableByName, Queryable, Insertable)]
 #[table_name = "chaintips"]
 pub struct Chaintip {
     pub id: i64,
-    pub node: String,
+    pub node: i64,
     pub status: String,
     pub block: String,
     pub height: i64,
@@ -17,6 +17,30 @@ pub struct Chaintip {
 }
 
 impl Chaintip {
+    pub fn update(&self, conn: &PgConnection) -> QueryResult<usize> {
+        use crate::schema::chaintips::dsl::*;
+        diesel::update(chaintips.filter(id.eq(self.id)))
+            .set(self)
+            .execute(conn)
+    }
+
+    pub fn get_active(conn: &PgConnection, node_id: i64) -> QueryResult<Chaintip> {
+        use crate::schema::chaintips::dsl::*;
+        chaintips
+            .filter(node.eq(node_id).and(status.eq("active")))
+            .first(conn)
+    }
+
+    pub fn list_active_no_parent(
+        conn: &PgConnection,
+        tip_height: i64,
+    ) -> QueryResult<Vec<Chaintip>> {
+        use crate::schema::chaintips::dsl::*;
+        chaintips
+            .filter(height.lt(tip_height).and(status.eq("active")))
+            .load(conn)
+    }
+
     pub fn purge(conn: &PgConnection) -> QueryResult<usize> {
         use crate::schema::chaintips::dsl::*;
         use diesel::dsl::not;
@@ -25,72 +49,82 @@ impl Chaintip {
             .execute(conn)
     }
 
-    pub fn set_invalid_fork(conn: &PgConnection, block_height: i64, hash: &String, node_id: &String) -> QueryResult<usize> {
+    pub fn set_invalid_fork(
+        conn: &PgConnection,
+        block_height: i64,
+        hash: &String,
+        node_id: i64,
+    ) -> QueryResult<usize> {
         use crate::schema::chaintips::dsl::*;
         diesel::insert_into(chaintips)
             .values((
                 node.eq(node_id),
                 block.eq(hash),
                 height.eq(block_height),
-                status.eq("invalid")
+                status.eq("invalid"),
             ))
             .execute(conn)
     }
 
-    pub fn set_valid_fork(conn: &PgConnection, block_height: i64, hash: &String, node_id: &String) -> QueryResult<usize> {
+    pub fn set_valid_fork(
+        conn: &PgConnection,
+        block_height: i64,
+        hash: &String,
+        node_id: i64,
+    ) -> QueryResult<usize> {
         use crate::schema::chaintips::dsl::*;
         diesel::insert_into(chaintips)
             .values((
                 node.eq(node_id),
                 block.eq(hash),
                 height.eq(block_height),
-                status.eq("valid-fork")
+                status.eq("valid-fork"),
             ))
             .execute(conn)
     }
 
-    pub fn set_active_tip(conn: &PgConnection, block_height: i64, hash: &String, node_id: &String) -> QueryResult<usize> {
+    pub fn set_active_tip(
+        conn: &PgConnection,
+        block_height: i64,
+        hash: &String,
+        node_id: i64,
+    ) -> QueryResult<usize> {
         use crate::schema::chaintips::dsl::*;
-        let tip = chaintips.filter(
-            status.eq("active").and(node.eq(node_id))
-        ).first::<Chaintip>(conn);
+        let tip = chaintips
+            .filter(status.eq("active").and(node.eq(node_id)))
+            .first::<Chaintip>(conn);
 
         match tip {
             Ok(tip) => {
                 if &tip.block != hash {
                     // remove parent chaintip references....
-                    diesel::update(
-                        chaintips.filter(parent_chaintip.eq(tip.id))
-                    ).set(parent_chaintip.eq::<Option<i64>>(None))
+                    diesel::update(chaintips.filter(parent_chaintip.eq(tip.id)))
+                        .set(parent_chaintip.eq::<Option<i64>>(None))
                         .execute(conn)?;
 
-                    diesel::update(
-                        chaintips.filter(id.eq(tip.id))
-                    ).set((
-                        block.eq(hash),
-                        height.eq(block_height),
-                        parent_chaintip.eq::<Option<i64>>(None)
-                    ))
-                          .execute(conn)
+                    diesel::update(chaintips.filter(id.eq(tip.id)))
+                        .set((
+                            block.eq(hash),
+                            height.eq(block_height),
+                            parent_chaintip.eq::<Option<i64>>(None),
+                        ))
+                        .execute(conn)
                 } else {
                     Ok(0)
                 }
             }
-            Err(diesel::result::Error::NotFound) => {
-                diesel::insert_into(chaintips)
-                    .values((
-                        node.eq(node_id),
-                        status.eq("active"),
-                        block.eq(hash),
-                        height.eq(block_height)
-                    ))
-                    .execute(conn)
-            }
+            Err(diesel::result::Error::NotFound) => diesel::insert_into(chaintips)
+                .values((
+                    node.eq(node_id),
+                    status.eq("active"),
+                    block.eq(hash),
+                    height.eq(block_height),
+                ))
+                .execute(conn),
             Err(e) => Err(e),
         }
     }
 }
-
 
 #[derive(QueryableByName, Queryable, Insertable)]
 #[table_name = "blocks"]
@@ -99,16 +133,17 @@ pub struct Block {
     pub height: i64,
     pub parent_hash: Option<String>,
     pub connected: bool,
-    pub marked_valid: Option<String>,
-    pub marked_invalid: Option<String>,
 }
 
 impl Block {
+    pub fn get(conn: &PgConnection, block_hash: &String) -> QueryResult<Block> {
+        use crate::schema::blocks::dsl::*;
+        blocks.find(block_hash).first(conn)
+    }
+
     pub fn get_or_create(conn: &PgConnection, header: &GetBlockHeaderResult) -> QueryResult<Block> {
         use crate::schema::blocks::dsl::*;
-        let block = blocks
-            .find(header.hash.to_string())
-            .first::<Block>(conn);
+        let block = blocks.find(header.hash.to_string()).first::<Block>(conn);
 
         if let Err(diesel::result::Error::NotFound) = block {
             let prev_hash = header.previous_block_hash.map(|h| h.to_string());
@@ -117,8 +152,6 @@ impl Block {
                 hash: header.hash.to_string(),
                 height: header.height as i64,
                 parent_hash: prev_hash,
-                marked_valid: None,
-                marked_invalid: None,
                 connected: false,
             };
 
@@ -135,19 +168,42 @@ impl Block {
         }
     }
 
-    pub fn set_valid(conn: &PgConnection, block_hash: &String, node: &String) -> QueryResult<usize> {
-        use crate::schema::blocks::dsl::*;
-        diesel::update(
-            blocks.filter(hash.eq(block_hash).and(marked_valid.is_null())
-        )).set(marked_valid.eq(node))
+    /// Node has marked block valid.
+    pub fn set_valid(conn: &PgConnection, block_hash: &String, node_id: i64) -> QueryResult<usize> {
+        use crate::schema::valid_blocks::dsl::*;
+
+        let block = ValidBlock {
+            hash: block_hash.to_string(),
+            node: node_id,
+        };
+
+        diesel::insert_into(valid_blocks)
+            .values(block)
             .execute(conn)
     }
 
-    pub fn set_invalid(conn: &PgConnection, block_hash: &String, node: &String) -> QueryResult<usize> {
-        use crate::schema::blocks::dsl::*;
-        diesel::update(
-            blocks.filter(hash.eq(block_hash).and(marked_invalid.is_null())
-        )).set(marked_invalid.eq(node))
+    /// Fetch number of nodes that marked invalid.
+    pub fn marked_invalid(conn: &PgConnection, block_hash: &String) -> QueryResult<usize> {
+        use crate::schema::invalid_blocks::dsl::*;
+
+        invalid_blocks.filter(hash.eq(block_hash)).execute(conn)
+    }
+
+    /// Node has marked block invalid.
+    pub fn set_invalid(
+        conn: &PgConnection,
+        block_hash: &String,
+        node_id: i64,
+    ) -> QueryResult<usize> {
+        use crate::schema::invalid_blocks::dsl::*;
+
+        let block = InvalidBlock {
+            hash: block_hash.to_string(),
+            node: node_id,
+        };
+
+        diesel::insert_into(invalid_blocks)
+            .values(block)
             .execute(conn)
     }
 
@@ -156,46 +212,36 @@ impl Block {
             .values(self)
             .execute(conn)
     }
+}
 
-    pub fn find_fork(conn: &PgConnection) -> QueryResult<Vec<(Option<String>, i64)>> {
-        use crate::schema::blocks::dsl as bd;
-        let forks = bd::blocks
-            .filter(bd::parent_hash.is_not_null())
-            .select((bd::parent_hash, diesel::dsl::sql("count(*)")))
-            .group_by(bd::parent_hash)
-            .load::<(Option<String>, i64)>(conn)?;
-        Ok(forks.into_iter().filter(|f| f.1 > 1).collect())
+#[derive(QueryableByName, Queryable, Insertable)]
+#[table_name = "nodes"]
+pub struct Node {
+    pub id: i64,
+    pub node: String,
+    pub rpc_host: String,
+    pub rpc_user: String,
+    pub rpc_pass: String,
+    pub rpc_port: i32,
+    pub unreachable_since: Option<DateTime<Utc>>,
+}
+
+impl Node {
+    pub fn list(conn: &PgConnection) -> QueryResult<Vec<Node>> {
+        nodes::dsl::nodes.load(conn)
     }
+}
 
-    pub fn find_tips(conn: &PgConnection, hash: &String) -> QueryResult<Vec<(i64, String)>> {
-        use crate::schema::blocks::dsl as bd;
-        let mut parents = bd::blocks
-            .filter(bd::parent_hash.is_not_null().and(bd::parent_hash.eq(hash)))
-            .select((bd::height, bd::hash))
-            .load::<(i64, String)>(conn)?;
+#[derive(QueryableByName, Queryable, Insertable)]
+#[table_name = "invalid_blocks"]
+pub struct InvalidBlock {
+    pub hash: String,
+    pub node: i64,
+}
 
-        loop {
-            let mut changed = false;
-            let mut next_parents = vec![];
-            for parent in parents.drain(..) {
-                let items = bd::blocks
-                    .filter(bd::parent_hash.is_not_null().and(bd::parent_hash.eq(parent.1.clone())))
-                    .select((bd::height, bd::hash))
-                    .load::<(i64, String)>(conn)?;
-                if items.len() > 0 {
-                    next_parents.extend(items);
-                    changed = true;
-                } else {
-                    next_parents.push(parent);
-                }
-            }
-
-            parents = next_parents;
-
-            if !changed {
-                break;
-            }
-        }
-        Ok(parents)
-    }
+#[derive(QueryableByName, Queryable, Insertable)]
+#[table_name = "valid_blocks"]
+pub struct ValidBlock {
+    pub hash: String,
+    pub node: i64,
 }

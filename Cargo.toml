@@ -7,8 +7,9 @@ edition = "2018"
 
 [dependencies]
 bitcoincore-rpc = "0.14.0"
+chrono = "0.4"
 crossbeam-channel = "0.5.1"
-diesel = { version = "1.4.8", features = ["postgres"] }
+diesel = { version = "1.4.8", features = ["chrono", "postgres"] }
 dotenv = "0.15.0"
 env_logger = "0.9.0"
 log = "0.4.14"

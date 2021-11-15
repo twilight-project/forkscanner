@@ -22,9 +22,7 @@ thread_local! {
 }
 
 fn get_best_block_hash(_: Params) -> Result<Value> {
-    let num = BLOCK_NUM.with(|bn| {
-        bn.fetch_add(1, Ordering::SeqCst)
-    });
+    let num = BLOCK_NUM.with(|bn| bn.fetch_add(1, Ordering::SeqCst));
     let response = BLOCKS.with(|v| v[num].to_string());
 
     Ok(Value::String(response))
@@ -47,9 +45,7 @@ fn get_block_header_info(params: Params) -> Result<Value> {
 }
 
 fn wait_for_new_block(_: Params) -> Result<Value> {
-    let num = REF_NUM.with(|bn| {
-        bn.fetch_add(1, Ordering::SeqCst)
-    });
+    let num = REF_NUM.with(|bn| bn.fetch_add(1, Ordering::SeqCst));
     let response = REFS.with(|v| v[num].to_string());
 
     let response: Value = serde_json::from_str(&response).expect("JSON serde error");
@@ -80,8 +76,7 @@ fn one_test() {
 
     let (sender, receiver) = unbounded();
     let auth = Auth::UserPass("bitcoin".into(), "pass".into());
-    let fork_watcher =
-        ForkScanner::new(db_conn, "http://localhost:8339", auth)
+    let fork_watcher = ForkScanner::new(db_conn, "http://localhost:8339", auth)
         .expect("Bitcoin rpc client failed");
 
     let _client = thread::spawn(move || fork_watcher.run(sender));
