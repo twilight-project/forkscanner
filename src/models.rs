@@ -31,7 +31,37 @@ impl Chaintip {
             .first(conn)
     }
 
-    pub fn list_active_no_parent(
+    pub fn get_invalid(
+        conn: &PgConnection,
+        hash: &String,
+    ) -> QueryResult<Chaintip> {
+        use crate::schema::chaintips::dsl::*;
+        chaintips
+            .filter(block.eq(hash).and(status.eq("invalid")))
+            .first(conn)
+    }
+
+    pub fn list_invalid_gt(
+        conn: &PgConnection,
+        tip_height: i64,
+    ) -> QueryResult<Vec<Chaintip>> {
+        use crate::schema::chaintips::dsl::*;
+        chaintips
+            .filter(height.gt(tip_height).and(status.eq("invalid")))
+            .load(conn)
+    }
+
+    pub fn list_active_gt(
+        conn: &PgConnection,
+        tip_height: i64,
+    ) -> QueryResult<Vec<Chaintip>> {
+        use crate::schema::chaintips::dsl::*;
+        chaintips
+            .filter(height.gt(tip_height).and(status.eq("active")))
+            .load(conn)
+    }
+
+    pub fn list_active_lt(
         conn: &PgConnection,
         tip_height: i64,
     ) -> QueryResult<Vec<Chaintip>> {
@@ -180,6 +210,15 @@ impl Block {
         diesel::insert_into(valid_blocks)
             .values(block)
             .execute(conn)
+    }
+
+    pub fn marked_invalid_by(conn: &PgConnection, block_hash: &String, node_id: i64) -> QueryResult<bool> {
+        use crate::schema::invalid_blocks::dsl::*;
+
+        let rows = invalid_blocks
+            .filter(hash.eq(block_hash).and(node.eq(node_id)))
+            .execute(conn)?;
+        Ok(rows > 0)
     }
 
     /// Fetch number of nodes that marked invalid.

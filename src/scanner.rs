@@ -2,16 +2,9 @@ use crate::{Block, Chaintip, Node};
 use bitcoincore_rpc::bitcoin as btc;
 use bitcoincore_rpc::bitcoincore_rpc_json::GetChainTipsResultStatus;
 use bitcoincore_rpc::{Auth, Client, RpcApi};
-use crossbeam_channel::Sender;
 use diesel::prelude::PgConnection;
 use log::{debug, error, info};
 use std::str::FromStr;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
-use std::thread::sleep;
-use std::time::Duration;
 use thiserror::Error;
 
 const MAX_BLOCK_DEPTH: usize = 100;
@@ -70,7 +63,6 @@ pub struct ForkScanner {
     node_list: Vec<Node>,
     clients: Vec<Client>,
     db_conn: PgConnection,
-    should_exit: Arc<AtomicBool>,
 }
 
 impl ForkScanner {
@@ -86,13 +78,10 @@ impl ForkScanner {
             clients.push(client);
         }
 
-        let should_exit = Arc::new(AtomicBool::new(false));
-
         Ok(ForkScanner {
             node_list,
             clients,
             db_conn,
-            should_exit,
         })
     }
 
@@ -101,7 +90,6 @@ impl ForkScanner {
             Ok(tips) => tips,
             Err(e) => {
                 error!("rpc error {:?}", e);
-                sleep(Duration::from_millis(500));
                 return;
             }
         };
@@ -180,100 +168,224 @@ impl ForkScanner {
         }
     }
 
-    // We initialized with get_best_block_hash, now we just poll continually
-    // for new blocks, and fetch ancestors up to MAX_BLOCK_HEIGHT postgres
-    // will do the rest for us.
-    pub fn run(mut self, channel: Sender<ReorgMessage>) {
-        loop {
-            if self.should_exit.load(Ordering::Relaxed) {
-                info!("Watcher leaving... goodbye!");
-                break;
+    fn match_children(&self, tip: &Chaintip) {
+        // Chaintips with a height less than current tip, see if they are an ancestor
+        // of current.
+        // If none or error, skip current node and go to next one.
+        let candidate_tips =
+            match Chaintip::list_active_lt(&self.db_conn, tip.height) {
+                Ok(tips) => tips,
+                Err(e) => {
+                    error!("Chaintip query {:?}", e);
+                    return;
+                }
+            };
+
+        for mut candidate in candidate_tips {
+            if candidate.parent_chaintip.is_some() {
+                continue;
             }
 
-            if let Err(e) = Chaintip::purge(&self.db_conn) {
-                error!("Error purging database {:?}", e);
-                sleep(Duration::from_millis(500));
-                return;
-            }
+            let mut block = match Block::get(&self.db_conn, &tip.block) {
+                Ok(block) => block,
+                Err(e) => {
+                    error!("Block query: match children {:?}", e);
+                    return;
+                }
+            };
 
-            for (client, node) in self.clients.iter().zip(&self.node_list) {
-                self.process_client(client, node);
-            }
-
-            // For each node, start with their active chaintip and see if
-            // other chaintips are behind this one. Link them via 'parent_chaintip'
-            // if this one has not been marked invalid by some node.
-            for node in &self.node_list {
-                let tip = match Chaintip::get_active(&self.db_conn, node.id) {
-                    Ok(t) => t,
+            loop {
+                // Break if this current block was marked invalid by someone.
+                let invalid = match Block::marked_invalid(&self.db_conn, &block.hash) {
+                    Ok(v) => v > 0,
                     Err(e) => {
-                        error!("Query failed {:?}", e);
-                        continue;
+                        error!("BlockInvalid query {:?}", e);
+                        break;
                     }
                 };
 
-                // Chaintips with a height less than current tip, see if they are an ancestor
-                // of current.
-                // If none or error, skip current node and go to next one.
-                let candidate_tips =
-                    match Chaintip::list_active_no_parent(&self.db_conn, tip.height) {
-                        Ok(tips) => tips,
-                        Err(e) => {
-                            error!("Chaintip query {:?}", e);
-                            continue;
-                        }
-                    };
+                if invalid {
+                    break;
+                }
 
-                'outer: for mut candidate in candidate_tips {
-                    let mut block = match Block::get(&self.db_conn, &tip.block) {
-                        Ok(block) => block,
-                        Err(e) => {
-                            error!("Block query: match children {:?}", e);
-                            continue;
-                        }
-                    };
-
-                    loop {
-                        // Break if this current block was marked invalid by someone.
-                        let invalid = match Block::marked_invalid(&self.db_conn, &block.hash) {
-                            Ok(v) => v > 0,
-                            Err(e) => {
-                                error!("BlockInvalid query {:?}", e);
-                                break;
-                            }
-                        };
-
-                        // TODO: might need to mark parents invalid here.
-                        if invalid {
-                            break 'outer;
-                        }
-
-                        if block.hash == candidate.block {
-                            candidate.parent_chaintip = Some(tip.id);
-                            if let Err(e) = candidate.update(&self.db_conn) {
-                                error!("Chaintip update failed {:?}", e);
-                                break;
-                            }
-                        }
-
-                        // This tip is not an ancestor of the other if the heights are equal at this
-                        // point.
-                        if block.parent_hash.is_none() || block.height == candidate.height {
-                            break;
-                        }
-
-                        block = match Block::get(&self.db_conn, &block.parent_hash.unwrap()) {
-                            Ok(b) => b,
-                            Err(e) => {
-                                error!("Get parent block failed {:?}", e);
-                                break;
-                            }
-                        };
+                if block.hash == candidate.block {
+                    candidate.parent_chaintip = Some(tip.id);
+                    if let Err(e) = candidate.update(&self.db_conn) {
+                        error!("Chaintip update failed {:?}", e);
+                        break;
                     }
                 }
-            }
 
-            sleep(Duration::from_millis(10000));
+                // This tip is not an ancestor of the other if the heights are equal at this
+                // point.
+                if block.parent_hash.is_none() || block.height == candidate.height {
+                    break;
+                }
+
+                block = match Block::get(&self.db_conn, &block.parent_hash.unwrap()) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        error!("Get parent block failed {:?}", e);
+                        break;
+                    }
+                };
+            }
+        }
+    }
+
+    fn check_parent(&self, tip: &mut Chaintip) {
+        if tip.parent_chaintip.is_none() {
+            return;
+        }
+
+        // Chaintips with a height greater than current tip, see if they are a successor
+        // of current. If so, disconnect parent pointer.
+        let candidate_tips =
+            match Chaintip::list_invalid_gt(&self.db_conn, tip.height) {
+                Ok(tips) => tips,
+                Err(e) => {
+                    error!("Chaintip query {:?}", e);
+                    return;
+                }
+            };
+
+        for candidate in &candidate_tips {
+            let mut block = match Block::get(&self.db_conn, &candidate.block) {
+                Ok(block) => block,
+                Err(e) => {
+                    error!("Block query: match children {:?}", e);
+                    return;
+                }
+            };
+
+            loop {
+                if tip.block == block.hash {
+                    tip.parent_chaintip = None;
+                    if let Err(e) = tip.update(&self.db_conn) {
+                        error!("Chaintip update failed {:?}", e);
+                        break;
+                    }
+                    return;
+                }
+
+                // This tip is not an ancestor of the other if the heights are equal at this
+                // point.
+                if block.parent_hash.is_none() || block.height == tip.height {
+                    break;
+                }
+
+                block = match Block::get(&self.db_conn, &block.parent_hash.unwrap()) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        error!("Get parent block failed {:?}", e);
+                        break;
+                    }
+                };
+            }
+        }
+    }
+
+    fn match_parent(&self, tip: &mut Chaintip, node: &Node) {
+        // we have a parent still, keep it.
+        if tip.parent_chaintip.is_some() {
+            return;
+        }
+
+        let candidate_tips =
+            match Chaintip::list_active_gt(&self.db_conn, tip.height) {
+                Ok(tips) => tips,
+                Err(e) => {
+                    error!("Chaintip query {:?}", e);
+                    return;
+                }
+            };
+
+        for candidate in &candidate_tips {
+            let mut block = match Block::get(&self.db_conn, &candidate.block) {
+                Ok(block) => block,
+                Err(e) => {
+                    error!("Block query: match children {:?}", e);
+                    return;
+                }
+            };
+
+            loop {
+                // Don't attach as parent if current node or any chaintip has marked invalid.
+                let invalid = match Block::marked_invalid_by(&self.db_conn, &block.hash, node.id) {
+                    Ok(invalid) => invalid,
+                    Err(e) => {
+                        error!("Block query: match children {:?}", e);
+                        break;
+                    }
+                };
+
+                let invalid_tip = match Chaintip::get_invalid(&self.db_conn, &block.hash) {
+                    Ok(_) => true,
+                    Err(diesel::result::Error::NotFound) => false,
+                    Err(e) => {
+                        error!("Chaintips: match parent {:?}", e);
+                        break;
+                    }
+                };
+
+                if invalid || invalid_tip {
+                    break;
+                }
+
+                if block.hash == tip.block {
+                    tip.parent_chaintip = Some(candidate.id);
+                    if let Err(e) = tip.update(&self.db_conn) {
+                        error!("Chaintip update failed {:?}", e);
+                        break;
+                    }
+                    return;
+                }
+
+                // This tip is not an ancestor of the other if the heights are equal at this
+                // point.
+                if block.parent_hash.is_none() || block.height == tip.height {
+                    break;
+                }
+
+                block = match Block::get(&self.db_conn, &block.parent_hash.unwrap()) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        error!("Get parent block failed {:?}", e);
+                        break;
+                    }
+                };
+            }
+        }
+    }
+
+    // We initialized with get_best_block_hash, now we just poll continually
+    // for new blocks, and fetch ancestors up to MAX_BLOCK_HEIGHT postgres
+    // will do the rest for us.
+    pub fn run(self) {
+        if let Err(e) = Chaintip::purge(&self.db_conn) {
+            error!("Error purging database {:?}", e);
+            return;
+        }
+
+        for (client, node) in self.clients.iter().zip(&self.node_list) {
+            self.process_client(client, node);
+        }
+
+        // For each node, start with their active chaintip and see if
+        // other chaintips are behind this one. Link them via 'parent_chaintip'
+        // if this one has not been marked invalid by some node.
+        for node in &self.node_list {
+            let mut tip = match Chaintip::get_active(&self.db_conn, node.id) {
+                Ok(t) => t,
+                Err(e) => {
+                    error!("Query failed {:?}", e);
+                    return;
+                }
+            };
+
+            self.match_children(&tip);
+            self.check_parent(&mut tip);
+            self.match_parent(&mut tip, node);
         }
     }
 }
