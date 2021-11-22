@@ -20,25 +20,25 @@ A block is a bitcoin core block obtained from a full node
 
 ## Struct
 
-string "block_hash"
-integer "height"
-integer "timestamp"
-string "work"
-datetime "created_at"
-datetime "updated_at"
-bigint "parent_id"
-integer "mediantime"
-bigint "first_seen_by_id"
-integer "version"
-integer "coin"
-string "pool"
-integer "tx_count"
-integer "size"
-boolean "connected"
-integer Array "marked_invalid_by"
-integer Array "marked_valid_by"
-string "coinbase_message"
-boolean "headers_only"
+- string "block_hash"
+- integer "height"
+- integer "timestamp"
+- string "work"
+- datetime "created_at"
+- datetime "updated_at"
+- bigint "parent_id"
+- integer "mediantime"
+- bigint "first_seen_by_id"
+- integer "version"
+- integer "coin"
+- string "pool"
+- integer "tx_count"
+- integer "size"
+- boolean "connected"
+- integer Array "marked_invalid_by"
+- integer Array "marked_valid_by"
+- string "coinbase_message"
+- boolean "headers_only"
 
 **Parent_ID:** Blocks will maintain a parent child relationship using the parent_id field in above
 struct.
@@ -53,12 +53,12 @@ A Chaintip is a bitcoin core chaintip object returned by calling the getchaintip
 
 ### Struct
 
-bigint "node_id"
-bigint "block_id"
-bigint "parent_chaintip_id"
-string "status"
-datetime "created_at"
-datetime "updated_at"
+- bigint "node_id"
+- bigint "block_id"
+- bigint "parent_chaintip_id"
+- string "status"
+- datetime "created_at"
+- datetime "updated_at"
 
 **Parent_ID:** Chaintips will maintain a parent child relationship using the parent_chaintip_id field in
 above struct.
@@ -73,28 +73,28 @@ of all the Bitcoin Nodes available to Forkscanner for RPC connections.
 
 ### Struct
 
-string "name"
-integer "version"
-bigint "block_id"
-datetime "created_at"
-datetime "updated_at"
-datetime "unreachable_since"
-string "rpchost"
-string "rpcuser"
-string "rpcpassword"
-integer "peer_count"
-integer "client_type"
-integer "rpcport"
-string "version_extra"
-boolean "enabled"
-string "mirror_rpchost"
-integer "mirror_rpcport"
-bigint "mirror_block_id"
-boolean "txindex"
-datetime "mirror_rest_until"
-datetime "polled_at"
-integer "sync_height"
-datetime "mirror_unreachable_since"
+- string "name"
+- integer "version"
+- bigint "block_id"
+- datetime "created_at"
+- datetime "updated_at"
+- datetime "unreachable_since"
+- string "rpchost"
+- string "rpcuser"
+- string "rpcpassword"
+- integer "peer_count"
+- integer "client_type"
+- integer "rpcport"
+- string "version_extra"
+- boolean "enabled"
+- string "mirror_rpchost"
+- integer "mirror_rpcport"
+- bigint "mirror_block_id"
+- boolean "txindex"
+- datetime "mirror_rest_until"
+- datetime "polled_at"
+- integer "sync_height"
+- datetime "mirror_unreachable_since"
 
 **Mirror Node**
 
@@ -110,12 +110,12 @@ use the below RPC call
 **rpc::getpeerinfo**
 
 **Struct**
-string "name"
-integer "version"
-datetime "created_at"
-datetime "updated_at"
-string "rpchost"
-integer_array = ["node_id's connected to this peer"]
+- string "name"
+- integer "version"
+- datetime "created_at"
+- datetime "updated_at"
+- string "rpchost"
+- integer_array = ["node_id's connected to this peer"]
 
 ## API Spec
 
