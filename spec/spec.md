@@ -241,3 +241,4 @@ chaintip instead unless we consider it invalid
 Pending
 
 ## DB SCHEMA
+https://github.com/twilight-project/forkscanner/blob/spec/spec/img/DB_schema.png
