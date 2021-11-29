@@ -36,13 +36,15 @@ pub enum ReorgMessage {
 fn create_block_and_ancestors(
     client: &Client,
     conn: &PgConnection,
+    node_id: i64,
+    headers_only: bool,
     block_hash: &String,
 ) -> ForkScannerResult<()> {
     let mut hash = btc::BlockHash::from_str(block_hash)?;
 
     for _ in 0..MAX_BLOCK_DEPTH {
         let bh = client.get_block_header_info(&hash)?;
-        let block = Block::get_or_create(&conn, &bh)?;
+        let block = Block::get_or_create(&conn, node_id, headers_only, &bh)?;
 
         if block.connected {
             break;
@@ -99,13 +101,13 @@ impl ForkScanner {
 
             match tip.status {
                 GetChainTipsResultStatus::HeadersOnly => {
-                    if let Err(e) = create_block_and_ancestors(client, &self.db_conn, &hash) {
+                    if let Err(e) = create_block_and_ancestors(client, &self.db_conn, node.id, true, &hash) {
                         error!("Failed fetching ancestors {:?}", e);
                         break;
                     }
                 }
                 GetChainTipsResultStatus::ValidHeaders => {
-                    if let Err(e) = create_block_and_ancestors(client, &self.db_conn, &hash) {
+                    if let Err(e) = create_block_and_ancestors(client, &self.db_conn, node.id, true, &hash) {
                         error!("Failed fetching ancestors {:?}", e);
                         break;
                     }
@@ -118,7 +120,7 @@ impl ForkScanner {
                         break;
                     }
 
-                    if let Err(e) = create_block_and_ancestors(client, &self.db_conn, &hash) {
+                    if let Err(e) = create_block_and_ancestors(client, &self.db_conn, node.id, false, &hash) {
                         error!("Failed fetching ancestors {:?}", e);
                         break;
                     }
@@ -136,7 +138,7 @@ impl ForkScanner {
                         break;
                     }
 
-                    if let Err(e) = create_block_and_ancestors(client, &self.db_conn, &hash) {
+                    if let Err(e) = create_block_and_ancestors(client, &self.db_conn, node.id, false, &hash) {
                         error!("Failed fetching ancestors {:?}", e);
                         break;
                     }
@@ -154,7 +156,7 @@ impl ForkScanner {
                         break;
                     }
 
-                    if let Err(e) = create_block_and_ancestors(client, &self.db_conn, &hash) {
+                    if let Err(e) = create_block_and_ancestors(client, &self.db_conn, node.id, false, &hash) {
                         error!("Failed fetching ancestors {:?}", e);
                         break;
                     }

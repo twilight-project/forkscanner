@@ -163,6 +163,8 @@ pub struct Block {
     pub height: i64,
     pub parent_hash: Option<String>,
     pub connected: bool,
+    pub node_id: i64,
+    pub headers_only: bool,
 }
 
 impl Block {
@@ -171,9 +173,9 @@ impl Block {
         blocks.find(block_hash).first(conn)
     }
 
-    pub fn get_or_create(conn: &PgConnection, header: &GetBlockHeaderResult) -> QueryResult<Block> {
-        use crate::schema::blocks::dsl::*;
-        let block = blocks.find(header.hash.to_string()).first::<Block>(conn);
+    pub fn get_or_create(conn: &PgConnection, node_id: i64, headers_only: bool, header: &GetBlockHeaderResult) -> QueryResult<Block> {
+        use crate::schema::blocks::dsl as bs;
+        let block = bs::blocks.find(header.hash.to_string()).first::<Block>(conn);
 
         if let Err(diesel::result::Error::NotFound) = block {
             let prev_hash = header.previous_block_hash.map(|h| h.to_string());
@@ -183,12 +185,14 @@ impl Block {
                 height: header.height as i64,
                 parent_hash: prev_hash,
                 connected: false,
+                headers_only,
+                node_id,
             };
 
             conn.transaction::<usize, diesel::result::Error, _>(|| {
                 let _ = block.insert(conn)?;
-                diesel::update(blocks.filter(parent_hash.eq(header.hash.to_string())))
-                    .set(connected.eq(true))
+                diesel::update(bs::blocks.filter(bs::parent_hash.eq(header.hash.to_string()).and(bs::node_id.eq(node_id))))
+                    .set(bs::connected.eq(true))
                     .execute(conn)
             })?;
 
@@ -259,9 +263,11 @@ pub struct Node {
     pub id: i64,
     pub node: String,
     pub rpc_host: String,
+    pub rpc_port: i32,
+    pub mirror_rpc_host: String,
+    pub mirror_rpc_port: i32,
     pub rpc_user: String,
     pub rpc_pass: String,
-    pub rpc_port: i32,
     pub unreachable_since: Option<DateTime<Utc>>,
 }
 

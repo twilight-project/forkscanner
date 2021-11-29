@@ -3,9 +3,11 @@ CREATE TABLE nodes (
 	id bigint generated always as identity,
 	node varchar not null,
 	rpc_host varchar not null,
+	rpc_port int not null,
+	mirror_rpc_host varchar not null,
+	mirror_rpc_port int not null,
 	rpc_user varchar not null,
 	rpc_pass varchar not null,
-	rpc_port int not null,
 	unreachable_since timestamp with time zone,
 	PRIMARY KEY(id)
 );
@@ -50,3 +52,7 @@ CREATE TABLE valid_blocks (
 	  FOREIGN KEY(node)
 	    REFERENCES nodes(id)
 );
+
+ALTER TABLE blocks
+ADD COLUMN node_id bigint not null CONSTRAINT fk_block_node REFERENCES nodes(id),
+ADD COLUMN headers_only boolean not null default false;
