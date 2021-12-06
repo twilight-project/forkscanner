@@ -156,14 +156,14 @@ impl Chaintip {
     }
 }
 
-#[derive(QueryableByName, Queryable, Insertable)]
+#[derive(AsChangeset, QueryableByName, Queryable, Insertable)]
 #[table_name = "blocks"]
 pub struct Block {
     pub hash: String,
     pub height: i64,
     pub parent_hash: Option<String>,
     pub connected: bool,
-    pub node_id: i64,
+    pub first_seen_by: i64,
     pub headers_only: bool,
 }
 
@@ -173,33 +173,64 @@ impl Block {
         blocks.find(block_hash).first(conn)
     }
 
-    pub fn get_or_create(conn: &PgConnection, node_id: i64, headers_only: bool, header: &GetBlockHeaderResult) -> QueryResult<Block> {
+    pub fn max_height(conn: &PgConnection) -> QueryResult<Option<i64>> {
+        use crate::schema::blocks::dsl::*;
+        use diesel::dsl::max;
+
+        blocks.select(max(height)).first(conn)
+    }
+
+    pub fn headers_only(conn: &PgConnection, max_depth: i64) -> QueryResult<Vec<Block>> {
+        use crate::schema::blocks::dsl::*;
+
+        blocks.filter(
+            headers_only.eq(true).and(height.gt(max_depth))
+        )
+            .order(height.asc())
+            .load(conn)
+    }
+
+    pub fn get_or_create(conn: &PgConnection, headers_only: bool, first_seen_by: i64, header: &GetBlockHeaderResult) -> QueryResult<Block> {
         use crate::schema::blocks::dsl as bs;
         let block = bs::blocks.find(header.hash.to_string()).first::<Block>(conn);
 
-        if let Err(diesel::result::Error::NotFound) = block {
-            let prev_hash = header.previous_block_hash.map(|h| h.to_string());
+        match block {
+            Err(diesel::result::Error::NotFound) => {
+                let prev_hash = header.previous_block_hash.map(|h| h.to_string());
 
-            let block = Block {
-                hash: header.hash.to_string(),
-                height: header.height as i64,
-                parent_hash: prev_hash,
-                connected: false,
-                headers_only,
-                node_id,
-            };
+                let block = Block {
+                    hash: header.hash.to_string(),
+                    height: header.height as i64,
+                    parent_hash: prev_hash,
+                    connected: false,
+                    headers_only,
+                    first_seen_by,
+                };
 
-            conn.transaction::<usize, diesel::result::Error, _>(|| {
-                let _ = block.insert(conn)?;
-                diesel::update(bs::blocks.filter(bs::parent_hash.eq(header.hash.to_string()).and(bs::node_id.eq(node_id))))
-                    .set(bs::connected.eq(true))
-                    .execute(conn)
-            })?;
+                conn.transaction::<usize, diesel::result::Error, _>(|| {
+                    let _ = block.insert(conn)?;
+                    diesel::update(bs::blocks.filter(bs::parent_hash.eq(header.hash.to_string())))
+                        .set(bs::connected.eq(true))
+                        .execute(conn)
+                })?;
 
-            Ok(block)
-        } else {
-            block
+                Ok(block)
+            }
+            Ok(mut block) => {
+                block.headers_only &= headers_only;
+                block.update(&conn)?;
+
+                Ok(block)
+            }
+            e => e,
         }
+    }
+
+    pub fn update(&self, conn: &PgConnection) -> QueryResult<usize> {
+        use crate::schema::blocks::dsl::*;
+        diesel::update(blocks.filter(hash.eq(&self.hash)))
+            .set(self)
+            .execute(conn)
     }
 
     /// Node has marked block valid.
@@ -264,8 +295,7 @@ pub struct Node {
     pub node: String,
     pub rpc_host: String,
     pub rpc_port: i32,
-    pub mirror_rpc_host: String,
-    pub mirror_rpc_port: i32,
+    pub mirror_rpc_port: Option<i32>,
     pub rpc_user: String,
     pub rpc_pass: String,
     pub unreachable_since: Option<DateTime<Utc>>,

@@ -4,7 +4,7 @@ table! {
         height -> Int8,
         parent_hash -> Nullable<Varchar>,
         connected -> Bool,
-        node_id -> Int8,
+        first_seen_by -> Int8,
         headers_only -> Bool,
     }
 }
@@ -33,8 +33,7 @@ table! {
         node -> Varchar,
         rpc_host -> Varchar,
         rpc_port -> Int4,
-        mirror_rpc_host -> Varchar,
-        mirror_rpc_port -> Int4,
+        mirror_rpc_port -> Nullable<Int4>,
         rpc_user -> Varchar,
         rpc_pass -> Varchar,
         unreachable_since -> Nullable<Timestamptz>,
@@ -47,8 +46,6 @@ table! {
         node -> Int8,
     }
 }
-
-joinable!(blocks -> nodes (node_id));
 
 allow_tables_to_appear_in_same_query!(
     blocks,
