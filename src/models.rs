@@ -3,7 +3,7 @@ use chrono::prelude::*;
 use diesel::prelude::*;
 use diesel::result::QueryResult;
 
-use crate::schema::{blocks, chaintips, invalid_blocks, nodes, valid_blocks};
+use crate::schema::{blocks, chaintips, invalid_blocks, nodes, peers, valid_blocks};
 
 #[derive(Debug, AsChangeset, QueryableByName, Queryable, Insertable)]
 #[table_name = "chaintips"]
@@ -31,40 +31,28 @@ impl Chaintip {
             .first(conn)
     }
 
-    pub fn get_invalid(
-        conn: &PgConnection,
-        hash: &String,
-    ) -> QueryResult<Chaintip> {
+    pub fn get_invalid(conn: &PgConnection, hash: &String) -> QueryResult<Chaintip> {
         use crate::schema::chaintips::dsl::*;
         chaintips
             .filter(block.eq(hash).and(status.eq("invalid")))
             .first(conn)
     }
 
-    pub fn list_invalid_gt(
-        conn: &PgConnection,
-        tip_height: i64,
-    ) -> QueryResult<Vec<Chaintip>> {
+    pub fn list_invalid_gt(conn: &PgConnection, tip_height: i64) -> QueryResult<Vec<Chaintip>> {
         use crate::schema::chaintips::dsl::*;
         chaintips
             .filter(height.gt(tip_height).and(status.eq("invalid")))
             .load(conn)
     }
 
-    pub fn list_active_gt(
-        conn: &PgConnection,
-        tip_height: i64,
-    ) -> QueryResult<Vec<Chaintip>> {
+    pub fn list_active_gt(conn: &PgConnection, tip_height: i64) -> QueryResult<Vec<Chaintip>> {
         use crate::schema::chaintips::dsl::*;
         chaintips
             .filter(height.gt(tip_height).and(status.eq("active")))
             .load(conn)
     }
 
-    pub fn list_active_lt(
-        conn: &PgConnection,
-        tip_height: i64,
-    ) -> QueryResult<Vec<Chaintip>> {
+    pub fn list_active_lt(conn: &PgConnection, tip_height: i64) -> QueryResult<Vec<Chaintip>> {
         use crate::schema::chaintips::dsl::*;
         chaintips
             .filter(height.lt(tip_height).and(status.eq("active")))
@@ -183,16 +171,22 @@ impl Block {
     pub fn headers_only(conn: &PgConnection, max_depth: i64) -> QueryResult<Vec<Block>> {
         use crate::schema::blocks::dsl::*;
 
-        blocks.filter(
-            headers_only.eq(true).and(height.gt(max_depth))
-        )
+        blocks
+            .filter(headers_only.eq(true).and(height.gt(max_depth)))
             .order(height.asc())
             .load(conn)
     }
 
-    pub fn get_or_create(conn: &PgConnection, headers_only: bool, first_seen_by: i64, header: &GetBlockHeaderResult) -> QueryResult<Block> {
+    pub fn get_or_create(
+        conn: &PgConnection,
+        headers_only: bool,
+        first_seen_by: i64,
+        header: &GetBlockHeaderResult,
+    ) -> QueryResult<Block> {
         use crate::schema::blocks::dsl as bs;
-        let block = bs::blocks.find(header.hash.to_string()).first::<Block>(conn);
+        let block = bs::blocks
+            .find(header.hash.to_string())
+            .first::<Block>(conn);
 
         match block {
             Err(diesel::result::Error::NotFound) => {
@@ -247,7 +241,11 @@ impl Block {
             .execute(conn)
     }
 
-    pub fn marked_invalid_by(conn: &PgConnection, block_hash: &String, node_id: i64) -> QueryResult<bool> {
+    pub fn marked_invalid_by(
+        conn: &PgConnection,
+        block_hash: &String,
+        node_id: i64,
+    ) -> QueryResult<bool> {
         use crate::schema::invalid_blocks::dsl::*;
 
         let rows = invalid_blocks
@@ -305,7 +303,24 @@ impl Node {
     pub fn list(conn: &PgConnection) -> QueryResult<Vec<Node>> {
         nodes::dsl::nodes.load(conn)
     }
+
+    pub fn get_mirrors(conn: &PgConnection) -> QueryResult<Vec<Node>> {
+        use crate::schema::nodes::dsl::*;
+        nodes.filter(mirror_rpc_port.is_not_null()).load(conn)
+    }
 }
+
+#[derive(QueryableByName, Queryable, Insertable)]
+#[table_name = "peers"]
+pub struct Peer {
+    pub id: i64,
+    pub node_id: i64,
+    pub peer_id: i64,
+    pub address: String,
+    pub version: i64,
+}
+
+impl Peer {}
 
 #[derive(QueryableByName, Queryable, Insertable)]
 #[table_name = "invalid_blocks"]

@@ -7,4 +7,5 @@ DROP COLUMN headers_only;
 DROP TABLE valid_blocks;
 DROP TABLE invalid_blocks;
 DROP TABLE chaintips;
+DROP TABLE peers;
 DROP TABLE nodes;

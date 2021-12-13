@@ -57,6 +57,19 @@ CREATE TABLE valid_blocks (
 	    ON DELETE CASCADE
 );
 
+CREATE TABLE peers (
+	id bigint generated always as identity,
+	node_id bigint not null,
+	peer_id bigint not null,
+	address varchar not null,
+	version bigint not null,
+	PRIMARY KEY(id),
+	CONSTRAINT fk_node_id
+	  FOREIGN KEY(node_id)
+	    REFERENCES nodes(id)
+	    ON DELETE CASCADE
+);
+
 ALTER TABLE blocks
 ADD COLUMN first_seen_by bigint not null,
 ADD COLUMN headers_only boolean not null default false;

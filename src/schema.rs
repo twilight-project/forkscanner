@@ -41,16 +41,29 @@ table! {
 }
 
 table! {
+    peers (id) {
+        id -> Int8,
+        node_id -> Int8,
+        peer_id -> Int8,
+        address -> Varchar,
+        version -> Int8,
+    }
+}
+
+table! {
     valid_blocks (hash, node) {
         hash -> Varchar,
         node -> Int8,
     }
 }
 
+joinable!(peers -> nodes (node_id));
+
 allow_tables_to_appear_in_same_query!(
     blocks,
     chaintips,
     invalid_blocks,
     nodes,
+    peers,
     valid_blocks,
 );
