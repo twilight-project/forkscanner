@@ -1,3 +1,7 @@
+ PDF To Markdown Converter
+Debug View
+Result View
+specs_v2
 # SPECS for ForkScanner
 
 Responsibility of this Fork monitor will be to detect forks in BTC chain as well and check for
@@ -335,7 +339,8 @@ them stale candidates.
     - Continue if there are more than 1 blocks at the previous height.^
     - Continue loop if we have that block in invalid_block table.^
     - Find or create an entry in DB for stale candidate.^
-    - Also create entries for stale candidate children.^
+    - Also create entries for stale candidate children. Pick up blocks (children of stale candidate)
+       from the blocks table and add an entry in stale candidate table.
 
 ## Validating Forks and Rollbacks
 
@@ -343,11 +348,11 @@ This service validates folks and makes roll backs where needed. This service is 
 on the mirror nodes and the following Json RPC calls.
 
 **rpc::submitblock
-rpc::InvalidateBlock
-rpc::Getblockfrompeer**
+rpc::InvalidateBlock**
 
 
-**rpc::ReconsiderBlock**
+**rpc::Getblockfrompeer
+rpc::ReconsiderBlock**
 
 **Service:**
 This service will perform the following tasks.
@@ -449,7 +454,9 @@ Validation of forks and roll backs where applicable and performed as mentioned b
     - Maintain a list of blocks we need to invalidate^
     - If block height == active tip height^
        - Add block to blocks to invalidate list^
-    - Now add all the all children to invalidate list.^
+    - Else we traverse back and find the branch starting point (explained below) we pass the
+       current block in this method.
+    - Add all the all children to invalidate list.^
     - If the invalidate list is empty call unable to roll back error and break loop^
     - Otherwise run a loop on the list and call **rpc::invalidateblock** on the mirror node. For
        every entry in the blocks to invalidate list
@@ -462,16 +469,27 @@ Validation of forks and roll backs where applicable and performed as mentioned b
 - If the invalidated blocks list (from make active on mirror) is empty return null.^
 - Run a loop on the list and Call **rpc::reconsiderBlock** on mirror node for each block.^
 
+**Get branch start:**
+
+- Lets call the block passed into this method original block and the block we get in the loop
+    current block
+
+
+- Run an infinite loop starting from tip height block.^
+- Return current block, if original block is a descendant current block^
+- Else set current block == parent of current block^
+- Run the loop until we find the ancestor of the original block or if there are no more blocks^
+
 ## Double Spent detection:
 
 This service will check for double spend transactions and the replace by fee transactions. A few
 considerations are
 
 - The service will check the last 3 stale candidates.
-
-
 - Will look for stale blocks in the last 100 blocks (approx. one day)
-- Service will check double spend in last 30 blocks.
+- Service will check double spend in last 30 blocks. Which means we check for 30 blocks before
+    the stale candidate block. So we check for stale blocks in last 100 blocks and once we find a
+    stale block we look for double spent in 30 blocks after that.
 
 **Service:**
 The service will first pick up the shortest and longest branches then will pick up transactions that
@@ -516,12 +534,14 @@ algorithm will run for each of the 3 latest stale candidates mentioned above.
 - Get the blocks at the same height as the stale candidate from the blocks table. And run a loop
     on them
        - For each block we generate a chain of descendants and order them by work.^
-       - We create an entry in the stale_candidate_children table. Please note that the
-          stale_candidate children table does not store the actual block it just keeps track of the
-          following info
-             - Root (the block where the fork started. Stale candidate block in this case).^
-             - Tip (latest block in this branch)^
-             - Branch length^
+
+
+- We create an entry in the stale_candidate_children table. Please note that the
+    stale_candidate children table does not store the actual block it just keeps track of the
+    following info
+       - Root (the block where the fork started. Stale candidate block in this case).^
+       - Tip (latest block in this branch)^
+       - Branch length^
 
 **Setting Conflicting transactions:**
 
@@ -530,8 +550,6 @@ algorithm will run for each of the 3 latest stale candidates mentioned above.
 - Get the coins spent with transactions (explained below),
 - Filter coins that are spent with a different tx id in the longest chain and get the double spent
     inputs. (explained below)
-
-
 - Get double spent in one branch, which should be a list of transactions ids for the shortest
     branch retrieved from the get double spent method.
 - Get double spent by, which should be a list of transactions ids for the longest branch retrieved
@@ -584,7 +602,10 @@ algorithm will run for each of the 3 latest stale candidates mentioned above.
 - Ensure that the pk script for both output transaction lists is the same, this indicates that the
     transaction is RBF.
 
+
 ## DB SCHEMA
 
 
 
+This is a offline tool, your data stays locally and is not send to any server!
+Feedback & Bug Reports
