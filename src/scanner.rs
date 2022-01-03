@@ -1,7 +1,7 @@
 use crate::{Block, Chaintip, Node};
 use bitcoin::consensus::encode::serialize_hex;
 use bitcoincore_rpc::bitcoin as btc;
-use bitcoincore_rpc::bitcoincore_rpc_json::GetChainTipsResultStatus;
+use bitcoincore_rpc::bitcoincore_rpc_json::{GetChainTipsResultTip, GetChainTipsResultStatus};
 use bitcoincore_rpc::Error as BitcoinRpcError;
 use bitcoincore_rpc::{Auth, Client, RpcApi};
 use diesel::prelude::PgConnection;
@@ -31,6 +31,8 @@ pub enum ForkScannerError {
     HexError(#[from] bitcoincore_rpc::bitcoin::hashes::hex::Error),
     #[error("Failed to fetch parent block.")]
     ParentBlockFetchError,
+    #[error("Failed to roll back.")]
+    FailedRollback,
 }
 
 #[derive(Debug)]
@@ -465,8 +467,15 @@ impl ForkScanner {
 
                 let block = match Block::get(&self.db_conn, &tip.hash.to_string()) {
                     Ok(b) => b,
-                    Err(e) => continue,
+                    Err(_) => continue,
                 };
+
+                let is_valid = Block::marked_valid_by(&self.db_conn, &block.hash, node.node_id);
+                let is_invalid = Block::marked_invalid_by(&self.db_conn, &block.hash, node.node_id);
+
+                if is_valid.unwrap_or(true) || is_invalid.unwrap_or(true) {
+                    continue;
+                }
 
                 let hash = btc::BlockHash::from_str(&block.hash).unwrap();
                 if let Err(BitcoinRpcError::JsonRpc(JsonRpcError::Rpc(RpcError { code, .. }))) = mirror.unwrap().get_block_hex(&hash) {
@@ -490,15 +499,174 @@ impl ForkScanner {
                 }
 
                 // Validate fork
-                if let Err(e) = mirror.unwrap().call::<serde_json::Value>("setnetworkactive", &[false]) {
+                if let Err(e) = mirror.unwrap().call::<serde_json::Value>("setnetworkactive", &[false.into()]) {
                     error!("Could not disable p2p {:?}", e);
                     continue;
                 }
-                // 2. make current tip the active one
-                // 3. check if mirror thinks this is valid tip
-                // 4. undo the rollback
-                // 5. reactivate network
+                match self.set_tip_active(mirror.unwrap(), tip) {
+                    Ok(invalidated_hashes) => {
+                        let tips = match mirror.unwrap().get_chain_tips() {
+                            Ok(t) => t,
+                            Err(e) => {
+                                error!("Chain tips error {:?}", e);
+                                continue;
+                            }
+                        };
+
+                        let active = tips.iter().find(|t| t.status == GetChainTipsResultStatus::Active).unwrap().clone();
+
+                        if active.hash == tip.hash {
+                            if let Err(e) = Block::set_valid(&self.db_conn, &tip.hash.to_string(), node.node_id) {
+                                error!("Database error {:?}", e);
+                                continue;
+                            }
+
+                            // Undo the rollback
+                            for hash in invalidated_hashes {
+                                let _ = mirror.unwrap().reconsider_block(&hash);
+                            }
+                        } else {
+                            for t in tips.into_iter().filter(|t| t.status == GetChainTipsResultStatus::Invalid) {
+                                let _ = mirror.unwrap().reconsider_block(&t.hash);
+                            }
+                        }
+
+                        if let Err(e) = mirror.unwrap().call::<serde_json::Value>("setnetworkactive", &[true.into()]) {
+                            error!("Could not reactivate p2p {:?}", e);
+                        }
+
+                        // TODO: is tip still considered invalid? mark it invalid #442++
+                    }
+                    Err(_) => {
+                        error!("Could not make tip active, restoring state...");
+                        if let Err(e) = mirror.unwrap().call::<serde_json::Value>("setnetworkactive", &[true.into()]) {
+                            error!("Could not reactivate p2p {:?}", e);
+                        }
+                        let tips = match mirror.unwrap().get_chain_tips() {
+                            Ok(t) => t,
+                            Err(e) => {
+                                error!("Chain tips error {:?}", e);
+                                continue;
+                            }
+                        };
+
+                        for t in tips.into_iter().filter(|t| t.status == GetChainTipsResultStatus::Invalid) {
+                            let _ = mirror.unwrap().reconsider_block(&t.hash);
+                        }
+                    }
+                }
             }
+        }
+    }
+
+    fn set_tip_active(&self, mirror: &Client, tip: &GetChainTipsResultTip) -> ForkScannerResult<Vec<btc::BlockHash>> {
+        let mut invalidated_hashes = Vec::new();
+        let mut retry_count = 0;
+
+        loop {
+            let tips = match mirror.get_chain_tips() {
+                Ok(t) => t,
+                Err(e) => {
+                    error!("Chain tips error {:?}", e);
+                    continue;
+                }
+            };
+
+            let active = tips.iter().find(|t| t.status == GetChainTipsResultStatus::Active).unwrap();
+
+            if active.hash == tip.hash {
+                break;
+            }
+
+            if retry_count > 100 {
+                return Err(ForkScannerError::FailedRollback);
+            }
+
+            let mut blocks_to_invalidate = Vec::new();
+
+            if active.height == tip.height {
+                blocks_to_invalidate.push(active.hash);
+            } else {
+                if let Some(branch) = self.find_branch_point(active, tip) {
+                    blocks_to_invalidate.push(branch);
+                }
+
+                let children = match Block::children(&self.db_conn, &tip.hash.to_string()) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        error!("Children fetch failed {:?}", e);
+                        continue;
+                    }
+                };
+
+                for child in children {
+                    let hash = btc::BlockHash::from_str(&child.hash).unwrap();
+                    blocks_to_invalidate.push(hash);
+                }
+            }
+
+            for block in blocks_to_invalidate {
+                let _ = mirror.invalidate_block(&block);
+                invalidated_hashes.push(block);
+            }
+
+            retry_count += 1;
+        }
+        Ok(invalidated_hashes)
+    }
+
+    fn find_branch_point(&self, active: &GetChainTipsResultTip, tip: &GetChainTipsResultTip) -> Option<btc::BlockHash> {
+        if active.height <= tip.height {
+            return None;
+        }
+
+        let mut block1 = match Block::get(&self.db_conn, &active.hash.to_string()) {
+            Ok(block) => block,
+            Err(e) => {
+                error!("Block query: match children {:?}", e);
+                return None;
+            }
+        };
+        while block1.height > tip.height as i64 {
+            block1 = match block1.parent(&self.db_conn) {
+                Ok(block) => block,
+                Err(e) => {
+                    error!("Block query: match children {:?}", e);
+                    return None;
+                }
+            };
+        }
+
+        if block1.hash == tip.hash.to_string() {
+            None
+        } else {
+            let mut block2 = match Block::get(&self.db_conn, &tip.hash.to_string()) {
+                Ok(block) => block,
+                Err(e) => {
+                    error!("Block query: match children {:?}", e);
+                    return None;
+                }
+            };
+
+            while block1.hash != block2.hash {
+                block1 = match block1.parent(&self.db_conn) {
+                    Ok(block) => block,
+                    Err(e) => {
+                        error!("Block query: match children {:?}", e);
+                        return None;
+                    }
+                };
+                block2 = match block2.parent(&self.db_conn) {
+                    Ok(block) => block,
+                    Err(e) => {
+                        error!("Block query: match children {:?}", e);
+                        return None;
+                    }
+                };
+            }
+
+            let hash = btc::BlockHash::from_str(&block1.hash).unwrap();
+            Some(hash)
         }
     }
 
@@ -579,8 +747,8 @@ impl ForkScanner {
 
             let hash = btc::BlockHash::from_str(&block.hash).unwrap();
             let mirror = client.unwrap().mirror().as_ref();
-            let header = match mirror.unwrap().get_block_header(&hash) {
-                Ok(header) => serialize_hex(&header),
+            match mirror.unwrap().get_block_header(&hash) {
+                Ok(_) => (),
                 Err(BitcoinRpcError::JsonRpc(JsonRpcError::Rpc(RpcError { code, .. })))
                     if code == BLOCK_NOT_FOUND =>
                 {
@@ -600,7 +768,7 @@ impl ForkScanner {
 
                     match mirror.unwrap().call::<serde_json::Value>(
                         "submitheader",
-                        &[serde_json::Value::String(header.clone())],
+                        &[serde_json::Value::String(header)],
                     ) {
                         Ok(_) => (),
                         Err(e) => {
@@ -608,7 +776,6 @@ impl ForkScanner {
                             continue;
                         }
                     }
-                    header
                 }
                 Err(e) => {
                     error!("Client connection error {:?}", e);
@@ -618,7 +785,7 @@ impl ForkScanner {
 
             let peers = match mirror.unwrap().get_peer_info() {
                 Ok(p) => p,
-                Err(e) => {
+                Err(_) => {
                     error!("No peers");
                     continue;
                 }
@@ -634,7 +801,7 @@ impl ForkScanner {
                     ],
                 ) {
                     Ok(_) => (),
-                    Err(e) => {
+                    Err(_) => {
                         let _ = mirror.unwrap().call::<serde_json::Value>(
                             "disconnectnode",
                             &[serde_json::Value::String("".into()), peer_id],

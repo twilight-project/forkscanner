@@ -161,6 +161,22 @@ impl Block {
         blocks.find(block_hash).first(conn)
     }
 
+    pub fn parent(&self, conn: &PgConnection) -> QueryResult<Block> {
+        use crate::schema::blocks::dsl::*;
+
+        if let Some(parent) = &self.parent_hash {
+            blocks.find(parent).first(conn)
+        } else {
+            Err(diesel::result::Error::NotFound)
+        }
+    }
+
+    pub fn children(conn: &PgConnection, block_hash: &String) -> QueryResult<Vec<Block>> {
+        use crate::schema::blocks::dsl::*;
+
+        blocks.filter(parent_hash.eq(block_hash)).load(conn)
+    }
+
     pub fn max_height(conn: &PgConnection) -> QueryResult<Option<i64>> {
         use crate::schema::blocks::dsl::*;
         use diesel::dsl::max;
@@ -249,6 +265,19 @@ impl Block {
         use crate::schema::invalid_blocks::dsl::*;
 
         let rows = invalid_blocks
+            .filter(hash.eq(block_hash).and(node.eq(node_id)))
+            .execute(conn)?;
+        Ok(rows > 0)
+    }
+
+    pub fn marked_valid_by(
+        conn: &PgConnection,
+        block_hash: &String,
+        node_id: i64,
+    ) -> QueryResult<bool> {
+        use crate::schema::valid_blocks::dsl::*;
+
+        let rows = valid_blocks
             .filter(hash.eq(block_hash).and(node.eq(node_id)))
             .execute(conn)?;
         Ok(rows > 0)
