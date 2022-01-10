@@ -1,6 +1,9 @@
 use diesel::prelude::PgConnection;
 use diesel::Connection;
 use forkscanner::ForkScanner;
+use forkscanner::run_server;
+use log::info;
+
 
 fn main() {
     dotenv::dotenv().expect("Failed loading dotenv");
@@ -8,5 +11,15 @@ fn main() {
     let db_conn = PgConnection::establish(&db_url).expect("Connection failed");
 
     let scanner = ForkScanner::new(db_conn).expect("Launching forkscanner failed");
-    scanner.run();
+    let duration = std::time::Duration::from_millis(10_000);
+
+    let _handle = std::thread::spawn(move || {
+        loop {
+            scanner.run();
+            info!("Run finished, sleeping");
+            std::thread::sleep(duration);
+        }
+    });
+
+    run_server("127.0.0.1:8339", &db_url);
 }

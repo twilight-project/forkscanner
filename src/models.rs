@@ -2,10 +2,11 @@ use bitcoincore_rpc::bitcoincore_rpc_json::GetBlockHeaderResult;
 use chrono::prelude::*;
 use diesel::prelude::*;
 use diesel::result::QueryResult;
+use serde::Serialize;
 
 use crate::schema::{blocks, chaintips, invalid_blocks, nodes, peers, valid_blocks};
 
-#[derive(Debug, AsChangeset, QueryableByName, Queryable, Insertable)]
+#[derive(Serialize, Debug, AsChangeset, QueryableByName, Queryable, Insertable)]
 #[table_name = "chaintips"]
 pub struct Chaintip {
     pub id: i64,
@@ -42,6 +43,13 @@ impl Chaintip {
         use crate::schema::chaintips::dsl::*;
         chaintips
             .filter(height.gt(tip_height).and(status.eq("invalid")))
+            .load(conn)
+    }
+
+    pub fn list_active(conn: &PgConnection) -> QueryResult<Vec<Chaintip>> {
+        use crate::schema::chaintips::dsl::*;
+        chaintips
+            .filter(status.eq("active"))
             .load(conn)
     }
 
@@ -169,6 +177,18 @@ impl Block {
         } else {
             Err(diesel::result::Error::NotFound)
         }
+    }
+
+    pub fn descendants(&self, conn: &PgConnection) -> QueryResult<Vec<Block>> {
+        let raw_query = format!("
+            WITH RECURSIVE rec_query AS (
+                SELECT * FROM blocks WHERE hash = '{}'
+                UNION ALL
+                SELECT b.* FROM blocks b INNER JOIN rec_query r ON r.hash = b.parent_hash
+            ) SELECT * FROM rec_query ORDER BY height ASC;
+        ", self.hash);
+
+        diesel::sql_query(raw_query).load(conn)
     }
 
     pub fn children(conn: &PgConnection, block_hash: &String) -> QueryResult<Vec<Block>> {

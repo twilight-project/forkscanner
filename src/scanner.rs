@@ -134,123 +134,57 @@ impl ForkScanner {
         })
     }
 
-    fn process_client(&self, client: &Client, node: &Node) {
-        let tips = match client.get_chain_tips() {
-            Ok(tips) => tips,
-            Err(e) => {
-                error!("rpc error {:?}", e);
-                return;
-            }
-        };
+    fn process_client(&self, client: &Client, node: &Node) -> ForkScannerResult<()> {
+        let tips = client.get_chain_tips()?;
 
         for tip in tips {
             let hash = tip.hash.to_string();
 
             match tip.status {
                 GetChainTipsResultStatus::HeadersOnly => {
-                    if let Err(e) =
-                        create_block_and_ancestors(client, &self.db_conn, true, &hash, node.id)
-                    {
-                        error!("Failed fetching ancestors {:?}", e);
-                        break;
-                    }
+                    create_block_and_ancestors(client, &self.db_conn, true, &hash, node.id)?;
                 }
                 GetChainTipsResultStatus::ValidHeaders => {
-                    if let Err(e) =
-                        create_block_and_ancestors(client, &self.db_conn, true, &hash, node.id)
-                    {
-                        error!("Failed fetching ancestors {:?}", e);
-                        break;
-                    }
+                    create_block_and_ancestors(client, &self.db_conn, true, &hash, node.id)?;
                 }
                 GetChainTipsResultStatus::Invalid => {
-                    if let Err(e) =
-                        Chaintip::set_invalid_fork(&self.db_conn, tip.height as i64, &hash, node.id)
-                    {
-                        error!("Failed setting chaintip {:?}", e);
-                        break;
-                    }
+                    Chaintip::set_invalid_fork(&self.db_conn, tip.height as i64, &hash, node.id)?;
 
-                    if let Err(e) =
-                        create_block_and_ancestors(client, &self.db_conn, false, &hash, node.id)
-                    {
-                        error!("Failed fetching ancestors {:?}", e);
-                        break;
-                    }
+                    create_block_and_ancestors(client, &self.db_conn, false, &hash, node.id)?;
 
-                    if let Err(e) = Block::set_invalid(&self.db_conn, &hash, node.id) {
-                        error!("Failed setting valid {:?}", e);
-                        break;
-                    }
+                    Block::set_invalid(&self.db_conn, &hash, node.id)?;
                 }
                 GetChainTipsResultStatus::ValidFork => {
-                    if let Err(e) =
-                        Chaintip::set_valid_fork(&self.db_conn, tip.height as i64, &hash, node.id)
-                    {
-                        error!("Failed setting chaintip {:?}", e);
-                        break;
-                    }
+                    Chaintip::set_valid_fork(&self.db_conn, tip.height as i64, &hash, node.id)?;
 
-                    if let Err(e) =
-                        create_block_and_ancestors(client, &self.db_conn, false, &hash, node.id)
-                    {
-                        error!("Failed fetching ancestors {:?}", e);
-                        break;
-                    }
+                    create_block_and_ancestors(client, &self.db_conn, false, &hash, node.id)?;
 
-                    if let Err(e) = Block::set_valid(&self.db_conn, &hash, node.id) {
-                        error!("Failed setting valid {:?}", e);
-                        break;
-                    }
+                    Block::set_valid(&self.db_conn, &hash, node.id)?;
                 }
                 GetChainTipsResultStatus::Active => {
-                    if let Err(e) =
-                        Chaintip::set_active_tip(&self.db_conn, tip.height as i64, &hash, node.id)
-                    {
-                        error!("Failed setting chaintip {:?}", e);
-                        break;
-                    }
+                    Chaintip::set_active_tip(&self.db_conn, tip.height as i64, &hash, node.id)?;
 
-                    if let Err(e) =
-                        create_block_and_ancestors(client, &self.db_conn, false, &hash, node.id)
-                    {
-                        error!("Failed fetching ancestors {:?}", e);
-                        break;
-                    }
+                    create_block_and_ancestors(client, &self.db_conn, false, &hash, node.id)?;
 
-                    if let Err(e) = Block::set_valid(&self.db_conn, &hash, node.id) {
-                        error!("Failed setting valid {:?}", e);
-                        break;
-                    }
+                    Block::set_valid(&self.db_conn, &hash, node.id)?;
                 }
             }
         }
+        Ok(())
     }
 
-    fn match_children(&self, tip: &Chaintip) {
+    fn match_children(&self, tip: &Chaintip) -> ForkScannerResult<()> {
         // Chaintips with a height less than current tip, see if they are an ancestor
         // of current.
         // If none or error, skip current node and go to next one.
-        let candidate_tips = match Chaintip::list_active_lt(&self.db_conn, tip.height) {
-            Ok(tips) => tips,
-            Err(e) => {
-                error!("Chaintip query {:?}", e);
-                return;
-            }
-        };
+        let candidate_tips = Chaintip::list_active_lt(&self.db_conn, tip.height)?;
 
         for mut candidate in candidate_tips {
             if candidate.parent_chaintip.is_some() {
                 continue;
             }
 
-            let mut block = match Block::get(&self.db_conn, &tip.block) {
-                Ok(block) => block,
-                Err(e) => {
-                    error!("Block query: match children {:?}", e);
-                    return;
-                }
-            };
+            let mut block = Block::get(&self.db_conn, &tip.block)?;
 
             loop {
                 // Break if this current block was marked invalid by someone.
@@ -273,7 +207,7 @@ impl ForkScanner {
                         error!("Chaintip update failed {:?}", e);
                         break;
                     }
-                    return;
+                    return Ok(());
                 }
 
                 // This tip is not an ancestor of the other if the heights are equal at this
@@ -291,31 +225,20 @@ impl ForkScanner {
                 };
             }
         }
+        Ok(())
     }
 
-    fn check_parent(&self, tip: &mut Chaintip) {
+    fn check_parent(&self, tip: &mut Chaintip) -> ForkScannerResult<()> {
         if tip.parent_chaintip.is_none() {
-            return;
+            return Ok(());
         }
 
         // Chaintips with a height greater than current tip, see if they are a successor
         // of current. If so, disconnect parent pointer.
-        let candidate_tips = match Chaintip::list_invalid_gt(&self.db_conn, tip.height) {
-            Ok(tips) => tips,
-            Err(e) => {
-                error!("Chaintip query {:?}", e);
-                return;
-            }
-        };
+        let candidate_tips = Chaintip::list_invalid_gt(&self.db_conn, tip.height)?;
 
         for candidate in &candidate_tips {
-            let mut block = match Block::get(&self.db_conn, &candidate.block) {
-                Ok(block) => block,
-                Err(e) => {
-                    error!("Block query: match children {:?}", e);
-                    return;
-                }
-            };
+            let mut block = Block::get(&self.db_conn, &candidate.block)?;
 
             loop {
                 if tip.block == block.hash {
@@ -324,7 +247,7 @@ impl ForkScanner {
                         error!("Chaintip update failed {:?}", e);
                         break;
                     }
-                    return;
+                    return Ok(());
                 }
 
                 // This tip is not an ancestor of the other if the heights are equal at this
@@ -342,30 +265,19 @@ impl ForkScanner {
                 };
             }
         }
+        Ok(())
     }
 
-    fn match_parent(&self, tip: &mut Chaintip, node: &Node) {
+    fn match_parent(&self, tip: &mut Chaintip, node: &Node) -> ForkScannerResult<()> {
         // we have a parent still, keep it.
         if tip.parent_chaintip.is_some() {
-            return;
+            return Ok(());
         }
 
-        let candidate_tips = match Chaintip::list_active_gt(&self.db_conn, tip.height) {
-            Ok(tips) => tips,
-            Err(e) => {
-                error!("Chaintip query {:?}", e);
-                return;
-            }
-        };
+        let candidate_tips = Chaintip::list_active_gt(&self.db_conn, tip.height)?;
 
         for candidate in &candidate_tips {
-            let mut block = match Block::get(&self.db_conn, &candidate.block) {
-                Ok(block) => block,
-                Err(e) => {
-                    error!("Block query: match children {:?}", e);
-                    return;
-                }
-            };
+            let mut block = Block::get(&self.db_conn, &candidate.block)?;
 
             loop {
                 // Don't attach as parent if current node or any chaintip has marked invalid.
@@ -387,7 +299,7 @@ impl ForkScanner {
                         error!("Chaintip update failed {:?}", e);
                         break;
                     }
-                    return;
+                    return Ok(());
                 }
 
                 // This tip is not an ancestor of the other if the heights are equal at this
@@ -405,19 +317,23 @@ impl ForkScanner {
                 };
             }
         }
+        Ok(())
     }
 
     // We initialized with get_best_block_hash, now we just poll continually
     // for new blocks, and fetch ancestors up to MAX_BLOCK_HEIGHT postgres
     // will do the rest for us.
-    pub fn run(self) {
+    pub fn run(&self) {
         if let Err(e) = Chaintip::purge(&self.db_conn) {
             error!("Error purging database {:?}", e);
             return;
         }
 
         for (client, node) in self.clients.iter().zip(&self.node_list) {
-            self.process_client(client.client(), node);
+            if let Err(e) = self.process_client(client.client(), node) {
+                error!("Error processing client {:?}", e);
+                continue;
+            }
         }
 
         // For each node, start with their active chaintip and see if
@@ -428,13 +344,24 @@ impl ForkScanner {
                 Ok(t) => t,
                 Err(e) => {
                     error!("Query failed {:?}", e);
-                    return;
+                    continue;
                 }
             };
 
-            self.match_children(&tip);
-            self.check_parent(&mut tip);
-            self.match_parent(&mut tip, node);
+            if let Err(e) = self.match_children(&tip) {
+                error!("Match children failed {:?}", e);
+                continue;
+            }
+
+            if let Err(e) = self.check_parent(&mut tip) {
+                error!("Checking parent failed {:?}", e);
+                continue;
+            }
+
+            if let Err(e) = self.match_parent(&mut tip, node) {
+                error!("Match parent failed {:?}", e);
+                continue;
+            }
         }
 
         // Now try to fill in missing blocks.
@@ -444,8 +371,8 @@ impl ForkScanner {
 
     fn rollback_checks(&self) {
         for node in self.clients.iter().filter(|c| c.mirror().is_some()) {
-            let mirror = node.mirror().as_ref();
-            let chaintips = match mirror.unwrap().get_chain_tips() {
+            let mirror = node.mirror().as_ref().unwrap();
+            let chaintips = match mirror.get_chain_tips() {
                 Ok(tips) => tips,
                 Err(e) => {
                     error!("RPC Error {:?}", e);
@@ -478,10 +405,10 @@ impl ForkScanner {
                 }
 
                 let hash = btc::BlockHash::from_str(&block.hash).unwrap();
-                if let Err(BitcoinRpcError::JsonRpc(JsonRpcError::Rpc(RpcError { code, .. }))) = mirror.unwrap().get_block_hex(&hash) {
+                if let Err(BitcoinRpcError::JsonRpc(JsonRpcError::Rpc(RpcError { code, .. }))) = mirror.get_block_hex(&hash) {
                     if code == BLOCK_NOT_FOUND {
                         if let Ok(hex) = node.client().get_block_hex(&hash) {
-                            match mirror.unwrap().call::<serde_json::Value>(
+                            match mirror.call::<serde_json::Value>(
                                 "submitblock",
                                 &[hex.into(), hash.to_string().into()],
                             ) {
@@ -499,13 +426,13 @@ impl ForkScanner {
                 }
 
                 // Validate fork
-                if let Err(e) = mirror.unwrap().call::<serde_json::Value>("setnetworkactive", &[false.into()]) {
+                if let Err(e) = mirror.call::<serde_json::Value>("setnetworkactive", &[false.into()]) {
                     error!("Could not disable p2p {:?}", e);
                     continue;
                 }
-                match self.set_tip_active(mirror.unwrap(), tip) {
+                match self.set_tip_active(mirror, tip) {
                     Ok(invalidated_hashes) => {
-                        let tips = match mirror.unwrap().get_chain_tips() {
+                        let tips = match mirror.get_chain_tips() {
                             Ok(t) => t,
                             Err(e) => {
                                 error!("Chain tips error {:?}", e);
@@ -523,15 +450,15 @@ impl ForkScanner {
 
                             // Undo the rollback
                             for hash in invalidated_hashes {
-                                let _ = mirror.unwrap().reconsider_block(&hash);
+                                let _ = mirror.reconsider_block(&hash);
                             }
                         } else {
                             for t in tips.into_iter().filter(|t| t.status == GetChainTipsResultStatus::Invalid) {
-                                let _ = mirror.unwrap().reconsider_block(&t.hash);
+                                let _ = mirror.reconsider_block(&t.hash);
                             }
                         }
 
-                        if let Err(e) = mirror.unwrap().call::<serde_json::Value>("setnetworkactive", &[true.into()]) {
+                        if let Err(e) = mirror.call::<serde_json::Value>("setnetworkactive", &[true.into()]) {
                             error!("Could not reactivate p2p {:?}", e);
                         }
 
@@ -539,10 +466,10 @@ impl ForkScanner {
                     }
                     Err(_) => {
                         error!("Could not make tip active, restoring state...");
-                        if let Err(e) = mirror.unwrap().call::<serde_json::Value>("setnetworkactive", &[true.into()]) {
+                        if let Err(e) = mirror.call::<serde_json::Value>("setnetworkactive", &[true.into()]) {
                             error!("Could not reactivate p2p {:?}", e);
                         }
-                        let tips = match mirror.unwrap().get_chain_tips() {
+                        let tips = match mirror.get_chain_tips() {
                             Ok(t) => t,
                             Err(e) => {
                                 error!("Chain tips error {:?}", e);
@@ -551,7 +478,7 @@ impl ForkScanner {
                         };
 
                         for t in tips.into_iter().filter(|t| t.status == GetChainTipsResultStatus::Invalid) {
-                            let _ = mirror.unwrap().reconsider_block(&t.hash);
+                            let _ = mirror.reconsider_block(&t.hash);
                         }
                     }
                 }
@@ -620,53 +547,27 @@ impl ForkScanner {
             return None;
         }
 
-        let mut block1 = match Block::get(&self.db_conn, &active.hash.to_string()) {
-            Ok(block) => block,
-            Err(e) => {
-                error!("Block query: match children {:?}", e);
-                return None;
-            }
-        };
+        let mut block1 = Block::get(&self.db_conn, &active.hash.to_string()).ok()?;
+
         while block1.height > tip.height as i64 {
-            block1 = match block1.parent(&self.db_conn) {
-                Ok(block) => block,
-                Err(e) => {
-                    error!("Block query: match children {:?}", e);
-                    return None;
-                }
-            };
+            block1 = block1.parent(&self.db_conn).ok()?;
         }
 
         if block1.hash == tip.hash.to_string() {
             None
         } else {
-            let mut block2 = match Block::get(&self.db_conn, &tip.hash.to_string()) {
-                Ok(block) => block,
-                Err(e) => {
-                    error!("Block query: match children {:?}", e);
-                    return None;
+            loop {
+                block1 = block1.parent(&self.db_conn).ok()?;
+
+                let desc = block1.descendants(&self.db_conn).ok()?;
+
+                let fork = desc.into_iter().find(|b| b.hash == tip.hash.to_string());
+
+                if let Some(_) = fork {
+                    let hash = btc::BlockHash::from_str(&block1.hash).unwrap();
+                    return Some(hash);
                 }
-            };
-
-            while block1.hash != block2.hash {
-                block1 = match block1.parent(&self.db_conn) {
-                    Ok(block) => block,
-                    Err(e) => {
-                        error!("Block query: match children {:?}", e);
-                        return None;
-                    }
-                };
-                block2 = match block2.parent(&self.db_conn) {
-                    Ok(block) => block,
-                    Err(e) => {
-                        error!("Block query: match children {:?}", e);
-                        return None;
-                    }
-                };
             }
-
-            let hash = btc::BlockHash::from_str(&block1.hash).unwrap();
-            Some(hash)
         }
     }
 
@@ -722,15 +623,13 @@ impl ForkScanner {
                         .iter()
                         .find(|c| c.node_id == originally_seen)
                         .unwrap();
-                    match node.client().call::<serde_json::Value>(
+
+                    if let Err(e) = node.client().call::<serde_json::Value>(
                         "submitblock",
                         &[b.into(), hash.to_string().into()],
                     ) {
-                        Ok(_) => (),
-                        Err(e) => {
-                            error!("Could not submit block {:?}", e);
-                            continue;
-                        }
+                        error!("Could not submit block {:?}", e);
+                        continue;
                     }
                 }
             }
@@ -746,8 +645,8 @@ impl ForkScanner {
             }
 
             let hash = btc::BlockHash::from_str(&block.hash).unwrap();
-            let mirror = client.unwrap().mirror().as_ref();
-            match mirror.unwrap().get_block_header(&hash) {
+            let mirror = client.unwrap().mirror().as_ref().unwrap();
+            match mirror.get_block_header(&hash) {
                 Ok(_) => (),
                 Err(BitcoinRpcError::JsonRpc(JsonRpcError::Rpc(RpcError { code, .. })))
                     if code == BLOCK_NOT_FOUND =>
@@ -766,15 +665,12 @@ impl ForkScanner {
                         }
                     };
 
-                    match mirror.unwrap().call::<serde_json::Value>(
+                    if let Err(e) = mirror.call::<serde_json::Value>(
                         "submitheader",
                         &[serde_json::Value::String(header)],
                     ) {
-                        Ok(_) => (),
-                        Err(e) => {
-                            error!("Could not submit block {:?}", e);
-                            continue;
-                        }
+                        error!("Could not submit block {:?}", e);
+                        continue;
                     }
                 }
                 Err(e) => {
@@ -783,7 +679,7 @@ impl ForkScanner {
                 }
             };
 
-            let peers = match mirror.unwrap().get_peer_info() {
+            let peers = match mirror.get_peer_info() {
                 Ok(p) => p,
                 Err(_) => {
                     error!("No peers");
@@ -793,20 +689,17 @@ impl ForkScanner {
 
             for peer in peers {
                 let peer_id = serde_json::Value::Number(serde_json::Number::from(peer.id));
-                match mirror.unwrap().call::<serde_json::Value>(
+                if let Err(_) = mirror.call::<serde_json::Value>(
                     "getblockfrompeer",
                     &[
                         serde_json::Value::String(block.hash.clone()),
                         peer_id.clone(),
                     ],
                 ) {
-                    Ok(_) => (),
-                    Err(_) => {
-                        let _ = mirror.unwrap().call::<serde_json::Value>(
-                            "disconnectnode",
-                            &[serde_json::Value::String("".into()), peer_id],
-                        );
-                    }
+                    let _ = mirror.call::<serde_json::Value>(
+                        "disconnectnode",
+                        &[serde_json::Value::String("".into()), peer_id],
+                    );
                 }
             }
             gbfp_blocks.push(block);

@@ -14,10 +14,10 @@ diesel = { version = "1.4", features = ["chrono", "postgres"] }
 dotenv = "0.15"
 env_logger = "0.9"
 jsonrpc = "0.12"
+jsonrpc-http-server = "18.0.0"
 log = "0.4"
+r2d2 = "0.8"
+r2d2-diesel = "1.0"
+serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "1.0"
-
-[dev-dependencies]
-jsonrpc-http-server = "18.0.0"
-serde_json = "1.0.68"
