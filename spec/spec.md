@@ -4,7 +4,7 @@ Result View
 specs_v2
 # SPECS for ForkScanner
 
-Responsibility of this Fork monitor will be to detect forks in BTC chain as well and check for
+Responsibility of this Fork Scanner will be to detect forks in BTC chain as well and check for
 double spends. Please ensure that following requirements are met.
 
 ## Requirements:
