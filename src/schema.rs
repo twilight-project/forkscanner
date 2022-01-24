@@ -51,6 +51,26 @@ table! {
 }
 
 table! {
+    stale_candidate (hash) {
+        hash -> Varchar,
+        n_children -> Int4,
+        height -> Int8,
+        confirmed_in_one_branch_total -> Float8,
+        double_spent_in_one_branch_total -> Float8,
+        rbf_total -> Float8,
+    }
+}
+
+table! {
+    transaction (txid) {
+        txid -> Varchar,
+        is_coinbase -> Bool,
+        hex -> Varchar,
+        amount -> Float8,
+    }
+}
+
+table! {
     valid_blocks (hash, node) {
         hash -> Varchar,
         node -> Int8,
@@ -65,5 +85,7 @@ allow_tables_to_appear_in_same_query!(
     invalid_blocks,
     nodes,
     peers,
+    stale_candidate,
+    transaction,
     valid_blocks,
 );

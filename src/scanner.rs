@@ -1,4 +1,4 @@
-use crate::{Block, Chaintip, Node};
+use crate::{Block, Chaintip, Node, StaleCandidate, Transaction};
 use bitcoin::consensus::encode::serialize_hex;
 use bitcoincore_rpc::bitcoin as btc;
 use bitcoincore_rpc::bitcoincore_rpc_json::{
@@ -12,14 +12,89 @@ use jsonrpc::error::RpcError;
 use log::{debug, error, info};
 #[cfg(test)]
 use mockall::*;
+use serde::Deserialize;
 use std::str::FromStr;
 use thiserror::Error;
 
 const MAX_ANCESTRY_DEPTH: usize = 100;
 const MAX_BLOCK_DEPTH: i64 = 10;
 const BLOCK_NOT_FOUND: i32 = -5;
+const STALE_WINDOW: i64 = 100;
 
 type ForkScannerResult<T> = Result<T, ForkScannerError>;
+
+
+#[derive(Deserialize)]
+#[allow(dead_code)]
+pub struct FullBlock {
+    bits: serde_json::Value,
+    chainwork: serde_json::Value,
+    confirmations: serde_json::Value,
+    difficulty: serde_json::Value,
+    hash: serde_json::Value,
+    height: serde_json::Value,
+    mediantime: serde_json::Value,
+    merkleroot: serde_json::Value,
+    nTx: serde_json::Value,
+    nonce: serde_json::Value,
+    previousblockhash: serde_json::Value,
+    size: serde_json::Value,
+    strippedsize: serde_json::Value,
+    time: serde_json::Value,
+    tx: Vec<JsonTransaction>,
+    version: serde_json::Value,
+    versionHex: serde_json::Value,
+    weight: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct JsonTransaction {
+    hash: String,
+    hex: String,
+    locktime: usize,
+    size: usize,
+    txid: String,
+    version: usize,
+    vin: Vec<Vin>,
+    vout: Vec<Vout>,
+    vsize: usize,
+    weight: usize,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Vin {
+    txid: Option<String>,
+    vout: Option<usize>,
+    scriptSig: Option<ScriptSig>,
+    sequence: usize,
+    txinwitness: Option<Vec<String>>,
+}
+
+
+#[derive(Debug, Deserialize)]
+pub struct Vout {
+    value: f64,
+    n: usize,
+    scriptPubKey: ScriptPubKey,
+}
+
+
+#[derive(Debug, Deserialize)]
+pub struct ScriptSig {
+    asm: String,
+    hex: String,
+}
+
+
+#[derive(Debug, Deserialize)]
+pub struct ScriptPubKey {
+    asm: String,
+    hex: String,
+    reqSigs: Option<usize>,
+    r#type: String,
+    addresses: Option<Vec<String>>,
+}
+
 
 #[cfg_attr(test, automock)]
 pub trait BtcClient: Sized {
@@ -35,6 +110,10 @@ pub trait BtcClient: Sized {
         &self,
         hash: &btc::BlockHash,
     ) -> Result<btc::BlockHeader, bitcoincore_rpc::Error>;
+    fn get_block_verbose(
+        &self,
+        hash: String,
+    ) -> Result<FullBlock, bitcoincore_rpc::Error>;
     fn get_block_header_info(
         &self,
         hash: &btc::BlockHash,
@@ -89,6 +168,17 @@ impl BtcClient for Client {
         hash: &btc::BlockHash,
     ) -> Result<btc::BlockHeader, bitcoincore_rpc::Error> {
         RpcApi::get_block_header(self, hash)
+    }
+
+    fn get_block_verbose(
+        &self,
+        hash: String,
+    ) -> Result<FullBlock, bitcoincore_rpc::Error> {
+        RpcApi::call::<FullBlock>(
+            self,
+            "getblock",
+            &[serde_json::Value::String(hash), serde_json::Value::Number(serde_json::Number::from(2))],
+        )
     }
 
     fn get_block_header_info(
@@ -494,6 +584,73 @@ impl<BC: BtcClient> ForkScanner<BC> {
         // Now try to fill in missing blocks.
         self.find_missing_blocks();
         self.rollback_checks();
+        self.find_stale_candidates();
+    }
+
+    fn find_stale_candidates(&self) {
+        let tip_height = match Block::max_height(&self.db_conn) {
+            Ok(Some(tip)) => tip,
+            _ => return
+        };
+        ////////////////////////////////TEST CODE////////////////////////////////////////////////////
+        let blocks = match Block::get_at_height(&self.db_conn, tip_height) {
+            Ok(coo) => coo,
+            _ => panic!("Fack!!"),
+        };
+        for block in blocks {
+            println!("TJDEBUG testing transes");
+            self.fetch_transactions(&block);
+        }
+        ////////////////////////////////TEST CODE////////////////////////////////////////////////////
+        ////////////////////////////////TEST CODE////////////////////////////////////////////////////
+
+        let candidates = match Block::stale_candidates(&self.db_conn, tip_height - STALE_WINDOW) {
+            Ok(candidates) if candidates.len() > 0 => candidates,
+            _ => return,
+        };
+
+        for candidate in candidates.iter() {
+            match Block::count_at_height(&self.db_conn, candidate.height - 1) {
+                Ok(ct) if ct > 1 => continue,
+                _ => (),
+            }
+
+            let blocks = match Block::get_at_height(&self.db_conn, candidate.height) {
+                Ok(b) => b,
+                Err(e) => {
+                    error!("Database error {:?}", e);
+                    continue;
+                }
+            };
+
+            if let Err(e) = StaleCandidate::create(&self.db_conn, &blocks) {
+                error!("Database error {:?}", e);
+                continue;
+            }
+
+            for block in blocks {
+                self.fetch_transactions(&block);
+            }
+        }
+    }
+
+    fn fetch_transactions(&self, block: &Block) {
+        let node = self.clients.iter().find(|c| c.node_id == block.first_seen_by).unwrap().clone();
+
+        let block_info = match node.client().get_block_verbose(block.hash.clone()) {
+            Ok(bi) => bi,
+            Err(e) => {
+                error!("RPC call failed {:?}", e);
+                return;
+            }
+        };
+
+        for (idx,tx) in block_info.tx.iter().enumerate() {
+            let value = tx.vout.iter().fold(0., |a, amt| a + amt.value);
+            if let Err(e) = Transaction::create(&self.db_conn, idx, &tx.txid, &tx.hex, value) {
+                error!("Could not insert transaction {:?}", e);
+            }
+        }
     }
 
     // Rollback checks. Here we are looking to use the mirror node to try to set a 'valid-headers'

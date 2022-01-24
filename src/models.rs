@@ -4,7 +4,11 @@ use diesel::prelude::*;
 use diesel::result::QueryResult;
 use serde::Serialize;
 
-use crate::schema::{blocks, chaintips, invalid_blocks, nodes, peers, valid_blocks};
+use crate::schema::{
+    blocks, chaintips, invalid_blocks,
+    nodes, peers, valid_blocks,
+    stale_candidate, transaction,
+};
 
 #[derive(Serialize, Debug, AsChangeset, QueryableByName, Queryable, Insertable)]
 #[table_name = "chaintips"]
@@ -161,6 +165,12 @@ impl Chaintip {
     }
 }
 
+#[derive(QueryableByName, Queryable, Insertable, Debug)]
+#[table_name = "blocks"]
+pub struct Height {
+    pub height: i64,
+}
+
 #[derive(AsChangeset, QueryableByName, Queryable, Insertable)]
 #[table_name = "blocks"]
 pub struct Block {
@@ -187,6 +197,30 @@ impl Block {
         } else {
             Err(diesel::result::Error::NotFound)
         }
+    }
+
+    pub fn count_at_height(conn: &PgConnection, block_height: i64) -> QueryResult<usize> {
+        use crate::schema::blocks::dsl::*;
+
+        blocks.filter(height.eq(block_height)).execute(conn)
+    }
+
+    pub fn get_at_height(conn: &PgConnection, block_height: i64) -> QueryResult<Vec<Block>> {
+        use crate::schema::blocks::dsl::*;
+
+        blocks.filter(height.eq(block_height)).load(conn)
+    }
+
+    pub fn stale_candidates(conn: &PgConnection, height: i64) -> QueryResult<Vec<Height>> {
+        let raw_query = format!("
+            SELECT height FROM blocks
+            WHERE height > {}
+            GROUP BY height
+            HAVING count(height) > 1
+            ORDER BY height ASC
+        ", height);
+
+        diesel::sql_query(raw_query).load(conn)
     }
 
     /// Fetch the entire list of descendants for the current block.
@@ -352,6 +386,76 @@ impl Block {
     pub fn insert(&self, conn: &PgConnection) -> QueryResult<usize> {
         diesel::insert_into(blocks::dsl::blocks)
             .values(self)
+            .execute(conn)
+    }
+}
+
+#[derive(QueryableByName, Queryable, Insertable)]
+#[table_name = "transaction"]
+pub struct Transaction {
+    txid: String,
+    is_coinbase: bool,
+    hex: String,
+    amount: f64,
+}
+
+impl Transaction {
+    pub fn create(conn: &PgConnection, idx: usize, tx_id: &String, tx_hex: &String, tx_amount: f64) -> QueryResult<usize> {
+        use crate::schema::transaction::dsl::*;
+
+        let tx = Transaction {
+            is_coinbase: idx == 0,
+            txid: tx_id.clone(),
+            hex: tx_hex.clone(),
+            amount: tx_amount,
+        };
+
+        diesel::insert_into(transaction)
+            .values(tx)
+            .on_conflict(txid)
+            .do_nothing()
+            .execute(conn)
+    }
+}
+
+#[derive(QueryableByName, Queryable, Insertable)]
+#[table_name = "stale_candidate"]
+pub struct StaleCandidate {
+    hash: String,
+    n_children: i32,
+    height: i64,
+    confirmed_in_one_branch_total: f64,
+    double_spent_in_one_branch_total: f64,
+    rbf_total: f64,
+}
+
+impl StaleCandidate {
+    pub fn get(conn: &PgConnection, block: String) -> QueryResult<StaleCandidate> {
+        use crate::schema::stale_candidate::dsl::*;
+        stale_candidate.find(block).first(conn)
+    }
+
+    pub fn create(conn: &PgConnection, blocks: &Vec<Block>) -> QueryResult<usize> {
+        use crate::schema::stale_candidate::dsl::*;
+
+        let candidates: Vec<StaleCandidate> = blocks
+            .iter()
+            .map(|b|
+                 StaleCandidate {
+                    hash: b.hash.clone(),
+                    n_children: blocks.len() as i32,
+                    height: b.height,
+                    confirmed_in_one_branch_total: 0.,
+                    double_spent_in_one_branch_total: 0.,
+                    rbf_total: 0.,
+                 }
+             )
+            .collect();
+
+        diesel::insert_into(stale_candidate)
+            .values(candidates)
+            .on_conflict(hash)
+            .do_nothing()
             .execute(conn)
     }
 }
