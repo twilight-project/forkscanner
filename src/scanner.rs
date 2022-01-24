@@ -1,13 +1,17 @@
 use crate::{Block, Chaintip, Node};
 use bitcoin::consensus::encode::serialize_hex;
 use bitcoincore_rpc::bitcoin as btc;
-use bitcoincore_rpc::bitcoincore_rpc_json::{GetChainTipsResultTip, GetChainTipsResultStatus};
+use bitcoincore_rpc::bitcoincore_rpc_json::{
+    GetBlockHeaderResult, GetChainTipsResultStatus, GetChainTipsResultTip, GetPeerInfoResult,
+};
 use bitcoincore_rpc::Error as BitcoinRpcError;
 use bitcoincore_rpc::{Auth, Client, RpcApi};
 use diesel::prelude::PgConnection;
 use jsonrpc::error::Error as JsonRpcError;
 use jsonrpc::error::RpcError;
 use log::{debug, error, info};
+#[cfg(test)]
+use mockall::*;
 use std::str::FromStr;
 use thiserror::Error;
 
@@ -16,6 +20,126 @@ const MAX_BLOCK_DEPTH: i64 = 10;
 const BLOCK_NOT_FOUND: i32 = -5;
 
 type ForkScannerResult<T> = Result<T, ForkScannerError>;
+
+#[cfg_attr(test, automock)]
+pub trait BtcClient: Sized {
+    fn new(host: &String, auth: Auth) -> ForkScannerResult<Self>;
+    fn disconnect_node(&self, id: u64) -> Result<serde_json::Value, bitcoincore_rpc::Error>;
+    fn get_chain_tips(&self) -> Result<Vec<GetChainTipsResultTip>, bitcoincore_rpc::Error>;
+    fn get_block_from_peer(
+        &self,
+        hash: String,
+        id: u64,
+    ) -> Result<serde_json::Value, bitcoincore_rpc::Error>;
+    fn get_block_header(
+        &self,
+        hash: &btc::BlockHash,
+    ) -> Result<btc::BlockHeader, bitcoincore_rpc::Error>;
+    fn get_block_header_info(
+        &self,
+        hash: &btc::BlockHash,
+    ) -> Result<GetBlockHeaderResult, bitcoincore_rpc::Error>;
+    fn get_block_hex(&self, hash: &btc::BlockHash) -> Result<String, bitcoincore_rpc::Error>;
+    fn get_peer_info(&self) -> Result<Vec<GetPeerInfoResult>, bitcoincore_rpc::Error>;
+    fn set_network_active(&self, active: bool)
+        -> Result<serde_json::Value, bitcoincore_rpc::Error>;
+    fn submit_block(
+        &self,
+        hex: String,
+        hash: &btc::BlockHash,
+    ) -> Result<serde_json::Value, bitcoincore_rpc::Error>;
+    fn submit_header(&self, header: String) -> Result<serde_json::Value, bitcoincore_rpc::Error>;
+    fn invalidate_block(&self, hash: &btc::BlockHash) -> Result<(), bitcoincore_rpc::Error>;
+    fn reconsider_block(&self, hash: &btc::BlockHash) -> Result<(), bitcoincore_rpc::Error>;
+}
+
+impl BtcClient for Client {
+    fn new(host: &String, auth: Auth) -> ForkScannerResult<Client> {
+        Ok(Client::new(host, auth)?)
+    }
+
+    fn disconnect_node(&self, id: u64) -> Result<serde_json::Value, bitcoincore_rpc::Error> {
+        let peer_id = serde_json::Value::Number(serde_json::Number::from(id));
+        RpcApi::call::<serde_json::Value>(
+            self,
+            "disconnectnode",
+            &[serde_json::Value::String("".into()), peer_id],
+        )
+    }
+
+    fn get_chain_tips(&self) -> Result<Vec<GetChainTipsResultTip>, bitcoincore_rpc::Error> {
+        RpcApi::get_chain_tips(self)
+    }
+
+    fn get_block_from_peer(
+        &self,
+        hash: String,
+        id: u64,
+    ) -> Result<serde_json::Value, bitcoincore_rpc::Error> {
+        let peer_id = serde_json::Value::Number(serde_json::Number::from(id));
+        RpcApi::call::<serde_json::Value>(
+            self,
+            "getblockfrompeer",
+            &[serde_json::Value::String(hash), peer_id],
+        )
+    }
+
+    fn get_block_header(
+        &self,
+        hash: &btc::BlockHash,
+    ) -> Result<btc::BlockHeader, bitcoincore_rpc::Error> {
+        RpcApi::get_block_header(self, hash)
+    }
+
+    fn get_block_header_info(
+        &self,
+        hash: &btc::BlockHash,
+    ) -> Result<GetBlockHeaderResult, bitcoincore_rpc::Error> {
+        RpcApi::get_block_header_info(self, hash)
+    }
+
+    fn get_block_hex(&self, hash: &btc::BlockHash) -> Result<String, bitcoincore_rpc::Error> {
+        RpcApi::get_block_hex(self, hash)
+    }
+    fn get_peer_info(&self) -> Result<Vec<GetPeerInfoResult>, bitcoincore_rpc::Error> {
+        RpcApi::get_peer_info(self)
+    }
+
+    fn set_network_active(
+        &self,
+        active: bool,
+    ) -> Result<serde_json::Value, bitcoincore_rpc::Error> {
+        RpcApi::call::<serde_json::Value>(self, "setnetworkactive", &[active.into()])
+    }
+
+    fn submit_block(
+        &self,
+        hex: String,
+        hash: &btc::BlockHash,
+    ) -> Result<serde_json::Value, bitcoincore_rpc::Error> {
+        RpcApi::call::<serde_json::Value>(
+            self,
+            "submitblock",
+            &[hex.into(), hash.to_string().into()],
+        )
+    }
+
+    fn submit_header(&self, header: String) -> Result<serde_json::Value, bitcoincore_rpc::Error> {
+        RpcApi::call::<serde_json::Value>(
+            self,
+            "submitheader",
+            &[serde_json::Value::String(header)],
+        )
+    }
+
+    fn invalidate_block(&self, hash: &btc::BlockHash) -> Result<(), bitcoincore_rpc::Error> {
+        RpcApi::invalidate_block(self, hash)
+    }
+
+    fn reconsider_block(&self, hash: &btc::BlockHash) -> Result<(), bitcoincore_rpc::Error> {
+        RpcApi::reconsider_block(self, hash)
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum ForkScannerError {
@@ -35,14 +159,11 @@ pub enum ForkScannerError {
     FailedRollback,
 }
 
-#[derive(Debug)]
-pub enum ReorgMessage {
-    TipUpdated(String),
-    ReorgDetected(String, Vec<(i64, String)>),
-}
-
-fn create_block_and_ancestors(
-    client: &Client,
+/// Once we have a block hash, we want to enter it into the database.
+/// If the parent hash is not there, we walk up the block's ancestry
+/// up to MAX_ANCESTRY_DEPTH and make entries for those blocks as well.
+fn create_block_and_ancestors<BC: BtcClient>(
+    client: &BC,
     conn: &PgConnection,
     headers_only: bool,
     block_hash: &String,
@@ -69,22 +190,24 @@ fn create_block_and_ancestors(
     Ok(())
 }
 
-pub struct ScannerClient {
+/// Holds connection info for a bitcoin node that forkscanner is
+/// connected to.
+pub struct ScannerClient<BC: BtcClient> {
     node_id: i64,
-    client: Client,
-    mirror: Option<Client>,
+    client: BC,
+    mirror: Option<BC>,
 }
 
-impl ScannerClient {
+impl<BC: BtcClient> ScannerClient<BC> {
     pub fn new(
         node_id: i64,
         host: String,
         mirror: Option<String>,
         auth: Auth,
-    ) -> ForkScannerResult<ScannerClient> {
-        let client = Client::new(&host, auth.clone())?;
+    ) -> ForkScannerResult<ScannerClient<BC>> {
+        let client = BC::new(&host, auth.clone())?;
         let mirror = match mirror {
-            Some(h) => Some(Client::new(&h, auth)?),
+            Some(h) => Some(BC::new(&h, auth)?),
             None => None,
         };
 
@@ -95,23 +218,25 @@ impl ScannerClient {
         })
     }
 
-    pub fn client(&self) -> &Client {
+    pub fn client(&self) -> &BC {
         &self.client
     }
 
-    pub fn mirror(&self) -> &Option<Client> {
+    pub fn mirror(&self) -> &Option<BC> {
         &self.mirror
     }
 }
 
-pub struct ForkScanner {
+/// The main forkscanner struct. This maintains a list of bitcoin nodes to connect to,
+/// and db connection to record chain info.
+pub struct ForkScanner<BC: BtcClient> {
     node_list: Vec<Node>,
-    clients: Vec<ScannerClient>,
+    clients: Vec<ScannerClient<BC>>,
     db_conn: PgConnection,
 }
 
-impl ForkScanner {
-    pub fn new(db_conn: PgConnection) -> ForkScannerResult<ForkScanner> {
+impl<BC: BtcClient> ForkScanner<BC> {
+    pub fn new(db_conn: PgConnection) -> ForkScannerResult<ForkScanner<BC>> {
         let node_list = Node::list(&db_conn)?;
 
         let mut clients = Vec::new();
@@ -134,7 +259,8 @@ impl ForkScanner {
         })
     }
 
-    fn process_client(&self, client: &Client, node: &Node) -> ForkScannerResult<()> {
+    // process chaintip entries for a client, log to database.
+    fn process_client(&self, client: &BC, node: &Node) -> ForkScannerResult<()> {
         let tips = client.get_chain_tips()?;
 
         for tip in tips {
@@ -324,6 +450,7 @@ impl ForkScanner {
     // for new blocks, and fetch ancestors up to MAX_BLOCK_HEIGHT postgres
     // will do the rest for us.
     pub fn run(&self) {
+        // start by purging chaintips, keeping only the previously 'active' chaintips.
         if let Err(e) = Chaintip::purge(&self.db_conn) {
             error!("Error purging database {:?}", e);
             return;
@@ -369,6 +496,10 @@ impl ForkScanner {
         self.rollback_checks();
     }
 
+    // Rollback checks. Here we are looking to use the mirror node to try to set a 'valid-headers'
+    // chaintip as the active one by invalidating the currently active chaintip. We briefly turn
+    // off p2p on this node so the state doesn't change underneath us. Then, if the switch to new
+    // chaintip is successful, we check if it would've been a valid tip.
     fn rollback_checks(&self) {
         for node in self.clients.iter().filter(|c| c.mirror().is_some()) {
             let mirror = node.mirror().as_ref().unwrap();
@@ -387,7 +518,10 @@ impl ForkScanner {
                 .unwrap()
                 .height;
 
-            for tip in chaintips.iter().filter(|tip| tip.status == GetChainTipsResultStatus::ValidHeaders) {
+            for tip in chaintips
+                .iter()
+                .filter(|tip| tip.status == GetChainTipsResultStatus::ValidHeaders)
+            {
                 if tip.height < active_height - MAX_BLOCK_DEPTH as u64 {
                     continue;
                 }
@@ -405,13 +539,12 @@ impl ForkScanner {
                 }
 
                 let hash = btc::BlockHash::from_str(&block.hash).unwrap();
-                if let Err(BitcoinRpcError::JsonRpc(JsonRpcError::Rpc(RpcError { code, .. }))) = mirror.get_block_hex(&hash) {
+                if let Err(BitcoinRpcError::JsonRpc(JsonRpcError::Rpc(RpcError { code, .. }))) =
+                    mirror.get_block_hex(&hash)
+                {
                     if code == BLOCK_NOT_FOUND {
                         if let Ok(hex) = node.client().get_block_hex(&hash) {
-                            match mirror.call::<serde_json::Value>(
-                                "submitblock",
-                                &[hex.into(), hash.to_string().into()],
-                            ) {
+                            match mirror.submit_block(hex, &hash) {
                                 Ok(_) => (),
                                 Err(e) => {
                                     error!("Could not submit block {:?}", e);
@@ -426,7 +559,7 @@ impl ForkScanner {
                 }
 
                 // Validate fork
-                if let Err(e) = mirror.call::<serde_json::Value>("setnetworkactive", &[false.into()]) {
+                if let Err(e) = mirror.set_network_active(false) {
                     error!("Could not disable p2p {:?}", e);
                     continue;
                 }
@@ -440,10 +573,16 @@ impl ForkScanner {
                             }
                         };
 
-                        let active = tips.iter().find(|t| t.status == GetChainTipsResultStatus::Active).unwrap().clone();
+                        let active = tips
+                            .iter()
+                            .find(|t| t.status == GetChainTipsResultStatus::Active)
+                            .unwrap()
+                            .clone();
 
                         if active.hash == tip.hash {
-                            if let Err(e) = Block::set_valid(&self.db_conn, &tip.hash.to_string(), node.node_id) {
+                            if let Err(e) =
+                                Block::set_valid(&self.db_conn, &tip.hash.to_string(), node.node_id)
+                            {
                                 error!("Database error {:?}", e);
                                 continue;
                             }
@@ -453,12 +592,15 @@ impl ForkScanner {
                                 let _ = mirror.reconsider_block(&hash);
                             }
                         } else {
-                            for t in tips.into_iter().filter(|t| t.status == GetChainTipsResultStatus::Invalid) {
+                            for t in tips
+                                .into_iter()
+                                .filter(|t| t.status == GetChainTipsResultStatus::Invalid)
+                            {
                                 let _ = mirror.reconsider_block(&t.hash);
                             }
                         }
 
-                        if let Err(e) = mirror.call::<serde_json::Value>("setnetworkactive", &[true.into()]) {
+                        if let Err(e) = mirror.set_network_active(true) {
                             error!("Could not reactivate p2p {:?}", e);
                         }
 
@@ -466,7 +608,7 @@ impl ForkScanner {
                     }
                     Err(_) => {
                         error!("Could not make tip active, restoring state...");
-                        if let Err(e) = mirror.call::<serde_json::Value>("setnetworkactive", &[true.into()]) {
+                        if let Err(e) = mirror.set_network_active(true) {
                             error!("Could not reactivate p2p {:?}", e);
                         }
                         let tips = match mirror.get_chain_tips() {
@@ -477,7 +619,10 @@ impl ForkScanner {
                             }
                         };
 
-                        for t in tips.into_iter().filter(|t| t.status == GetChainTipsResultStatus::Invalid) {
+                        for t in tips
+                            .into_iter()
+                            .filter(|t| t.status == GetChainTipsResultStatus::Invalid)
+                        {
                             let _ = mirror.reconsider_block(&t.hash);
                         }
                     }
@@ -486,7 +631,13 @@ impl ForkScanner {
         }
     }
 
-    fn set_tip_active(&self, mirror: &Client, tip: &GetChainTipsResultTip) -> ForkScannerResult<Vec<btc::BlockHash>> {
+    // Find all the blocks that need to be invalidated on the mirror node in order to set a new
+    // tip.
+    fn set_tip_active(
+        &self,
+        mirror: &BC,
+        tip: &GetChainTipsResultTip,
+    ) -> ForkScannerResult<Vec<btc::BlockHash>> {
         let mut invalidated_hashes = Vec::new();
         let mut retry_count = 0;
 
@@ -499,7 +650,10 @@ impl ForkScanner {
                 }
             };
 
-            let active = tips.iter().find(|t| t.status == GetChainTipsResultStatus::Active).unwrap();
+            let active = tips
+                .iter()
+                .find(|t| t.status == GetChainTipsResultStatus::Active)
+                .unwrap();
 
             if active.hash == tip.hash {
                 break;
@@ -542,7 +696,13 @@ impl ForkScanner {
         Ok(invalidated_hashes)
     }
 
-    fn find_branch_point(&self, active: &GetChainTipsResultTip, tip: &GetChainTipsResultTip) -> Option<btc::BlockHash> {
+    // Fin the point where the two tips branched from eachother by walking up the ancestry of on
+    // tip and finding the earliest one that is also an ancestor of the other tip.
+    fn find_branch_point(
+        &self,
+        active: &GetChainTipsResultTip,
+        tip: &GetChainTipsResultTip,
+    ) -> Option<btc::BlockHash> {
         if active.height <= tip.height {
             return None;
         }
@@ -571,6 +731,7 @@ impl ForkScanner {
         }
     }
 
+    // Do we have any blocks that are 'headers-only'? If so, try to fetch the full body.
     fn find_missing_blocks(&self) {
         let tip_height = match Block::max_height(&self.db_conn) {
             Ok(Some(h)) => h,
@@ -624,10 +785,7 @@ impl ForkScanner {
                         .find(|c| c.node_id == originally_seen)
                         .unwrap();
 
-                    if let Err(e) = node.client().call::<serde_json::Value>(
-                        "submitblock",
-                        &[b.into(), hash.to_string().into()],
-                    ) {
+                    if let Err(e) = node.client().submit_block(b, &hash) {
                         error!("Could not submit block {:?}", e);
                         continue;
                     }
@@ -665,10 +823,7 @@ impl ForkScanner {
                         }
                     };
 
-                    if let Err(e) = mirror.call::<serde_json::Value>(
-                        "submitheader",
-                        &[serde_json::Value::String(header)],
-                    ) {
+                    if let Err(e) = mirror.submit_header(header) {
                         error!("Could not submit block {:?}", e);
                         continue;
                     }
@@ -688,21 +843,120 @@ impl ForkScanner {
             };
 
             for peer in peers {
-                let peer_id = serde_json::Value::Number(serde_json::Number::from(peer.id));
-                if let Err(_) = mirror.call::<serde_json::Value>(
-                    "getblockfrompeer",
-                    &[
-                        serde_json::Value::String(block.hash.clone()),
-                        peer_id.clone(),
-                    ],
-                ) {
-                    let _ = mirror.call::<serde_json::Value>(
-                        "disconnectnode",
-                        &[serde_json::Value::String("".into()), peer_id],
-                    );
+                if let Err(_) = mirror.get_block_from_peer(block.hash.clone(), peer.id) {
+                    let _ = mirror.disconnect_node(peer.id);
                 }
             }
             gbfp_blocks.push(block);
+        }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use diesel::Connection;
+
+    fn chaintips_setup() -> Vec<GetChainTipsResultTip> {
+        vec![
+            GetChainTipsResultTip {
+                branch_length: 8,
+                hash: btc::BlockHash::from_str("0000000000000000000501b978d69da3d476ada6a41aba60a42612806204013a").expect("Bad hash"),
+                height: 78000,
+                status: GetChainTipsResultStatus::HeadersOnly,
+            }
+        ]
+    }
+
+    fn blockheader_setup() -> impl Iterator<Item=GetBlockHeaderResult> {
+        let items = vec![
+            GetBlockHeaderResult {
+                hash: btc::BlockHash::from_str("0000000000000000000501b978d69da3d476ada6a41aba60a42612806204013a").expect("Bad hash"),
+                confirmations: 3,
+                height: 77999,
+                version: 0,
+                version_hex: None,
+                merkle_root: btc::TxMerkleNode::from_str("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff").expect("Bad merkle node"),
+                time: 1,
+                median_time: None,
+                nonce: 4,
+                bits: "".into(),
+                difficulty: 93.0,
+                chainwork: vec![],
+                n_tx: 5,
+                previous_block_hash: Some(btc::BlockHash::from_str("00000000000000000001ca4713bbb6900e61c6e3d6cbcbec958c0c580711afeb").expect("Bad hash")),
+                next_block_hash: None,
+            }
+        ];
+
+        items.into_iter()
+    }
+
+    #[test]
+    fn test_process_client() {
+        let db_url = "postgres://forktester:forktester@localhost/forktester";
+        let db_conn = PgConnection::establish(&db_url).expect("Connection failed");
+
+        let ctx = MockBtcClient::new_context();
+        ctx.expect()
+            .times(3)
+            .returning(|x, y| Ok(MockBtcClient::default()));
+
+        let mut scanner = ForkScanner::<MockBtcClient>::new(db_conn).expect("Client setup failed");
+        let results: Vec<GetChainTipsResultTip> = vec![];
+        scanner.clients[0]
+            .client
+            .expect_get_chain_tips()
+            .returning(|| Ok(vec![]));
+        let node = &scanner.node_list[0];
+        {
+            let client = &scanner.clients[0].client;
+            let result = scanner.process_client(client, node);
+            assert!(result.is_ok());
+        }
+
+        scanner.clients[0].client.checkpoint();
+
+        let tips = chaintips_setup();
+
+        scanner.clients[0]
+            .client
+            .expect_get_chain_tips()
+            .return_once(move || Ok(tips));
+
+        scanner.clients[0]
+            .client
+            .expect_get_block_header_info()
+            .return_once(move |_| Err(bitcoincore_rpc::Error::Io(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))));
+
+        {
+            let client = &scanner.clients[0].client;
+            let result = scanner.process_client(client, node);
+            assert!(result.is_err());
+        }
+
+        scanner.clients[0].client.checkpoint();
+
+        let tips = chaintips_setup();
+        let mut blockheaders = blockheader_setup();
+
+        scanner.clients[0]
+            .client
+            .expect_get_chain_tips()
+            .return_once(move || Ok(tips));
+
+        scanner.clients[0]
+            .client
+            .expect_get_block_header_info()
+            .times(1)
+            .returning(move |_| {
+                Ok(blockheaders.next().expect("Out of headers"))
+            });
+
+        {
+            let client = &scanner.clients[0].client;
+            let result = scanner.process_client(client, node);
+            assert!(result.is_ok());
         }
     }
 }

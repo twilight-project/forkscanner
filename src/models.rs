@@ -18,6 +18,7 @@ pub struct Chaintip {
 }
 
 impl Chaintip {
+    /// Update an entry in the chaintips table
     pub fn update(&self, conn: &PgConnection) -> QueryResult<usize> {
         use crate::schema::chaintips::dsl::*;
         diesel::update(chaintips.filter(id.eq(self.id)))
@@ -25,6 +26,7 @@ impl Chaintip {
             .execute(conn)
     }
 
+    /// Get the active chaintip, given a node_id
     pub fn get_active(conn: &PgConnection, node_id: i64) -> QueryResult<Chaintip> {
         use crate::schema::chaintips::dsl::*;
         chaintips
@@ -32,6 +34,7 @@ impl Chaintip {
             .first(conn)
     }
 
+    /// Check if a block hash is marked invalid in the chaintips database
     pub fn get_invalid(conn: &PgConnection, hash: &String) -> QueryResult<Chaintip> {
         use crate::schema::chaintips::dsl::*;
         chaintips
@@ -39,6 +42,7 @@ impl Chaintip {
             .first(conn)
     }
 
+    /// Fetch all invalid chaintips that are ahead of a particular height.
     pub fn list_invalid_gt(conn: &PgConnection, tip_height: i64) -> QueryResult<Vec<Chaintip>> {
         use crate::schema::chaintips::dsl::*;
         chaintips
@@ -46,13 +50,13 @@ impl Chaintip {
             .load(conn)
     }
 
+    /// List all active tips.
     pub fn list_active(conn: &PgConnection) -> QueryResult<Vec<Chaintip>> {
         use crate::schema::chaintips::dsl::*;
-        chaintips
-            .filter(status.eq("active"))
-            .load(conn)
+        chaintips.filter(status.eq("active")).load(conn)
     }
 
+    /// List active tips that are ahead of a given height.
     pub fn list_active_gt(conn: &PgConnection, tip_height: i64) -> QueryResult<Vec<Chaintip>> {
         use crate::schema::chaintips::dsl::*;
         chaintips
@@ -60,6 +64,7 @@ impl Chaintip {
             .load(conn)
     }
 
+    /// List active tips that are behind a given height.
     pub fn list_active_lt(conn: &PgConnection, tip_height: i64) -> QueryResult<Vec<Chaintip>> {
         use crate::schema::chaintips::dsl::*;
         chaintips
@@ -67,6 +72,7 @@ impl Chaintip {
             .load(conn)
     }
 
+    /// Delete all chaintip entries that are not active.
     pub fn purge(conn: &PgConnection) -> QueryResult<usize> {
         use crate::schema::chaintips::dsl::*;
         use diesel::dsl::not;
@@ -75,6 +81,7 @@ impl Chaintip {
             .execute(conn)
     }
 
+    /// Create an entry for an invalid fork.
     pub fn set_invalid_fork(
         conn: &PgConnection,
         block_height: i64,
@@ -92,6 +99,7 @@ impl Chaintip {
             .execute(conn)
     }
 
+    /// Create entry for a valid fork.
     pub fn set_valid_fork(
         conn: &PgConnection,
         block_height: i64,
@@ -109,6 +117,7 @@ impl Chaintip {
             .execute(conn)
     }
 
+    /// Update or create the active tip entry for a node.
     pub fn set_active_tip(
         conn: &PgConnection,
         block_height: i64,
@@ -169,6 +178,7 @@ impl Block {
         blocks.find(block_hash).first(conn)
     }
 
+    /// Look up a parent block.
     pub fn parent(&self, conn: &PgConnection) -> QueryResult<Block> {
         use crate::schema::blocks::dsl::*;
 
@@ -179,24 +189,30 @@ impl Block {
         }
     }
 
+    /// Fetch the entire list of descendants for the current block.
     pub fn descendants(&self, conn: &PgConnection) -> QueryResult<Vec<Block>> {
-        let raw_query = format!("
+        let raw_query = format!(
+            "
             WITH RECURSIVE rec_query AS (
                 SELECT * FROM blocks WHERE hash = '{}'
                 UNION ALL
                 SELECT b.* FROM blocks b INNER JOIN rec_query r ON r.hash = b.parent_hash
             ) SELECT * FROM rec_query ORDER BY height ASC;
-        ", self.hash);
+        ",
+            self.hash
+        );
 
         diesel::sql_query(raw_query).load(conn)
     }
 
+    /// Fetch all blocks that point to the block with a given hash.
     pub fn children(conn: &PgConnection, block_hash: &String) -> QueryResult<Vec<Block>> {
         use crate::schema::blocks::dsl::*;
 
         blocks.filter(parent_hash.eq(block_hash)).load(conn)
     }
 
+    /// Highest block height.
     pub fn max_height(conn: &PgConnection) -> QueryResult<Option<i64>> {
         use crate::schema::blocks::dsl::*;
         use diesel::dsl::max;
@@ -204,6 +220,7 @@ impl Block {
         blocks.select(max(height)).first(conn)
     }
 
+    /// Which blocks do we only have headers for?
     pub fn headers_only(conn: &PgConnection, max_depth: i64) -> QueryResult<Vec<Block>> {
         use crate::schema::blocks::dsl::*;
 
@@ -213,6 +230,7 @@ impl Block {
             .load(conn)
     }
 
+    /// Fetch block if we have it, or create.
     pub fn get_or_create(
         conn: &PgConnection,
         headers_only: bool,
@@ -256,6 +274,7 @@ impl Block {
         }
     }
 
+    /// Update the database with current block info.
     pub fn update(&self, conn: &PgConnection) -> QueryResult<usize> {
         use crate::schema::blocks::dsl::*;
         diesel::update(blocks.filter(hash.eq(&self.hash)))
@@ -277,6 +296,7 @@ impl Block {
             .execute(conn)
     }
 
+    /// Has block_hash been marked invalid by this node?
     pub fn marked_invalid_by(
         conn: &PgConnection,
         block_hash: &String,
@@ -290,6 +310,7 @@ impl Block {
         Ok(rows > 0)
     }
 
+    /// Has block_hash been marked valid by this node?
     pub fn marked_valid_by(
         conn: &PgConnection,
         block_hash: &String,
@@ -353,6 +374,7 @@ impl Node {
         nodes::dsl::nodes.load(conn)
     }
 
+    /// Fetch nodes that also have a mirror.
     pub fn get_mirrors(conn: &PgConnection) -> QueryResult<Vec<Node>> {
         use crate::schema::nodes::dsl::*;
         nodes.filter(mirror_rpc_port.is_not_null()).load(conn)
