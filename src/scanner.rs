@@ -1,4 +1,4 @@
-use crate::{Block, Chaintip, Node, StaleCandidate, Transaction};
+use crate::{Block, Chaintip, Node, StaleCandidate, StaleCandidateChildren, Transaction};
 use bitcoin::consensus::encode::serialize_hex;
 use bitcoincore_rpc::bitcoin as btc;
 use bitcoincore_rpc::bitcoincore_rpc_json::{
@@ -13,19 +13,20 @@ use log::{debug, error, info};
 #[cfg(test)]
 use mockall::*;
 use serde::Deserialize;
-use std::str::FromStr;
+use std::{collections::HashSet, iter::FromIterator, str::FromStr};
 use thiserror::Error;
 
 const MAX_ANCESTRY_DEPTH: usize = 100;
 const MAX_BLOCK_DEPTH: i64 = 10;
 const BLOCK_NOT_FOUND: i32 = -5;
 const STALE_WINDOW: i64 = 100;
+const DOUBLE_SPEND_RANGE: i64 = 30;
 
 type ForkScannerResult<T> = Result<T, ForkScannerError>;
 
-
 #[derive(Deserialize)]
 #[allow(dead_code)]
+#[serde(rename_all = "camelCase")]
 pub struct FullBlock {
     bits: serde_json::Value,
     chainwork: serde_json::Value,
@@ -35,7 +36,7 @@ pub struct FullBlock {
     height: serde_json::Value,
     mediantime: serde_json::Value,
     merkleroot: serde_json::Value,
-    nTx: serde_json::Value,
+    n_tx: serde_json::Value,
     nonce: serde_json::Value,
     previousblockhash: serde_json::Value,
     size: serde_json::Value,
@@ -43,7 +44,7 @@ pub struct FullBlock {
     time: serde_json::Value,
     tx: Vec<JsonTransaction>,
     version: serde_json::Value,
-    versionHex: serde_json::Value,
+    version_hex: serde_json::Value,
     weight: serde_json::Value,
 }
 
@@ -62,22 +63,22 @@ pub struct JsonTransaction {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Vin {
     txid: Option<String>,
     vout: Option<usize>,
-    scriptSig: Option<ScriptSig>,
+    script_sig: Option<ScriptSig>,
     sequence: usize,
     txinwitness: Option<Vec<String>>,
 }
 
-
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Vout {
     value: f64,
     n: usize,
-    scriptPubKey: ScriptPubKey,
+    script_pub_key: ScriptPubKey,
 }
-
 
 #[derive(Debug, Deserialize)]
 pub struct ScriptSig {
@@ -85,16 +86,15 @@ pub struct ScriptSig {
     hex: String,
 }
 
-
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ScriptPubKey {
     asm: String,
     hex: String,
-    reqSigs: Option<usize>,
+    req_sigs: Option<usize>,
     r#type: String,
     addresses: Option<Vec<String>>,
 }
-
 
 #[cfg_attr(test, automock)]
 pub trait BtcClient: Sized {
@@ -110,10 +110,7 @@ pub trait BtcClient: Sized {
         &self,
         hash: &btc::BlockHash,
     ) -> Result<btc::BlockHeader, bitcoincore_rpc::Error>;
-    fn get_block_verbose(
-        &self,
-        hash: String,
-    ) -> Result<FullBlock, bitcoincore_rpc::Error>;
+    fn get_block_verbose(&self, hash: String) -> Result<FullBlock, bitcoincore_rpc::Error>;
     fn get_block_header_info(
         &self,
         hash: &btc::BlockHash,
@@ -170,14 +167,14 @@ impl BtcClient for Client {
         RpcApi::get_block_header(self, hash)
     }
 
-    fn get_block_verbose(
-        &self,
-        hash: String,
-    ) -> Result<FullBlock, bitcoincore_rpc::Error> {
+    fn get_block_verbose(&self, hash: String) -> Result<FullBlock, bitcoincore_rpc::Error> {
         RpcApi::call::<FullBlock>(
             self,
             "getblock",
-            &[serde_json::Value::String(hash), serde_json::Value::Number(serde_json::Number::from(2))],
+            &[
+                serde_json::Value::String(hash),
+                serde_json::Value::Number(serde_json::Number::from(2)),
+            ],
         )
     }
 
@@ -585,29 +582,248 @@ impl<BC: BtcClient> ForkScanner<BC> {
         self.find_missing_blocks();
         self.rollback_checks();
         self.find_stale_candidates();
+
+        // for 3 most recent stale candidates...
+        self.process_stale_candidates()
     }
+
+    fn process_stale_candidates(&self) {
+        // Find top 3.
+        let candidates = match StaleCandidate::top_n(&self.db_conn, 3) {
+            Ok(c) => c,
+            Err(e) => {
+                error!("Database error {:?}", e);
+                return;
+            }
+        };
+
+        for mut candidate in candidates {
+            let blocks = match Block::get_at_height(&self.db_conn, candidate.height) {
+                Ok(b) => b,
+                Err(e) => {
+                    error!("Database error {:?}", e);
+                    continue;
+                }
+            };
+
+            for block in blocks {
+                self.fetch_transactions(&block);
+                let descendants = match block.descendants(&self.db_conn, Some(DOUBLE_SPEND_RANGE)) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        error!("Database error {:?}", e);
+                        continue;
+                    }
+                };
+
+                for desc in descendants {
+                    self.fetch_transactions(&desc);
+                }
+            }
+
+            let tip_height = match Block::max_height(&self.db_conn) {
+                Ok(Some(tip)) => tip,
+                _ => continue,
+            };
+
+            let children = match candidate.children(&self.db_conn) {
+                Ok(c) => c,
+                Err(e) => {
+                    error!("Database error {:?}", e);
+                    continue;
+                }
+            };
+
+            if children.len() == 0
+                || candidate.height_processed.is_none()
+                || (candidate.height_processed.unwrap() < tip_height
+                    && candidate.height_processed.unwrap() <= candidate.height + DOUBLE_SPEND_RANGE)
+            {
+                self.set_children(&mut candidate);
+                self.set_conflicting_txs(&candidate);
+            }
+        }
+    }
+
+    fn set_children(&self, candidate: &mut StaleCandidate) {
+        if let Err(e) = candidate.purge_children(&self.db_conn) {
+		    error!("Could not purge children! {:?}", e);
+			return;
+		};
+
+		let blocks = match Block::get_at_height(&self.db_conn, candidate.height) {
+			Ok(b) => b,
+			Err(e) => {
+				error!("Database error {:?}", e);
+				return;
+			}
+		};
+
+		for block in blocks {
+		    let descendants = match block.descendants_by_work(&self.db_conn, block.height + STALE_WINDOW) {
+			    Ok(d) => d,
+				Err(e) => {
+				    error!("Database error {:?}", e);
+					continue;
+				}
+			};
+
+			match StaleCandidateChildren::create(&self.db_conn, &block, descendants.last().unwrap(), descendants.len() as i32) {
+			    Ok(_) => (),
+				Err(e) => {
+				    error!("Database error {:?}", e);
+				}
+			}
+			candidate.n_children += 1;
+		}
+
+		if let Err(e) = candidate.update(&self.db_conn) {
+		    error!("Database error {:?}", e);
+		};
+    }
+
+    fn set_conflicting_txs(&self, candidate: &StaleCandidate) {
+	    let confirmed_in_one = self.get_confirmed_in_one_branch(candidate);
+	}
+
+	fn get_confirmed_in_one_branch(&self, candidate: &StaleCandidate) -> Option<Vec<String>> {
+	    // TODO: handle more than two branches
+	    if candidate.n_children != 2 {
+		    return None;
+		}
+
+		let children = match candidate.children(&self.db_conn) {
+		    Ok(c) => c,
+			Err(e) => {
+			    error!("Database error {:?}", e);
+				return None;
+			}
+		};
+
+		let headers_only = children.iter().all(|c| {
+		    match Block::get(&self.db_conn, &c.root_id) {
+			    Ok(b) => b.headers_only,
+				_ => false,
+			}
+		});
+
+		if headers_only {
+		    return None;
+		}
+
+		let block = match Block::get(&self.db_conn, &children[0].root_id) {
+		    Ok(b) => b,
+			Err(e) => {
+			    error!("Database error {:?}", e);
+				return None;
+			}
+		};
+
+		let mut short_txs = match block.num_transactions(&self.db_conn) {
+		    Ok(txs) => txs > 0,
+			Err(e) => {
+			    error!("Database error {:?}", e);
+				return None;
+			}
+		};
+
+		let descendants = match block.descendants(&self.db_conn, Some(DOUBLE_SPEND_RANGE)) {
+		    Ok(d) => d,
+			Err(e) => {
+			    error!("Database error {:?}", e);
+				return None;
+			}
+		};
+
+		for desc in descendants {
+		    short_txs &= match desc.num_transactions(&self.db_conn) {
+			    Ok(txs) => txs > 0,
+				Err(e) => {
+				    error!("Database error {:?}", e);
+					return None;
+				}
+			};
+		}
+
+		if !short_txs {
+		    return None;
+		}
+
+		let short_tx_ids: Vec<String> = match block.block_and_descendant_transactions(&self.db_conn, DOUBLE_SPEND_RANGE) {
+		    Ok(txs) => txs.into_iter().map(|t| t.txid).collect(),
+			Err(e) => {
+			    error!("Database error {:?}", e);
+				return None;
+			}
+		};
+
+		let block = match Block::get(&self.db_conn, &children[1].root_id) {
+		    Ok(b) => b,
+			Err(e) => {
+			    error!("Database error {:?}", e);
+				return None;
+			}
+		};
+
+		let mut long_txs = match block.num_transactions(&self.db_conn) {
+		    Ok(txs) => txs > 0,
+			Err(e) => {
+			    error!("Database error {:?}", e);
+				return None;
+			}
+		};
+
+		let descendants = match block.descendants(&self.db_conn, Some(DOUBLE_SPEND_RANGE)) {
+		    Ok(d) => d,
+			Err(e) => {
+			    error!("Database error {:?}", e);
+				return None;
+			}
+		};
+
+		for desc in descendants {
+		    long_txs &= match desc.num_transactions(&self.db_conn) {
+			    Ok(txs) => txs > 0,
+				Err(e) => {
+				    error!("Database error {:?}", e);
+					return None;
+				}
+			}
+		}
+
+		if !long_txs {
+		    return None;
+		}
+
+		let long_tx_ids: Vec<String> = match block.block_and_descendant_transactions(&self.db_conn, DOUBLE_SPEND_RANGE) {
+		    Ok(txs) => txs.into_iter().map(|t| t.txid).collect(),
+			Err(e) => {
+			    error!("Database error {:?}", e);
+				return None;
+			}
+		};
+
+		let short = HashSet::<_>::from_iter(short_tx_ids.into_iter());
+		let long = HashSet::<_>::from_iter(long_tx_ids.into_iter());
+
+		if short.len() < long.len() {
+		    Some(short.difference(&long).cloned().collect())
+		} else {
+		    Some(short.symmetric_difference(&long).cloned().collect())
+		}
+	}
 
     fn find_stale_candidates(&self) {
         let tip_height = match Block::max_height(&self.db_conn) {
             Ok(Some(tip)) => tip,
-            _ => return
-        };
-        ////////////////////////////////TEST CODE////////////////////////////////////////////////////
-        let blocks = match Block::get_at_height(&self.db_conn, tip_height) {
-            Ok(coo) => coo,
-            _ => panic!("Fack!!"),
-        };
-        for block in blocks {
-            println!("TJDEBUG testing transes");
-            self.fetch_transactions(&block);
-        }
-        ////////////////////////////////TEST CODE////////////////////////////////////////////////////
-        ////////////////////////////////TEST CODE////////////////////////////////////////////////////
-
-        let candidates = match Block::stale_candidates(&self.db_conn, tip_height - STALE_WINDOW) {
-            Ok(candidates) if candidates.len() > 0 => candidates,
             _ => return,
         };
+
+        let candidates =
+            match Block::find_stale_candidates(&self.db_conn, tip_height - STALE_WINDOW) {
+                Ok(candidates) if candidates.len() > 0 => candidates,
+                _ => return,
+            };
 
         for candidate in candidates.iter() {
             match Block::count_at_height(&self.db_conn, candidate.height - 1) {
@@ -623,19 +839,22 @@ impl<BC: BtcClient> ForkScanner<BC> {
                 }
             };
 
-            if let Err(e) = StaleCandidate::create(&self.db_conn, &blocks) {
+            if let Err(e) =
+                StaleCandidate::create(&self.db_conn, candidate.height, blocks.len() as i32)
+            {
                 error!("Database error {:?}", e);
                 continue;
-            }
-
-            for block in blocks {
-                self.fetch_transactions(&block);
             }
         }
     }
 
     fn fetch_transactions(&self, block: &Block) {
-        let node = self.clients.iter().find(|c| c.node_id == block.first_seen_by).unwrap().clone();
+        let node = self
+            .clients
+            .iter()
+            .find(|c| c.node_id == block.first_seen_by)
+            .unwrap()
+            .clone();
 
         let block_info = match node.client().get_block_verbose(block.hash.clone()) {
             Ok(bi) => bi,
@@ -645,9 +864,16 @@ impl<BC: BtcClient> ForkScanner<BC> {
             }
         };
 
-        for (idx,tx) in block_info.tx.iter().enumerate() {
+        for (idx, tx) in block_info.tx.iter().enumerate() {
             let value = tx.vout.iter().fold(0., |a, amt| a + amt.value);
-            if let Err(e) = Transaction::create(&self.db_conn, idx, &tx.txid, &tx.hex, value) {
+            if let Err(e) = Transaction::create(
+                &self.db_conn,
+                block.hash.to_string(),
+                idx,
+                &tx.txid,
+                &tx.hex,
+                value,
+            ) {
                 error!("Could not insert transaction {:?}", e);
             }
         }
@@ -876,7 +1102,7 @@ impl<BC: BtcClient> ForkScanner<BC> {
             loop {
                 block1 = block1.parent(&self.db_conn).ok()?;
 
-                let desc = block1.descendants(&self.db_conn).ok()?;
+                let desc = block1.descendants(&self.db_conn, None).ok()?;
 
                 let fork = desc.into_iter().find(|b| b.hash == tip.hash.to_string());
 
@@ -1015,36 +1241,46 @@ mod test {
     use diesel::Connection;
 
     fn chaintips_setup() -> Vec<GetChainTipsResultTip> {
-        vec![
-            GetChainTipsResultTip {
-                branch_length: 8,
-                hash: btc::BlockHash::from_str("0000000000000000000501b978d69da3d476ada6a41aba60a42612806204013a").expect("Bad hash"),
-                height: 78000,
-                status: GetChainTipsResultStatus::HeadersOnly,
-            }
-        ]
+        vec![GetChainTipsResultTip {
+            branch_length: 8,
+            hash: btc::BlockHash::from_str(
+                "0000000000000000000501b978d69da3d476ada6a41aba60a42612806204013a",
+            )
+            .expect("Bad hash"),
+            height: 78000,
+            status: GetChainTipsResultStatus::HeadersOnly,
+        }]
     }
 
-    fn blockheader_setup() -> impl Iterator<Item=GetBlockHeaderResult> {
-        let items = vec![
-            GetBlockHeaderResult {
-                hash: btc::BlockHash::from_str("0000000000000000000501b978d69da3d476ada6a41aba60a42612806204013a").expect("Bad hash"),
-                confirmations: 3,
-                height: 77999,
-                version: 0,
-                version_hex: None,
-                merkle_root: btc::TxMerkleNode::from_str("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff").expect("Bad merkle node"),
-                time: 1,
-                median_time: None,
-                nonce: 4,
-                bits: "".into(),
-                difficulty: 93.0,
-                chainwork: vec![],
-                n_tx: 5,
-                previous_block_hash: Some(btc::BlockHash::from_str("00000000000000000001ca4713bbb6900e61c6e3d6cbcbec958c0c580711afeb").expect("Bad hash")),
-                next_block_hash: None,
-            }
-        ];
+    fn blockheader_setup() -> impl Iterator<Item = GetBlockHeaderResult> {
+        let items = vec![GetBlockHeaderResult {
+            hash: btc::BlockHash::from_str(
+                "0000000000000000000501b978d69da3d476ada6a41aba60a42612806204013a",
+            )
+            .expect("Bad hash"),
+            confirmations: 3,
+            height: 77999,
+            version: 0,
+            version_hex: None,
+            merkle_root: btc::TxMerkleNode::from_str(
+                "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            )
+            .expect("Bad merkle node"),
+            time: 1,
+            median_time: None,
+            nonce: 4,
+            bits: "".into(),
+            difficulty: 93.0,
+            chainwork: vec![],
+            n_tx: 5,
+            previous_block_hash: Some(
+                btc::BlockHash::from_str(
+                    "00000000000000000001ca4713bbb6900e61c6e3d6cbcbec958c0c580711afeb",
+                )
+                .expect("Bad hash"),
+            ),
+            next_block_hash: None,
+        }];
 
         items.into_iter()
     }
@@ -1084,7 +1320,11 @@ mod test {
         scanner.clients[0]
             .client
             .expect_get_block_header_info()
-            .return_once(move |_| Err(bitcoincore_rpc::Error::Io(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))));
+            .return_once(move |_| {
+                Err(bitcoincore_rpc::Error::Io(std::io::Error::from(
+                    std::io::ErrorKind::ConnectionRefused,
+                )))
+            });
 
         {
             let client = &scanner.clients[0].client;
@@ -1106,9 +1346,7 @@ mod test {
             .client
             .expect_get_block_header_info()
             .times(1)
-            .returning(move |_| {
-                Ok(blockheaders.next().expect("Out of headers"))
-            });
+            .returning(move |_| Ok(blockheaders.next().expect("Out of headers")));
 
         {
             let client = &scanner.clients[0].client;

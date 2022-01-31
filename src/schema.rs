@@ -6,6 +6,7 @@ table! {
         connected -> Bool,
         first_seen_by -> Int8,
         headers_only -> Bool,
+        work -> Varchar,
     }
 }
 
@@ -51,18 +52,28 @@ table! {
 }
 
 table! {
-    stale_candidate (hash) {
-        hash -> Varchar,
-        n_children -> Int4,
+    stale_candidate (height) {
         height -> Int8,
+        n_children -> Int4,
         confirmed_in_one_branch_total -> Float8,
         double_spent_in_one_branch_total -> Float8,
         rbf_total -> Float8,
+        height_processed -> Nullable<Int8>,
+    }
+}
+
+table! {
+    stale_candidate_children (root_id) {
+        candidate_height -> Int8,
+        root_id -> Varchar,
+        tip_id -> Varchar,
+        len -> Int4,
     }
 }
 
 table! {
     transaction (txid) {
+        block_id -> Varchar,
         txid -> Varchar,
         is_coinbase -> Bool,
         hex -> Varchar,
@@ -78,6 +89,7 @@ table! {
 }
 
 joinable!(peers -> nodes (node_id));
+joinable!(stale_candidate_children -> stale_candidate (candidate_height));
 
 allow_tables_to_appear_in_same_query!(
     blocks,
@@ -86,6 +98,7 @@ allow_tables_to_appear_in_same_query!(
     nodes,
     peers,
     stale_candidate,
+    stale_candidate_children,
     transaction,
     valid_blocks,
 );
