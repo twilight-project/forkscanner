@@ -9,13 +9,33 @@ CREATE TABLE stale_candidate (
 	PRIMARY KEY(height)
 );
 
+CREATE TABLE rbf_by (
+    candidate_height bigint not null,
+	txid varchar not null,
+	PRIMARY KEY(candidate_height, txid),
+	CONSTRAINT fk_rbf_by
+	    FOREIGN KEY(candidate_height)
+		REFERENCES stale_candidate(height)
+		ON DELETE CASCADE
+);
+
+CREATE TABLE double_spent_by (
+    candidate_height bigint not null,
+	txid varchar not null,
+	PRIMARY KEY(candidate_height, txid),
+	CONSTRAINT fk_rbf_by
+	    FOREIGN KEY(candidate_height)
+		REFERENCES stale_candidate(height)
+		ON DELETE CASCADE
+);
+
 CREATE TABLE transaction (
 	block_id varchar not null,
 	txid varchar not null,
 	is_coinbase boolean not null,
 	hex varchar not null,
 	amount float(53) not null,
-	PRIMARY KEY(txid)
+	PRIMARY KEY(block_id, txid)
 );
 
 CREATE TABLE stale_candidate_children (

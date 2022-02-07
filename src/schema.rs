@@ -1,4 +1,6 @@
-table! {
+// @generated automatically by Diesel CLI.
+
+diesel::table! {
     blocks (hash) {
         hash -> Varchar,
         height -> Int8,
@@ -10,7 +12,7 @@ table! {
     }
 }
 
-table! {
+diesel::table! {
     chaintips (id) {
         id -> Int8,
         node -> Int8,
@@ -21,14 +23,21 @@ table! {
     }
 }
 
-table! {
+diesel::table! {
+    double_spent_by (candidate_height, txid) {
+        candidate_height -> Int8,
+        txid -> Varchar,
+    }
+}
+
+diesel::table! {
     invalid_blocks (hash, node) {
         hash -> Varchar,
         node -> Int8,
     }
 }
 
-table! {
+diesel::table! {
     nodes (id) {
         id -> Int8,
         node -> Varchar,
@@ -41,7 +50,7 @@ table! {
     }
 }
 
-table! {
+diesel::table! {
     peers (id) {
         id -> Int8,
         node_id -> Int8,
@@ -51,7 +60,14 @@ table! {
     }
 }
 
-table! {
+diesel::table! {
+    rbf_by (candidate_height, txid) {
+        candidate_height -> Int8,
+        txid -> Varchar,
+    }
+}
+
+diesel::table! {
     stale_candidate (height) {
         height -> Int8,
         n_children -> Int4,
@@ -62,7 +78,7 @@ table! {
     }
 }
 
-table! {
+diesel::table! {
     stale_candidate_children (root_id) {
         candidate_height -> Int8,
         root_id -> Varchar,
@@ -71,8 +87,8 @@ table! {
     }
 }
 
-table! {
-    transaction (txid) {
+diesel::table! {
+    transaction (block_id, txid) {
         block_id -> Varchar,
         txid -> Varchar,
         is_coinbase -> Bool,
@@ -81,22 +97,24 @@ table! {
     }
 }
 
-table! {
+diesel::table! {
     valid_blocks (hash, node) {
         hash -> Varchar,
         node -> Int8,
     }
 }
 
-joinable!(peers -> nodes (node_id));
-joinable!(stale_candidate_children -> stale_candidate (candidate_height));
+diesel::joinable!(peers -> nodes (node_id));
+diesel::joinable!(stale_candidate_children -> stale_candidate (candidate_height));
 
-allow_tables_to_appear_in_same_query!(
+diesel::allow_tables_to_appear_in_same_query!(
     blocks,
     chaintips,
+    double_spent_by,
     invalid_blocks,
     nodes,
     peers,
+    rbf_by,
     stale_candidate,
     stale_candidate_children,
     transaction,

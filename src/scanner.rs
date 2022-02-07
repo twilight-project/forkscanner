@@ -3,6 +3,7 @@ use bitcoin::consensus::encode::serialize_hex;
 use bitcoincore_rpc::bitcoin as btc;
 use bitcoincore_rpc::bitcoincore_rpc_json::{
     GetBlockHeaderResult, GetChainTipsResultStatus, GetChainTipsResultTip, GetPeerInfoResult,
+    GetRawTransactionResult,
 };
 use bitcoincore_rpc::Error as BitcoinRpcError;
 use bitcoincore_rpc::{Auth, Client, RpcApi};
@@ -13,7 +14,11 @@ use log::{debug, error, info};
 #[cfg(test)]
 use mockall::*;
 use serde::Deserialize;
-use std::{collections::HashSet, iter::FromIterator, str::FromStr};
+use std::{
+    collections::{HashMap, HashSet},
+    iter::FromIterator,
+    str::FromStr,
+};
 use thiserror::Error;
 
 const MAX_ANCESTRY_DEPTH: usize = 100;
@@ -117,6 +122,11 @@ pub trait BtcClient: Sized {
     ) -> Result<GetBlockHeaderResult, bitcoincore_rpc::Error>;
     fn get_block_hex(&self, hash: &btc::BlockHash) -> Result<String, bitcoincore_rpc::Error>;
     fn get_peer_info(&self) -> Result<Vec<GetPeerInfoResult>, bitcoincore_rpc::Error>;
+    fn get_raw_transaction_info<'a>(
+        &self,
+        txid: &btc::Txid,
+        block_hash: Option<&'a btc::BlockHash>,
+    ) -> Result<GetRawTransactionResult, bitcoincore_rpc::Error>;
     fn set_network_active(&self, active: bool)
         -> Result<serde_json::Value, bitcoincore_rpc::Error>;
     fn submit_block(
@@ -188,8 +198,17 @@ impl BtcClient for Client {
     fn get_block_hex(&self, hash: &btc::BlockHash) -> Result<String, bitcoincore_rpc::Error> {
         RpcApi::get_block_hex(self, hash)
     }
+
     fn get_peer_info(&self) -> Result<Vec<GetPeerInfoResult>, bitcoincore_rpc::Error> {
         RpcApi::get_peer_info(self)
+    }
+
+    fn get_raw_transaction_info(
+        &self,
+        txid: &btc::Txid,
+        block_hash: Option<&btc::BlockHash>,
+    ) -> Result<GetRawTransactionResult, bitcoincore_rpc::Error> {
+        RpcApi::get_raw_transaction_info(self, txid, block_hash)
     }
 
     fn set_network_active(
@@ -640,178 +659,357 @@ impl<BC: BtcClient> ForkScanner<BC> {
                     && candidate.height_processed.unwrap() <= candidate.height + DOUBLE_SPEND_RANGE)
             {
                 self.set_children(&mut candidate);
-                self.set_conflicting_txs(&candidate);
+                self.set_conflicting_txs(&mut candidate, tip_height);
             }
         }
     }
 
     fn set_children(&self, candidate: &mut StaleCandidate) {
         if let Err(e) = candidate.purge_children(&self.db_conn) {
-		    error!("Could not purge children! {:?}", e);
-			return;
-		};
+            error!("Could not purge children! {:?}", e);
+            return;
+        };
 
-		let blocks = match Block::get_at_height(&self.db_conn, candidate.height) {
-			Ok(b) => b,
-			Err(e) => {
-				error!("Database error {:?}", e);
-				return;
-			}
-		};
+        let blocks = match Block::get_at_height(&self.db_conn, candidate.height) {
+            Ok(b) => b,
+            Err(e) => {
+                error!("Database error {:?}", e);
+                return;
+            }
+        };
 
-		for block in blocks {
-		    let descendants = match block.descendants_by_work(&self.db_conn, block.height + STALE_WINDOW) {
-			    Ok(d) => d,
-				Err(e) => {
-				    error!("Database error {:?}", e);
-					continue;
-				}
-			};
+        for block in blocks {
+            let descendants =
+                match block.descendants_by_work(&self.db_conn, block.height + STALE_WINDOW) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        error!("Database error {:?}", e);
+                        continue;
+                    }
+                };
 
-			match StaleCandidateChildren::create(&self.db_conn, &block, descendants.last().unwrap(), descendants.len() as i32) {
-			    Ok(_) => (),
-				Err(e) => {
-				    error!("Database error {:?}", e);
-				}
-			}
-			candidate.n_children += 1;
-		}
+            match StaleCandidateChildren::create(
+                &self.db_conn,
+                &block,
+                descendants.last().unwrap(),
+                descendants.len() as i32,
+            ) {
+                Ok(_) => (),
+                Err(e) => {
+                    error!("Database error {:?}", e);
+                }
+            }
+            candidate.n_children += 1;
+        }
 
-		if let Err(e) = candidate.update(&self.db_conn) {
-		    error!("Database error {:?}", e);
-		};
+        if let Err(e) = candidate.update(&self.db_conn) {
+            error!("Database error {:?}", e);
+        };
     }
 
-    fn set_conflicting_txs(&self, candidate: &StaleCandidate) {
-	    let confirmed_in_one = self.get_confirmed_in_one_branch(candidate);
-	}
+    fn set_conflicting_txs(&self, candidate: &mut StaleCandidate, tip_height: i64) {
+        if let Some(confirmed_in_one) = self.get_confirmed_in_one_branch(candidate) {
+            // TODO: this handles only 2 branches, shortest and longest.
+            let client = self.clients.iter().next().unwrap().clone();
 
-	fn get_confirmed_in_one_branch(&self, candidate: &StaleCandidate) -> Option<Vec<String>> {
-	    // TODO: handle more than two branches
-	    if candidate.n_children != 2 {
-		    return None;
-		}
+            fn map_key(tx_id: String, vout: u32) -> String {
+                format!("{}##{}", tx_id, vout)
+            }
 
-		let children = match candidate.children(&self.db_conn) {
-		    Ok(c) => c,
-			Err(e) => {
-			    error!("Database error {:?}", e);
-				return None;
+            let confirmed_in_one_total = if confirmed_in_one.len() == 0 {
+                0.0
+            } else {
+                Transaction::amount_for_txs(&self.db_conn, &confirmed_in_one).unwrap()
+            };
+
+            let children = match candidate.children(&self.db_conn) {
+                Ok(c) => c,
+                Err(e) => {
+                    error!("Database error {:?}", e);
+                    return;
+                }
+            };
+
+            let block = match Block::get(&self.db_conn, &children[0].root_id) {
+                Ok(b) => b,
+                Err(e) => {
+                    error!("Database error {:?}", e);
+                    return;
+                }
+            };
+
+            let short_txs: Vec<_> =
+                match block.block_and_descendant_transactions(&self.db_conn, DOUBLE_SPEND_RANGE) {
+                    Ok(txs) => txs,
+                    Err(e) => {
+                        error!("Database error {:?}", e);
+                        return;
+                    }
+                };
+
+            let mut short_map: HashMap<String, GetRawTransactionResult> = HashMap::new();
+
+            for transaction in short_txs {
+                let txid = btc::Txid::from_str(&transaction.txid).unwrap();
+                let hash = btc::BlockHash::from_str(&transaction.block_id).unwrap();
+                let tx = match client.client().get_raw_transaction_info(&txid, Some(&hash)) {
+                    Ok(tx) => tx,
+                    Err(e) => {
+                        error!("RPC error {:?}", e);
+                        return;
+                    }
+                };
+                for input in &tx.vin {
+                    short_map.insert(
+                        map_key(input.txid.unwrap().to_string(), input.vout.unwrap()),
+                        tx.clone(),
+                    );
+                }
+            }
+
+            let block = match Block::get(&self.db_conn, &children[1].root_id) {
+                Ok(b) => b,
+                Err(e) => {
+                    error!("Database error {:?}", e);
+                    return;
+                }
+            };
+
+            let long_txs: Vec<_> =
+                match block.block_and_descendant_transactions(&self.db_conn, DOUBLE_SPEND_RANGE) {
+                    Ok(txs) => txs,
+                    Err(e) => {
+                        error!("Database error {:?}", e);
+                        return;
+                    }
+                };
+
+            let mut long_map: HashMap<String, GetRawTransactionResult> = HashMap::new();
+
+            for transaction in long_txs {
+                let txid = btc::Txid::from_str(&transaction.txid).unwrap();
+                let hash = btc::BlockHash::from_str(&transaction.block_id).unwrap();
+                let tx = match client.client().get_raw_transaction_info(&txid, Some(&hash)) {
+                    Ok(tx) => tx,
+                    Err(e) => {
+                        error!("RPC error {:?}", e);
+                        return;
+                    }
+                };
+                for input in &tx.vin {
+                    long_map.insert(
+                        map_key(input.txid.unwrap().to_string(), input.vout.unwrap()),
+                        tx.clone(),
+                    );
+                }
+            }
+
+            let double_spent: (f64, Vec<_>) = short_map
+                .iter()
+                .filter_map(|(txout, tx)| {
+                    if long_map.contains_key(txout) && tx.txid != long_map.get(txout).unwrap().txid
+                    {
+                        Some((tx.clone(), long_map.get(txout).unwrap().clone()))
+                    } else {
+                        None
+                    }
+                })
+                .fold((0.0, vec![]), |(mut amt, mut by), b| {
+                    amt += b.0.vout.iter().fold(0.0, |a, b| a + b.value.as_btc());
+                    by.push(b.1.txid.to_string());
+                    (amt, by)
+                });
+
+            let rbf: (f64, Vec<_>) = short_map
+                .iter()
+                .filter_map(|(txout, tx)| {
+                    if !long_map.contains_key(txout) || long_map.get(txout).unwrap().txid == tx.txid
+                    {
+                        None
+                    } else if tx.vout.len() != long_map.get(txout).unwrap().vout.len() {
+                        None
+                    } else {
+                        let mut txouts = tx.vout.clone();
+                        let mut otherouts = long_map.get(txout).unwrap().vout.clone();
+
+                        txouts.sort_by(|l, r| {
+                            if l.script_pub_key.hex < r.script_pub_key.hex {
+                                std::cmp::Ordering::Less
+                            } else {
+                                std::cmp::Ordering::Greater
+                            }
+                        });
+
+                        otherouts.sort_by(|l, r| {
+                            if l.script_pub_key.hex < r.script_pub_key.hex {
+                                std::cmp::Ordering::Less
+                            } else {
+                                std::cmp::Ordering::Greater
+                            }
+                        });
+
+                        let same = !txouts.iter().zip(otherouts).any(|(l, r)| {
+                            l.script_pub_key != r.script_pub_key
+                                || (l.value.as_btc() - r.value.as_btc()).abs() > 0.0001
+                        });
+                        if same {
+                            Some((tx.clone(), long_map.get(txout).unwrap().clone()))
+                        } else {
+                            None
+                        }
+                    }
+                })
+                .fold((0.0, vec![]), |(mut amt, mut by), b| {
+                    amt += b.0.vout.iter().fold(0.0, |a, b| a + b.value.as_btc());
+                    by.push(b.1.txid.to_string());
+                    (amt, by)
+                });
+
+            candidate.confirmed_in_one_branch_total = confirmed_in_one_total;
+            candidate.double_spent_in_one_branch_total = double_spent.0;
+            candidate.rbf_total = rbf.0;
+            if let Err(e) = candidate.update_double_spent_by(&self.db_conn, &double_spent.1) {
+			    error!("Failed to update double spent by {:?}", e);
 			}
-		};
-
-		let headers_only = children.iter().all(|c| {
-		    match Block::get(&self.db_conn, &c.root_id) {
-			    Ok(b) => b.headers_only,
-				_ => false,
+            if let Err(e) = candidate.update_rbf_by(&self.db_conn, &rbf.1) {
+			    error!("Failed to update rbf by {:?}", e);
 			}
-		});
 
-		if headers_only {
-		    return None;
-		}
+            candidate.height_processed = Some(tip_height);
+            if let Err(e) = candidate.update(&self.db_conn) {
+                error!("Failed to update stale candidate {}", e);
+            }
+        }
+    }
 
-		let block = match Block::get(&self.db_conn, &children[0].root_id) {
-		    Ok(b) => b,
-			Err(e) => {
-			    error!("Database error {:?}", e);
-				return None;
-			}
-		};
+    fn get_confirmed_in_one_branch(&self, candidate: &StaleCandidate) -> Option<Vec<String>> {
+        // TODO: handle more than two branches
+        if candidate.n_children != 2 {
+            return None;
+        }
 
-		let mut short_txs = match block.num_transactions(&self.db_conn) {
-		    Ok(txs) => txs > 0,
-			Err(e) => {
-			    error!("Database error {:?}", e);
-				return None;
-			}
-		};
+        let children = match candidate.children(&self.db_conn) {
+            Ok(c) => c,
+            Err(e) => {
+                error!("Database error {:?}", e);
+                return None;
+            }
+        };
 
-		let descendants = match block.descendants(&self.db_conn, Some(DOUBLE_SPEND_RANGE)) {
-		    Ok(d) => d,
-			Err(e) => {
-			    error!("Database error {:?}", e);
-				return None;
-			}
-		};
+        let headers_only = children
+            .iter()
+            .all(|c| match Block::get(&self.db_conn, &c.root_id) {
+                Ok(b) => b.headers_only,
+                _ => false,
+            });
 
-		for desc in descendants {
-		    short_txs &= match desc.num_transactions(&self.db_conn) {
-			    Ok(txs) => txs > 0,
-				Err(e) => {
-				    error!("Database error {:?}", e);
-					return None;
-				}
-			};
-		}
+        if headers_only {
+            return None;
+        }
 
-		if !short_txs {
-		    return None;
-		}
+        let block = match Block::get(&self.db_conn, &children[0].root_id) {
+            Ok(b) => b,
+            Err(e) => {
+                error!("Database error {:?}", e);
+                return None;
+            }
+        };
 
-		let short_tx_ids: Vec<String> = match block.block_and_descendant_transactions(&self.db_conn, DOUBLE_SPEND_RANGE) {
-		    Ok(txs) => txs.into_iter().map(|t| t.txid).collect(),
-			Err(e) => {
-			    error!("Database error {:?}", e);
-				return None;
-			}
-		};
+        let mut short_txs = match block.num_transactions(&self.db_conn) {
+            Ok(txs) => txs > 0,
+            Err(e) => {
+                error!("Database error {:?}", e);
+                return None;
+            }
+        };
 
-		let block = match Block::get(&self.db_conn, &children[1].root_id) {
-		    Ok(b) => b,
-			Err(e) => {
-			    error!("Database error {:?}", e);
-				return None;
-			}
-		};
+        let descendants = match block.descendants(&self.db_conn, Some(DOUBLE_SPEND_RANGE)) {
+            Ok(d) => d,
+            Err(e) => {
+                error!("Database error {:?}", e);
+                return None;
+            }
+        };
 
-		let mut long_txs = match block.num_transactions(&self.db_conn) {
-		    Ok(txs) => txs > 0,
-			Err(e) => {
-			    error!("Database error {:?}", e);
-				return None;
-			}
-		};
+        for desc in descendants {
+            short_txs &= match desc.num_transactions(&self.db_conn) {
+                Ok(txs) => txs > 0,
+                Err(e) => {
+                    error!("Database error {:?}", e);
+                    return None;
+                }
+            };
+        }
 
-		let descendants = match block.descendants(&self.db_conn, Some(DOUBLE_SPEND_RANGE)) {
-		    Ok(d) => d,
-			Err(e) => {
-			    error!("Database error {:?}", e);
-				return None;
-			}
-		};
+        if !short_txs {
+            return None;
+        }
 
-		for desc in descendants {
-		    long_txs &= match desc.num_transactions(&self.db_conn) {
-			    Ok(txs) => txs > 0,
-				Err(e) => {
-				    error!("Database error {:?}", e);
-					return None;
-				}
-			}
-		}
+        let short_tx_ids: Vec<String> =
+            match block.block_and_descendant_transactions(&self.db_conn, DOUBLE_SPEND_RANGE) {
+                Ok(txs) => txs.into_iter().map(|t| t.txid).collect(),
+                Err(e) => {
+                    error!("Database error {:?}", e);
+                    return None;
+                }
+            };
 
-		if !long_txs {
-		    return None;
-		}
+        let block = match Block::get(&self.db_conn, &children[1].root_id) {
+            Ok(b) => b,
+            Err(e) => {
+                error!("Database error {:?}", e);
+                return None;
+            }
+        };
 
-		let long_tx_ids: Vec<String> = match block.block_and_descendant_transactions(&self.db_conn, DOUBLE_SPEND_RANGE) {
-		    Ok(txs) => txs.into_iter().map(|t| t.txid).collect(),
-			Err(e) => {
-			    error!("Database error {:?}", e);
-				return None;
-			}
-		};
+        let mut long_txs = match block.num_transactions(&self.db_conn) {
+            Ok(txs) => txs > 0,
+            Err(e) => {
+                error!("Database error {:?}", e);
+                return None;
+            }
+        };
 
-		let short = HashSet::<_>::from_iter(short_tx_ids.into_iter());
-		let long = HashSet::<_>::from_iter(long_tx_ids.into_iter());
+        let descendants = match block.descendants(&self.db_conn, Some(DOUBLE_SPEND_RANGE)) {
+            Ok(d) => d,
+            Err(e) => {
+                error!("Database error {:?}", e);
+                return None;
+            }
+        };
 
-		if short.len() < long.len() {
-		    Some(short.difference(&long).cloned().collect())
-		} else {
-		    Some(short.symmetric_difference(&long).cloned().collect())
-		}
-	}
+        for desc in descendants {
+            long_txs &= match desc.num_transactions(&self.db_conn) {
+                Ok(txs) => txs > 0,
+                Err(e) => {
+                    error!("Database error {:?}", e);
+                    return None;
+                }
+            }
+        }
+
+        if !long_txs {
+            return None;
+        }
+
+        let long_tx_ids: Vec<String> =
+            match block.block_and_descendant_transactions(&self.db_conn, DOUBLE_SPEND_RANGE) {
+                Ok(txs) => txs.into_iter().map(|t| t.txid).collect(),
+                Err(e) => {
+                    error!("Database error {:?}", e);
+                    return None;
+                }
+            };
+
+        let short = HashSet::<_>::from_iter(short_tx_ids.into_iter());
+        let long = HashSet::<_>::from_iter(long_tx_ids.into_iter());
+
+        if short.len() < long.len() {
+            Some(short.difference(&long).cloned().collect())
+        } else {
+            Some(short.symmetric_difference(&long).cloned().collect())
+        }
+    }
 
     fn find_stale_candidates(&self) {
         let tip_height = match Block::max_height(&self.db_conn) {
@@ -1351,6 +1549,7 @@ mod test {
         {
             let client = &scanner.clients[0].client;
             let result = scanner.process_client(client, node);
+			println!("TJDEBUG rezz {:?}", result);
             assert!(result.is_ok());
         }
     }
