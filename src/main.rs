@@ -19,5 +19,6 @@ fn main() {
         std::thread::sleep(duration);
     });
 
+    info!("Starting RPC server on 127.0.0.1:8339");
     run_server("127.0.0.1:8339", &db_url);
 }

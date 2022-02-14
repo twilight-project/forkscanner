@@ -18,6 +18,11 @@ struct NodeId {
 }
 
 #[derive(Debug, Deserialize)]
+struct TipArgs {
+    active_only: bool,
+}
+
+#[derive(Debug, Deserialize)]
 struct TxId {
     id: String,
 }
@@ -136,13 +141,33 @@ fn remove_node(conn: Conn, params: Params) -> Result<Value> {
     }
 }
 
-fn get_active_tips(conn: Conn, _params: Params) -> Result<Value> {
-    if let Ok(tips) = Chaintip::list_active(&conn) {
-        Ok(serde_json::Value::String(
-            serde_json::to_string(&tips).unwrap(),
-        ))
-    } else {
-        Err(JsonRpcError::internal_error())
+fn get_tips(conn: Conn, params: Params) -> Result<Value> {
+    match params.parse::<TipArgs>() {
+        Ok(args) => {
+		    let tips = if args.active_only {
+			    Chaintip::list_active(&conn)
+			} else {
+			    Chaintip::list(&conn)
+			};
+
+			match tips {
+			    Ok(t) => {
+				    match serde_json::to_value(t) {
+					    Ok(t) => Ok(t),
+						Err(_) => {
+							Err(JsonRpcError::internal_error())
+						}
+					}
+				}
+				Err(_) => {
+					Err(JsonRpcError::internal_error())
+				}
+			}
+        }
+        Err(args) => {
+            let err = JsonRpcError::invalid_params(format!("Invalid parameters, {:?}", args));
+            Err(err)
+        }
     }
 }
 
@@ -155,9 +180,9 @@ pub fn run_server(listen: &str, db_url: &str) {
 
     let mut io = IoHandler::new();
     let p = pool.clone();
-    io.add_sync_method("get_active_tips", move |params: Params| {
+    io.add_sync_method("get_tips", move |params: Params| {
         let conn = p.get().unwrap();
-        get_active_tips(conn, params)
+        get_tips(conn, params)
     });
 
     let p = pool.clone();

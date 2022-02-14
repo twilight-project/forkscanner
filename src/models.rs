@@ -59,6 +59,12 @@ impl Chaintip {
         chaintips.filter(status.eq("active")).load(conn)
     }
 
+    /// List all active tips.
+    pub fn list(conn: &PgConnection) -> QueryResult<Vec<Chaintip>> {
+        use crate::schema::chaintips::dsl::*;
+        chaintips.load(conn)
+    }
+
     /// List active tips that are ahead of a given height.
     pub fn list_active_gt(conn: &PgConnection, tip_height: i64) -> QueryResult<Vec<Chaintip>> {
         use crate::schema::chaintips::dsl::*;
