@@ -106,6 +106,7 @@ diesel::table! {
 
 diesel::joinable!(peers -> nodes (node_id));
 diesel::joinable!(stale_candidate_children -> stale_candidate (candidate_height));
+diesel::joinable!(transaction -> blocks (block_id));
 
 diesel::allow_tables_to_appear_in_same_query!(
     blocks,

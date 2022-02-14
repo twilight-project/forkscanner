@@ -2,14 +2,14 @@ use bitcoincore_rpc::bitcoincore_rpc_json::GetBlockHeaderResult;
 use chrono::prelude::*;
 use diesel::prelude::*;
 use diesel::result::QueryResult;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::schema::{
     blocks, chaintips, double_spent_by, invalid_blocks, nodes, peers, rbf_by, stale_candidate,
     stale_candidate_children, transaction, valid_blocks,
 };
 
-#[derive(Serialize, Debug, AsChangeset, QueryableByName, Queryable, Insertable)]
+#[derive(Deserialize, Serialize, Debug, AsChangeset, QueryableByName, Queryable, Insertable)]
 #[table_name = "chaintips"]
 pub struct Chaintip {
     pub id: i64,
@@ -170,7 +170,7 @@ pub struct Height {
     pub height: i64,
 }
 
-#[derive(AsChangeset, QueryableByName, Queryable, Insertable)]
+#[derive(Serialize, AsChangeset, QueryableByName, Queryable, Insertable)]
 #[table_name = "blocks"]
 pub struct Block {
     pub hash: String,
@@ -492,6 +492,29 @@ impl Transaction {
             .into_iter()
             .fold(0.0, |a, b| a + b.unwrap_or_default()))
     }
+
+    pub fn tx_block_and_descendants(conn: &PgConnection, id: String) -> QueryResult<Vec<Block>> {
+        use crate::schema::blocks::dsl as bdsl;
+        use crate::schema::transaction::dsl::*;
+
+        let blocks: Vec<(Transaction, Block)> = transaction
+            .inner_join(bdsl::blocks)
+            .filter(txid.eq(id))
+            .load(conn)?;
+
+        let descendants: Vec<Block> = blocks
+            .into_iter()
+            .filter_map(|b| {
+                if let Ok(desc) = b.1.descendants(conn, None) {
+                    Some(desc)
+                } else {
+                    None
+                }
+            })
+            .flatten()
+            .collect();
+        Ok(descendants)
+    }
 }
 
 #[derive(AsChangeset, QueryableByName, Queryable, Insertable)]
@@ -667,6 +690,33 @@ impl Node {
     pub fn get_mirrors(conn: &PgConnection) -> QueryResult<Vec<Node>> {
         use crate::schema::nodes::dsl::*;
         nodes.filter(mirror_rpc_port.is_not_null()).load(conn)
+    }
+
+    pub fn remove(conn: &PgConnection, node_id: i64) -> QueryResult<usize> {
+        use crate::schema::nodes::dsl::*;
+        diesel::delete(nodes).filter(id.eq(node_id)).execute(conn)
+    }
+
+    pub fn insert(
+        conn: &PgConnection,
+        name: String,
+        host: String,
+        port: i32,
+        mirror: Option<i32>,
+        user: String,
+        pass: String,
+    ) -> QueryResult<Node> {
+        use crate::schema::nodes::dsl::*;
+        diesel::insert_into(nodes)
+            .values((
+                node.eq(name),
+                rpc_host.eq(host),
+                rpc_port.eq(port),
+                mirror_rpc_port.eq(mirror),
+                rpc_user.eq(user),
+                rpc_pass.eq(pass),
+            ))
+            .get_result(conn)
     }
 }
 

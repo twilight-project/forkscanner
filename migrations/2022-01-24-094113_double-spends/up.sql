@@ -35,7 +35,11 @@ CREATE TABLE transaction (
 	is_coinbase boolean not null,
 	hex varchar not null,
 	amount float(53) not null,
-	PRIMARY KEY(block_id, txid)
+	PRIMARY KEY(block_id, txid),
+	CONSTRAINT fk_block_id
+	    FOREIGN KEY(block_id)
+		REFERENCES blocks(hash)
+		ON DELETE CASCADE
 );
 
 CREATE TABLE stale_candidate_children (

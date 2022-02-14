@@ -869,11 +869,11 @@ impl<BC: BtcClient> ForkScanner<BC> {
             candidate.double_spent_in_one_branch_total = double_spent.0;
             candidate.rbf_total = rbf.0;
             if let Err(e) = candidate.update_double_spent_by(&self.db_conn, &double_spent.1) {
-			    error!("Failed to update double spent by {:?}", e);
-			}
+                error!("Failed to update double spent by {:?}", e);
+            }
             if let Err(e) = candidate.update_rbf_by(&self.db_conn, &rbf.1) {
-			    error!("Failed to update rbf by {:?}", e);
-			}
+                error!("Failed to update rbf by {:?}", e);
+            }
 
             candidate.height_processed = Some(tip_height);
             if let Err(e) = candidate.update(&self.db_conn) {
@@ -1436,7 +1436,7 @@ impl<BC: BtcClient> ForkScanner<BC> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use diesel::Connection;
+    use diesel::{sql_query, Connection, RunQueryDsl};
 
     fn chaintips_setup() -> Vec<GetChainTipsResultTip> {
         vec![GetChainTipsResultTip {
@@ -1450,57 +1450,35 @@ mod test {
         }]
     }
 
-    fn blockheader_setup() -> impl Iterator<Item = GetBlockHeaderResult> {
-        let items = vec![GetBlockHeaderResult {
-            hash: btc::BlockHash::from_str(
-                "0000000000000000000501b978d69da3d476ada6a41aba60a42612806204013a",
-            )
-            .expect("Bad hash"),
-            confirmations: 3,
-            height: 77999,
-            version: 0,
-            version_hex: None,
-            merkle_root: btc::TxMerkleNode::from_str(
-                "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-            )
-            .expect("Bad merkle node"),
-            time: 1,
-            median_time: None,
-            nonce: 4,
-            bits: "".into(),
-            difficulty: 93.0,
-            chainwork: vec![],
-            n_tx: 5,
-            previous_block_hash: Some(
-                btc::BlockHash::from_str(
-                    "00000000000000000001ca4713bbb6900e61c6e3d6cbcbec958c0c580711afeb",
-                )
-                .expect("Bad hash"),
-            ),
-            next_block_hash: None,
-        }];
-
+    fn blockheaders1() -> impl Iterator<Item = GetBlockHeaderResult> {
+        let items: Vec<GetBlockHeaderResult> =
+            serde_json::from_str(include_str!("data/blockheaders1.json")).expect("Bad JSON");
         items.into_iter()
+    }
+
+    fn setup_blocks1(conn: &PgConnection) {
+        let queries = include_str!("data/blocks1.txt");
+        sql_query(queries).execute(conn).expect("Query failed");
     }
 
     #[test]
     fn test_process_client() {
         let db_url = "postgres://forktester:forktester@localhost/forktester";
         let db_conn = PgConnection::establish(&db_url).expect("Connection failed");
+        let test_conn = PgConnection::establish(&db_url).expect("Connection failed");
 
         let ctx = MockBtcClient::new_context();
         ctx.expect()
             .times(3)
-            .returning(|x, y| Ok(MockBtcClient::default()));
+            .returning(|_x, _y| Ok(MockBtcClient::default()));
 
         let mut scanner = ForkScanner::<MockBtcClient>::new(db_conn).expect("Client setup failed");
-        let results: Vec<GetChainTipsResultTip> = vec![];
         scanner.clients[0]
             .client
             .expect_get_chain_tips()
             .returning(|| Ok(vec![]));
-        let node = &scanner.node_list[0];
         {
+            let node = &scanner.node_list[0];
             let client = &scanner.clients[0].client;
             let result = scanner.process_client(client, node);
             assert!(result.is_ok());
@@ -1525,6 +1503,7 @@ mod test {
             });
 
         {
+            let node = &scanner.node_list[0];
             let client = &scanner.clients[0].client;
             let result = scanner.process_client(client, node);
             assert!(result.is_err());
@@ -1533,24 +1512,54 @@ mod test {
         scanner.clients[0].client.checkpoint();
 
         let tips = chaintips_setup();
-        let mut blockheaders = blockheader_setup();
-
-        scanner.clients[0]
-            .client
-            .expect_get_chain_tips()
-            .return_once(move || Ok(tips));
-
-        scanner.clients[0]
-            .client
-            .expect_get_block_header_info()
-            .times(1)
-            .returning(move |_| Ok(blockheaders.next().expect("Out of headers")));
+        let mut blockheaders = blockheaders1();
 
         {
+            let t = test_conn
+                .begin_test_transaction()
+                .expect("Could not open test transaction");
+            let node = &scanner.node_list[0];
+            setup_blocks1(&test_conn);
+
+            scanner.clients[0]
+                .client
+                .expect_get_chain_tips()
+                .return_once(move || Ok(tips));
+
+            scanner.clients[0]
+                .client
+                .expect_get_block_header_info()
+                .times(1)
+                .returning(move |_| Ok(blockheaders.next().expect("Out of headers")));
+
             let client = &scanner.clients[0].client;
-            let result = scanner.process_client(client, node);
-			println!("TJDEBUG rezz {:?}", result);
-            assert!(result.is_ok());
+            scanner
+                .process_client(client, node)
+                .expect("process_client failed");
         }
+
+        test_conn.test_transaction(|| {
+            let _db_setup = diesel::sql_query(include_str!("data/setup_match_children.sql"))
+                .execute(&test_conn)
+                .expect("DB query failed");
+            let tip: Chaintip = serde_json::from_str(include_str!("data/match_children_tips.json"))
+                .expect("Bad JSON");
+
+            scanner
+                .match_children(&tip)
+                .expect("Match children call failed");
+
+            let actives: Vec<_> = Chaintip::list_active(&test_conn)
+                .expect("DB query failed")
+                .into_iter()
+                .map(|tip| (tip.id, tip.parent_chaintip))
+                .collect();
+
+            assert_eq!(
+                actives,
+                vec![(0, None), (1, Some(9)), (4, None), (5, Some(0))]
+            );
+            Ok::<(), ForkScannerError>(())
+        });
     }
 }
