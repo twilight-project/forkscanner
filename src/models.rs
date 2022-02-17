@@ -2,11 +2,14 @@ use bitcoincore_rpc::bitcoincore_rpc_json::GetBlockHeaderResult;
 use chrono::prelude::*;
 use diesel::prelude::*;
 use diesel::result::QueryResult;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-use crate::schema::{blocks, chaintips, invalid_blocks, nodes, peers, valid_blocks};
+use crate::schema::{
+    blocks, chaintips, double_spent_by, invalid_blocks, nodes, peers, rbf_by, stale_candidate,
+    stale_candidate_children, transaction, valid_blocks,
+};
 
-#[derive(Serialize, Debug, AsChangeset, QueryableByName, Queryable, Insertable)]
+#[derive(Deserialize, Serialize, Debug, AsChangeset, QueryableByName, Queryable, Insertable)]
 #[table_name = "chaintips"]
 pub struct Chaintip {
     pub id: i64,
@@ -18,6 +21,7 @@ pub struct Chaintip {
 }
 
 impl Chaintip {
+    /// Update an entry in the chaintips table
     pub fn update(&self, conn: &PgConnection) -> QueryResult<usize> {
         use crate::schema::chaintips::dsl::*;
         diesel::update(chaintips.filter(id.eq(self.id)))
@@ -25,6 +29,7 @@ impl Chaintip {
             .execute(conn)
     }
 
+    /// Get the active chaintip, given a node_id
     pub fn get_active(conn: &PgConnection, node_id: i64) -> QueryResult<Chaintip> {
         use crate::schema::chaintips::dsl::*;
         chaintips
@@ -32,6 +37,7 @@ impl Chaintip {
             .first(conn)
     }
 
+    /// Check if a block hash is marked invalid in the chaintips database
     pub fn get_invalid(conn: &PgConnection, hash: &String) -> QueryResult<Chaintip> {
         use crate::schema::chaintips::dsl::*;
         chaintips
@@ -39,6 +45,7 @@ impl Chaintip {
             .first(conn)
     }
 
+    /// Fetch all invalid chaintips that are ahead of a particular height.
     pub fn list_invalid_gt(conn: &PgConnection, tip_height: i64) -> QueryResult<Vec<Chaintip>> {
         use crate::schema::chaintips::dsl::*;
         chaintips
@@ -46,13 +53,19 @@ impl Chaintip {
             .load(conn)
     }
 
+    /// List all active tips.
     pub fn list_active(conn: &PgConnection) -> QueryResult<Vec<Chaintip>> {
         use crate::schema::chaintips::dsl::*;
-        chaintips
-            .filter(status.eq("active"))
-            .load(conn)
+        chaintips.filter(status.eq("active")).load(conn)
     }
 
+    /// List all active tips.
+    pub fn list(conn: &PgConnection) -> QueryResult<Vec<Chaintip>> {
+        use crate::schema::chaintips::dsl::*;
+        chaintips.load(conn)
+    }
+
+    /// List active tips that are ahead of a given height.
     pub fn list_active_gt(conn: &PgConnection, tip_height: i64) -> QueryResult<Vec<Chaintip>> {
         use crate::schema::chaintips::dsl::*;
         chaintips
@@ -60,6 +73,7 @@ impl Chaintip {
             .load(conn)
     }
 
+    /// List active tips that are behind a given height.
     pub fn list_active_lt(conn: &PgConnection, tip_height: i64) -> QueryResult<Vec<Chaintip>> {
         use crate::schema::chaintips::dsl::*;
         chaintips
@@ -67,6 +81,7 @@ impl Chaintip {
             .load(conn)
     }
 
+    /// Delete all chaintip entries that are not active.
     pub fn purge(conn: &PgConnection) -> QueryResult<usize> {
         use crate::schema::chaintips::dsl::*;
         use diesel::dsl::not;
@@ -75,6 +90,7 @@ impl Chaintip {
             .execute(conn)
     }
 
+    /// Create an entry for an invalid fork.
     pub fn set_invalid_fork(
         conn: &PgConnection,
         block_height: i64,
@@ -92,6 +108,7 @@ impl Chaintip {
             .execute(conn)
     }
 
+    /// Create entry for a valid fork.
     pub fn set_valid_fork(
         conn: &PgConnection,
         block_height: i64,
@@ -109,6 +126,7 @@ impl Chaintip {
             .execute(conn)
     }
 
+    /// Update or create the active tip entry for a node.
     pub fn set_active_tip(
         conn: &PgConnection,
         block_height: i64,
@@ -152,7 +170,13 @@ impl Chaintip {
     }
 }
 
-#[derive(AsChangeset, QueryableByName, Queryable, Insertable)]
+#[derive(QueryableByName, Queryable, Insertable, Debug)]
+#[table_name = "blocks"]
+pub struct Height {
+    pub height: i64,
+}
+
+#[derive(Serialize, AsChangeset, QueryableByName, Queryable, Insertable)]
 #[table_name = "blocks"]
 pub struct Block {
     pub hash: String,
@@ -161,6 +185,7 @@ pub struct Block {
     pub connected: bool,
     pub first_seen_by: i64,
     pub headers_only: bool,
+    pub work: String,
 }
 
 impl Block {
@@ -169,6 +194,7 @@ impl Block {
         blocks.find(block_hash).first(conn)
     }
 
+    /// Look up a parent block.
     pub fn parent(&self, conn: &PgConnection) -> QueryResult<Block> {
         use crate::schema::blocks::dsl::*;
 
@@ -179,24 +205,106 @@ impl Block {
         }
     }
 
-    pub fn descendants(&self, conn: &PgConnection) -> QueryResult<Vec<Block>> {
-        let raw_query = format!("
-            WITH RECURSIVE rec_query AS (
-                SELECT * FROM blocks WHERE hash = '{}'
-                UNION ALL
-                SELECT b.* FROM blocks b INNER JOIN rec_query r ON r.hash = b.parent_hash
-            ) SELECT * FROM rec_query ORDER BY height ASC;
-        ", self.hash);
+    pub fn count_at_height(conn: &PgConnection, block_height: i64) -> QueryResult<usize> {
+        use crate::schema::blocks::dsl::*;
+
+        blocks.filter(height.eq(block_height)).execute(conn)
+    }
+
+    pub fn get_at_height(conn: &PgConnection, block_height: i64) -> QueryResult<Vec<Block>> {
+        use crate::schema::blocks::dsl::*;
+
+        blocks.filter(height.eq(block_height)).load(conn)
+    }
+
+    pub fn find_stale_candidates(conn: &PgConnection, height: i64) -> QueryResult<Vec<Height>> {
+        let raw_query = format!(
+            "
+            SELECT height FROM blocks
+            WHERE height > {}
+            GROUP BY height
+            HAVING count(height) > 1
+            ORDER BY height ASC
+        ",
+            height
+        );
 
         diesel::sql_query(raw_query).load(conn)
     }
 
+    pub fn num_transactions(&self, conn: &PgConnection) -> QueryResult<usize> {
+        use crate::schema::transaction::dsl::*;
+
+        transaction.filter(block_id.eq(&self.hash)).execute(conn)
+    }
+
+    pub fn block_and_descendant_transactions(
+        &self,
+        conn: &PgConnection,
+        limit: i64,
+    ) -> QueryResult<Vec<Transaction>> {
+        use crate::schema::transaction::dsl::*;
+
+        let block_ids: Vec<_> = self
+            .descendants(conn, Some(limit))?
+            .iter()
+            .map(|b| b.hash.clone())
+            .collect();
+
+        transaction
+            .filter(is_coinbase.eq(false).and(block_id.eq_any(block_ids)))
+            .load(conn)
+    }
+
+    /// Fetch the entire list of descendants for the current block.
+    pub fn descendants(&self, conn: &PgConnection, limit: Option<i64>) -> QueryResult<Vec<Block>> {
+        let limit = if limit.is_some() {
+            format!("WHERE height <= {}", self.height + limit.unwrap())
+        } else {
+            "".into()
+        };
+
+        let raw_query = format!(
+            "
+            WITH RECURSIVE rec_query AS (
+                SELECT * FROM blocks WHERE hash = '{}'
+                UNION ALL
+                SELECT b.* FROM blocks b INNER JOIN rec_query r ON r.hash = b.parent_hash
+            ) SELECT * FROM rec_query
+			{}
+			ORDER BY height ASC;
+        ",
+            self.hash, limit
+        );
+
+        diesel::sql_query(raw_query).load(conn)
+    }
+
+    /// Fetch the list of descendants for the current block ordered by work.
+    pub fn descendants_by_work(&self, conn: &PgConnection, limit: i64) -> QueryResult<Vec<Block>> {
+        let raw_query = format!(
+            "
+            WITH RECURSIVE rec_query AS (
+                SELECT * FROM blocks WHERE hash = '{}'
+                UNION ALL
+                SELECT b.* FROM blocks b INNER JOIN rec_query r ON r.hash = b.parent_hash
+            ) SELECT * FROM rec_query
+			WHERE height < {}
+			ORDER BY height,work ASC;
+        ",
+            self.hash, limit
+        );
+
+        diesel::sql_query(raw_query).load(conn)
+    }
+    /// Fetch all blocks that point to the block with a given hash.
     pub fn children(conn: &PgConnection, block_hash: &String) -> QueryResult<Vec<Block>> {
         use crate::schema::blocks::dsl::*;
 
         blocks.filter(parent_hash.eq(block_hash)).load(conn)
     }
 
+    /// Highest block height.
     pub fn max_height(conn: &PgConnection) -> QueryResult<Option<i64>> {
         use crate::schema::blocks::dsl::*;
         use diesel::dsl::max;
@@ -204,6 +312,7 @@ impl Block {
         blocks.select(max(height)).first(conn)
     }
 
+    /// Which blocks do we only have headers for?
     pub fn headers_only(conn: &PgConnection, max_depth: i64) -> QueryResult<Vec<Block>> {
         use crate::schema::blocks::dsl::*;
 
@@ -213,6 +322,7 @@ impl Block {
             .load(conn)
     }
 
+    /// Fetch block if we have it, or create.
     pub fn get_or_create(
         conn: &PgConnection,
         headers_only: bool,
@@ -235,6 +345,7 @@ impl Block {
                     connected: false,
                     headers_only,
                     first_seen_by,
+                    work: hex::encode(&header.chainwork),
                 };
 
                 conn.transaction::<usize, diesel::result::Error, _>(|| {
@@ -256,6 +367,7 @@ impl Block {
         }
     }
 
+    /// Update the database with current block info.
     pub fn update(&self, conn: &PgConnection) -> QueryResult<usize> {
         use crate::schema::blocks::dsl::*;
         diesel::update(blocks.filter(hash.eq(&self.hash)))
@@ -277,6 +389,7 @@ impl Block {
             .execute(conn)
     }
 
+    /// Has block_hash been marked invalid by this node?
     pub fn marked_invalid_by(
         conn: &PgConnection,
         block_hash: &String,
@@ -290,6 +403,7 @@ impl Block {
         Ok(rows > 0)
     }
 
+    /// Has block_hash been marked valid by this node?
     pub fn marked_valid_by(
         conn: &PgConnection,
         block_hash: &String,
@@ -336,6 +450,231 @@ impl Block {
 }
 
 #[derive(QueryableByName, Queryable, Insertable)]
+#[table_name = "transaction"]
+pub struct Transaction {
+    pub block_id: String,
+    pub txid: String,
+    pub is_coinbase: bool,
+    pub hex: String,
+    pub amount: f64,
+}
+
+impl Transaction {
+    pub fn create(
+        conn: &PgConnection,
+        block: String,
+        idx: usize,
+        tx_id: &String,
+        tx_hex: &String,
+        tx_amount: f64,
+    ) -> QueryResult<usize> {
+        use crate::schema::transaction::dsl::*;
+
+        let tx = Transaction {
+            block_id: block,
+            is_coinbase: idx == 0,
+            txid: tx_id.clone(),
+            hex: tx_hex.clone(),
+            amount: tx_amount,
+        };
+
+        diesel::insert_into(transaction)
+            .values(tx)
+            .on_conflict(txid)
+            .do_nothing()
+            .execute(conn)
+    }
+
+    pub fn amount_for_txs(conn: &PgConnection, txids: &Vec<String>) -> QueryResult<f64> {
+        use crate::schema::transaction::dsl::*;
+        use diesel::dsl::max;
+
+        let results: Vec<Option<f64>> = transaction
+            .filter(txid.eq_any(txids))
+            .group_by(txid)
+            .select(max(amount))
+            .load(conn)?;
+        Ok(results
+            .into_iter()
+            .fold(0.0, |a, b| a + b.unwrap_or_default()))
+    }
+
+    pub fn tx_block_and_descendants(conn: &PgConnection, id: String) -> QueryResult<Vec<Block>> {
+        use crate::schema::blocks::dsl as bdsl;
+        use crate::schema::transaction::dsl::*;
+
+        let blocks: Vec<(Transaction, Block)> = transaction
+            .inner_join(bdsl::blocks)
+            .filter(txid.eq(id))
+            .load(conn)?;
+
+        let descendants: Vec<Block> = blocks
+            .into_iter()
+            .filter_map(|b| {
+                if let Ok(desc) = b.1.descendants(conn, None) {
+                    Some(desc)
+                } else {
+                    None
+                }
+            })
+            .flatten()
+            .collect();
+        Ok(descendants)
+    }
+}
+
+#[derive(AsChangeset, QueryableByName, Queryable, Insertable)]
+#[table_name = "stale_candidate_children"]
+pub struct StaleCandidateChildren {
+    pub candidate_height: i64,
+    pub root_id: String,
+    pub tip_id: String,
+    pub len: i32,
+}
+
+impl StaleCandidateChildren {
+    pub fn create(
+        conn: &PgConnection,
+        root: &Block,
+        tip: &Block,
+        branch_len: i32,
+    ) -> QueryResult<usize> {
+        use crate::schema::stale_candidate_children::dsl::*;
+
+        let c = StaleCandidateChildren {
+            candidate_height: root.height,
+            root_id: root.hash.clone(),
+            tip_id: tip.hash.clone(),
+            len: branch_len,
+        };
+
+        diesel::insert_into(stale_candidate_children)
+            .values(c)
+            .execute(conn)
+    }
+
+    pub fn purge(conn: &PgConnection) -> QueryResult<usize> {
+        use crate::schema::stale_candidate_children::dsl::*;
+
+        diesel::delete(stale_candidate_children).execute(conn)
+    }
+}
+
+#[derive(AsChangeset, QueryableByName, Queryable, Insertable)]
+#[table_name = "rbf_by"]
+pub struct RbfBy {
+    pub candidate_height: i64,
+    pub txid: String,
+}
+
+#[derive(AsChangeset, QueryableByName, Queryable, Insertable)]
+#[table_name = "double_spent_by"]
+pub struct DoubleSpentBy {
+    pub candidate_height: i64,
+    pub txid: String,
+}
+
+#[derive(AsChangeset, QueryableByName, Queryable, Insertable)]
+#[table_name = "stale_candidate"]
+pub struct StaleCandidate {
+    pub height: i64,
+    pub n_children: i32,
+    pub confirmed_in_one_branch_total: f64,
+    pub double_spent_in_one_branch_total: f64,
+    pub rbf_total: f64,
+    pub height_processed: Option<i64>,
+}
+
+impl StaleCandidate {
+    pub fn get(conn: &PgConnection, candidate: i64) -> QueryResult<StaleCandidate> {
+        use crate::schema::stale_candidate::dsl::*;
+        stale_candidate.find(candidate).first(conn)
+    }
+
+    pub fn update(&self, conn: &PgConnection) -> QueryResult<usize> {
+        use crate::schema::stale_candidate::dsl::*;
+        diesel::update(stale_candidate.filter(height.eq(self.height)))
+            .set(self)
+            .execute(conn)
+    }
+
+    pub fn update_rbf_by(&self, conn: &PgConnection, txids: &Vec<String>) -> QueryResult<usize> {
+        use crate::schema::rbf_by::dsl::*;
+
+        let rbfs: Vec<RbfBy> = txids
+            .iter()
+            .map(|tx| RbfBy {
+                candidate_height: self.height,
+                txid: tx.clone(),
+            })
+            .collect();
+
+        diesel::insert_into(rbf_by).values(rbfs).execute(conn)
+    }
+
+    pub fn update_double_spent_by(
+        &self,
+        conn: &PgConnection,
+        txids: &Vec<String>,
+    ) -> QueryResult<usize> {
+        use crate::schema::double_spent_by::dsl::*;
+        let double_spends: Vec<DoubleSpentBy> = txids
+            .iter()
+            .map(|tx| DoubleSpentBy {
+                candidate_height: self.height,
+                txid: tx.clone(),
+            })
+            .collect();
+
+        diesel::insert_into(double_spent_by)
+            .values(double_spends)
+            .execute(conn)
+    }
+
+    pub fn children(&self, conn: &PgConnection) -> QueryResult<Vec<StaleCandidateChildren>> {
+        use crate::schema::stale_candidate_children::dsl::*;
+
+        stale_candidate_children
+            .filter(candidate_height.eq(self.height))
+            .order_by(len)
+            .load(conn)
+    }
+
+    pub fn purge_children(&self, conn: &PgConnection) -> QueryResult<usize> {
+        use crate::schema::stale_candidate_children::dsl::*;
+
+        diesel::delete(stale_candidate_children)
+            .filter(candidate_height.eq(self.height))
+            .execute(conn)
+    }
+
+    pub fn create(conn: &PgConnection, candidate_height: i64, children: i32) -> QueryResult<usize> {
+        use crate::schema::stale_candidate::dsl::*;
+
+        let candidate = StaleCandidate {
+            n_children: children,
+            height: candidate_height,
+            confirmed_in_one_branch_total: 0.,
+            double_spent_in_one_branch_total: 0.,
+            rbf_total: 0.,
+            height_processed: None,
+        };
+
+        diesel::insert_into(stale_candidate)
+            .values(candidate)
+            .on_conflict(height)
+            .do_nothing()
+            .execute(conn)
+    }
+
+    pub fn top_n(conn: &PgConnection, n: i64) -> QueryResult<Vec<StaleCandidate>> {
+        use crate::schema::stale_candidate::dsl::*;
+
+        stale_candidate.order_by(height.desc()).limit(n).load(conn)
+    }
+}
+
+#[derive(QueryableByName, Queryable, Insertable)]
 #[table_name = "nodes"]
 pub struct Node {
     pub id: i64,
@@ -353,9 +692,37 @@ impl Node {
         nodes::dsl::nodes.load(conn)
     }
 
+    /// Fetch nodes that also have a mirror.
     pub fn get_mirrors(conn: &PgConnection) -> QueryResult<Vec<Node>> {
         use crate::schema::nodes::dsl::*;
         nodes.filter(mirror_rpc_port.is_not_null()).load(conn)
+    }
+
+    pub fn remove(conn: &PgConnection, node_id: i64) -> QueryResult<usize> {
+        use crate::schema::nodes::dsl::*;
+        diesel::delete(nodes).filter(id.eq(node_id)).execute(conn)
+    }
+
+    pub fn insert(
+        conn: &PgConnection,
+        name: String,
+        host: String,
+        port: i32,
+        mirror: Option<i32>,
+        user: String,
+        pass: String,
+    ) -> QueryResult<Node> {
+        use crate::schema::nodes::dsl::*;
+        diesel::insert_into(nodes)
+            .values((
+                node.eq(name),
+                rpc_host.eq(host),
+                rpc_port.eq(port),
+                mirror_rpc_port.eq(mirror),
+                rpc_user.eq(user),
+                rpc_pass.eq(pass),
+            ))
+            .get_result(conn)
     }
 }
 
