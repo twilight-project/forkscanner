@@ -6,6 +6,7 @@ use r2d2_diesel::ConnectionManager;
 use r2d2::PooledConnection;
 use std::net::SocketAddr;
 use std::str::FromStr;
+use serde_json::json;
 
 type Conn = PooledConnection<ConnectionManager<diesel::PgConnection>>;
 
