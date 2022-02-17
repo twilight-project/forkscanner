@@ -1,0 +1,19 @@
+[
+  {
+	"hash": "0000000000000000000501b978d69da3d476ada6a41aba60a42612806204013a",
+	"confirmations": 3,
+	"height": 77999,
+	"version": 0,
+	"version_hex": null,
+	"merkleroot": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+	"time": 1,
+	"median_time": null,
+	"nonce": 4,
+	"bits": "",
+	"difficulty": 93.0,
+	"chainwork": "",
+	"nTx": 5,
+	"previous_block_hash": "00000000000000000001ca4713bbb6900e61c6e3d6cbcbec958c0c580711afeb",
+	"next_block_hash": null
+  }
+]
