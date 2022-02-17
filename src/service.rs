@@ -13,7 +13,7 @@ type Conn = PooledConnection<ConnectionManager<diesel::PgConnection>>;
 fn get_forks(conn: Conn, params: Params) -> Result<Value> {
     if let Ok(it_works) = Chaintip::list_active(&conn) {
         println!("TJDEBUG stuff {:?}", it_works);
-        Ok(serde_json::Value::String(serde_json::to_string(&it_works).unwrap()))
+        Ok(json!(&it_works))
     } else {
         let err = types::error::Error {
             code: types::error::ErrorCode::InternalError,
