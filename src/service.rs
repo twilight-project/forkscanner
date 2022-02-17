@@ -9,6 +9,7 @@ use serde::Deserialize;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::str::FromStr;
+use serde_json::json;
 
 type Conn = PooledConnection<ConnectionManager<diesel::PgConnection>>;
 
@@ -70,6 +71,18 @@ fn tx_is_active(conn: Conn, params: Params) -> Result<Value> {
     }
 }
 
+fn get_forks(conn: Conn, params: Params) -> Result<Value> {
+    if let Ok(it_works) = Chaintip::list_active(&conn) {
+        println!("TJDEBUG stuff {:?}", it_works);
+        Ok(json!(&it_works))
+    } else {
+        let err = types::error::Error {
+            code: types::error::ErrorCode::InternalError,
+            message: "Something's wrong".into(),
+            data: None,
+        };
+        Err(err)
+      
 fn get_block(conn: Conn, params: Params) -> Result<Value> {
     match params.parse::<BlockQuery>() {
         Ok(q) => match q {
