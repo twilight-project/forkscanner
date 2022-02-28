@@ -1,16 +1,39 @@
-use crate::{Block, Chaintip, Node, Transaction};
+use crate::{Block, Chaintip, Node, ScannerMessage, Transaction};
+use crossbeam::channel::{unbounded, Receiver, RecvTimeoutError, Sender};
 use diesel::prelude::PgConnection;
 use jsonrpc_core::types::error::Error as JsonRpcError;
 use jsonrpc_core::*;
-use jsonrpc_http_server::*;
+use jsonrpc_http_server as hts;
+use jsonrpc_pubsub::{PubSubHandler, Session, Sink, Subscriber, SubscriptionId};
+use jsonrpc_ws_server as wss;
+use log::{debug, error, info};
+use rand::Rng;
 use r2d2::PooledConnection;
 use r2d2_diesel::ConnectionManager;
 use serde::Deserialize;
-use std::collections::HashSet;
-use std::net::SocketAddr;
-use std::str::FromStr;
+use std::{
+    collections::{HashMap, HashSet},
+    net::{IpAddr, SocketAddr},
+    sync::atomic::{AtomicBool, Ordering},
+    sync::Arc,
+    thread, time,
+};
+use thiserror::Error;
 
 type Conn = PooledConnection<ConnectionManager<diesel::PgConnection>>;
+type ManagedPool = r2d2::Pool<ConnectionManager<PgConnection>>;
+
+#[derive(Debug, Error)]
+pub enum WsError {
+    #[error("Diesel query error {0:?}")]
+    DieselError(#[from] diesel::result::Error),
+    #[error("Connection pool error {0:?}")]
+    R2D2Error(#[from] r2d2::Error),
+    #[error("Serde error {0:?}")]
+    SerdeError(#[from] serde_json::Error),
+	#[error("Sink error {0:?}")]
+	SinkError(#[from] futures::channel::mpsc::TrySendError<std::string::String>),
+}
 
 #[derive(Debug, Deserialize)]
 struct NodeId {
@@ -144,25 +167,19 @@ fn remove_node(conn: Conn, params: Params) -> Result<Value> {
 fn get_tips(conn: Conn, params: Params) -> Result<Value> {
     match params.parse::<TipArgs>() {
         Ok(args) => {
-		    let tips = if args.active_only {
-			    Chaintip::list_active(&conn)
-			} else {
-			    Chaintip::list(&conn)
-			};
+            let tips = if args.active_only {
+                Chaintip::list_active(&conn)
+            } else {
+                Chaintip::list(&conn)
+            };
 
-			match tips {
-			    Ok(t) => {
-				    match serde_json::to_value(t) {
-					    Ok(t) => Ok(t),
-						Err(_) => {
-							Err(JsonRpcError::internal_error())
-						}
-					}
-				}
-				Err(_) => {
-					Err(JsonRpcError::internal_error())
-				}
-			}
+            match tips {
+                Ok(t) => match serde_json::to_value(t) {
+                    Ok(t) => Ok(t),
+                    Err(_) => Err(JsonRpcError::internal_error()),
+                },
+                Err(_) => Err(JsonRpcError::internal_error()),
+            }
         }
         Err(args) => {
             let err = JsonRpcError::invalid_params(format!("Invalid parameters, {:?}", args));
@@ -171,47 +188,174 @@ fn get_tips(conn: Conn, params: Params) -> Result<Value> {
     }
 }
 
+fn handle_subscribe(exit: Arc<AtomicBool>, receiver: Receiver<ScannerMessage>, pool: ManagedPool,  _: Params, sink: Sink) {
+    info!("New subscription");
+	fn send_update(pool: &ManagedPool, sink: &Sink) -> std::result::Result<(), WsError> {
+		let conn = pool.get()?;
+		let values = Chaintip::list(&conn)?;
+		let tips = serde_json::to_value(values)?;
+
+		Ok(sink.notify(Params::Array(vec![tips]))?)
+	}
+
+    thread::spawn(move || {
+	    if let Err(e) = send_update(&pool, &sink) {
+			error!("Error sending chaintips to initialize client {:?}", e);
+		}
+
+        loop {
+		    if exit.load(Ordering::SeqCst) {
+			    break;
+			}
+
+            match receiver.recv_timeout(time::Duration::from_millis(5000)) {
+			    Ok(ScannerMessage::NewChaintip) => {
+					if let Err(e) = send_update(&pool, &sink) {
+					    error!("Error sending chaintips to client {:?}", e);
+					}
+				}
+				Err(RecvTimeoutError::Timeout) => {
+				    info!("No chaintip updates");
+				}
+				Err(e) => {
+				    error!("Error! {:?}", e);
+				}
+			}
+        }
+    });
+}
+
+fn session_meta(context: &wss::RequestContext) -> Option<Arc<Session>> {
+    debug!("Request context {:#?}", context);
+	Some(Arc::new(Session::new(context.sender())))
+}
+
 /// RPC service endpoints for users of forkscanner.
-pub fn run_server(listen: &str, db_url: &str) {
-    let manager = ConnectionManager::<PgConnection>::new(db_url);
-    let pool = r2d2::Pool::builder()
-        .build(manager)
-        .expect("Connection pool");
+pub fn run_server(listen: String, rpc: u16, subs: u16, db_url: String, receiver: Receiver<ScannerMessage>) {
+	let manager = ConnectionManager::<PgConnection>::new(db_url);
+	let pool = r2d2::Pool::builder()
+		.build(manager)
+		.expect("Connection pool");
+    let pool2 = pool.clone();
 
-    let mut io = IoHandler::new();
-    let p = pool.clone();
-    io.add_sync_method("get_tips", move |params: Params| {
-        let conn = p.get().unwrap();
-        get_tips(conn, params)
+    let l1 = listen.clone();
+    let t1 = thread::spawn(move || {
+        let mut io = IoHandler::new();
+        let p = pool.clone();
+        io.add_sync_method("get_tips", move |params: Params| {
+            let conn = p.get().unwrap();
+            get_tips(conn, params)
+        });
+
+        let p = pool.clone();
+        io.add_sync_method("add_node", move |params: Params| {
+            let conn = p.get().unwrap();
+            add_node(conn, params)
+        });
+
+        let p = pool.clone();
+        io.add_sync_method("remove_node", move |params: Params| {
+            let conn = p.get().unwrap();
+            remove_node(conn, params)
+        });
+
+        let p = pool.clone();
+        io.add_sync_method("get_block", move |params: Params| {
+            let conn = p.get().unwrap();
+            get_block(conn, params)
+        });
+
+        let p = pool.clone();
+        io.add_sync_method("tx_is_active", move |params: Params| {
+            let conn = p.get().unwrap();
+            tx_is_active(conn, params)
+        });
+
+        let server = hts::ServerBuilder::new(io)
+            .start_http(&SocketAddr::from((l1.parse::<IpAddr>().unwrap(), rpc)))
+            .expect("Failed to start RPC server");
+
+        server.wait();
     });
 
-    let p = pool.clone();
-    io.add_sync_method("add_node", move |params: Params| {
-        let conn = p.get().unwrap();
-        add_node(conn, params)
+    let subscriptions = Arc::new(std::sync::Mutex::new(HashMap::<&str, Vec<Sender<ScannerMessage>>>::default()));
+	let subscriptions2 = subscriptions.clone();
+	let t2 = thread::spawn(move || {
+	    loop {
+		    match receiver.recv() {
+			    Ok(ScannerMessage::NewChaintip) => {
+				    debug!("New chaintip updates");
+				    if let Some(subs) = subscriptions2.lock().expect("Lock poisoned").get("forks") {
+					    for sub in subs {
+						    sub.send(ScannerMessage::NewChaintip).expect("Channel broke");
+						}
+					}
+				}
+				Err(e) => {
+				    error!("Channel broke {:?}", e);
+				    break;
+				}
+			}
+		}
+	});
+
+    let t3 = thread::spawn(move || {
+        let killers = Arc::new(std::sync::Mutex::new(HashMap::<SubscriptionId, Arc<AtomicBool>>::default()));
+
+        let mut io = PubSubHandler::new(MetaIoHandler::default());
+        io.add_sync_method("ping", |_: Params| Ok(Value::String("pong".into())));
+
+        let killer_clone = killers.clone();
+        io.add_subscription(
+            "forks",
+            (
+                "subscribe_forks",
+                move |params: Params, _, subscriber: Subscriber| {
+                    info!("Subscribe to forks");
+					let mut rng = rand::rngs::OsRng::default();
+                    if params != Params::None {
+                        subscriber
+                            .reject(Error {
+                                code: ErrorCode::ParseError,
+                                message: "Invalid parameters. Subscription rejected.".into(),
+                                data: None,
+                            })
+                            .unwrap();
+                        return;
+                    }
+
+                    let kill_switch = Arc::new(AtomicBool::new(false));
+					let sub_id = SubscriptionId::Number(rng.gen());
+					let sink = subscriber.assign_id(sub_id.clone()).unwrap();
+					killers.lock().expect("Lock poisoned").insert(sub_id, kill_switch.clone());
+					let (notify_tx, notify_rx) = unbounded();
+					{
+						let mut sub_lock = subscriptions.lock().expect("Lock poisoned");
+						sub_lock.entry("forks").or_insert(vec![]).push(notify_tx);
+					}
+
+                    handle_subscribe(kill_switch, notify_rx, pool2.clone(), params, sink)
+                },
+            ),
+            ("unsubscribe_forks", move |id: SubscriptionId, _| {
+			    if let Some(arc) = killer_clone.lock().expect("Lock poisoned").remove(&id) {
+				    arc.store(true, Ordering::SeqCst);
+				}
+				Box::pin(futures::future::ok(Value::Bool(true)))
+            }),
+        );
+
+        info!("Coming up on {} {}", listen, subs);
+        let server =
+            wss::ServerBuilder::with_meta_extractor(io, session_meta)
+            .start(&SocketAddr::from((listen.parse::<IpAddr>().unwrap(), subs)))
+            .expect("Failed to start sub server");
+
+        server.wait().expect("WS server crashed");
+        info!("WS service is exiting");
     });
 
-    let p = pool.clone();
-    io.add_sync_method("remove_node", move |params: Params| {
-        let conn = p.get().unwrap();
-        remove_node(conn, params)
-    });
-
-    let p = pool.clone();
-    io.add_sync_method("get_block", move |params: Params| {
-        let conn = p.get().unwrap();
-        get_block(conn, params)
-    });
-
-    let p = pool.clone();
-    io.add_sync_method("tx_is_active", move |params: Params| {
-        let conn = p.get().unwrap();
-        tx_is_active(conn, params)
-    });
-
-    let server = ServerBuilder::new(io)
-        .start_http(&SocketAddr::from_str(listen).unwrap())
-        .expect("Failed to start RPC server");
-
-    server.wait();
+    t1.join().expect("Thread join");
+    t2.join().expect("Thread join");
+    t3.join().expect("Thread join");
 }
