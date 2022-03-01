@@ -2,7 +2,7 @@ use crate::{Block, Chaintip, Node, StaleCandidate, StaleCandidateChildren, Trans
 use bitcoin::consensus::encode::serialize_hex;
 use bitcoincore_rpc::bitcoin as btc;
 use bitcoincore_rpc::bitcoincore_rpc_json::{
-    GetBlockHeaderResult, GetChainTipsResultStatus, GetChainTipsResultTip, GetPeerInfoResult,
+    GetBlockHeaderResult, GetChainTipsResultTip, GetChainTipsResultStatus, GetPeerInfoResult,
     GetRawTransactionResult,
 };
 use bitcoincore_rpc::Error as BitcoinRpcError;
@@ -32,6 +32,7 @@ type ForkScannerResult<T> = Result<T, ForkScannerError>;
 
 pub enum ScannerMessage {
     NewChaintip,
+	AllChaintips(Vec<Chaintip>),
 }
 
 #[derive(Deserialize)]
@@ -159,7 +160,7 @@ impl BtcClient for Client {
     }
 
     fn get_chain_tips(&self) -> Result<Vec<GetChainTipsResultTip>, bitcoincore_rpc::Error> {
-        RpcApi::get_chain_tips(self)
+	    RpcApi::get_chain_tips(self)
     }
 
     fn get_block_from_peer(
@@ -586,6 +587,13 @@ impl<BC: BtcClient> ForkScanner<BC> {
 
 		if changed {
 			self.notify_tx.send(ScannerMessage::NewChaintip).expect("Channel closed");
+		}
+
+        match Chaintip::list(&self.db_conn) {
+		    Ok(tips) => {
+				self.notify_tx.send(ScannerMessage::AllChaintips(tips)).expect("Channel closed");
+			}
+			Err(e) => error!("Database error: {:?}", e),
 		}
 
         // For each node, start with their active chaintip and see if

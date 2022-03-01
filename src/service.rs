@@ -15,7 +15,7 @@ use std::{
     collections::{HashMap, HashSet},
     net::{IpAddr, SocketAddr},
     sync::atomic::{AtomicBool, Ordering},
-    sync::Arc,
+    sync::{Arc, Mutex, RwLock},
     thread, time,
 };
 use thiserror::Error;
@@ -164,22 +164,19 @@ fn remove_node(conn: Conn, params: Params) -> Result<Value> {
     }
 }
 
-fn get_tips(conn: Conn, params: Params) -> Result<Value> {
+fn get_tips(params: Params, tips: Vec<Chaintip>) -> Result<Value> {
     match params.parse::<TipArgs>() {
-        Ok(args) => {
-            let tips = if args.active_only {
-                Chaintip::list_active(&conn)
-            } else {
-                Chaintip::list(&conn)
-            };
+        Ok(t) => {
+		    let chaintips = if t.active_only {
+			    tips.iter().filter(|t| t.status == "active").cloned().collect::<Vec<Chaintip>>()
+			} else {
+			    tips.to_vec()
+			};
 
-            match tips {
-                Ok(t) => match serde_json::to_value(t) {
-                    Ok(t) => Ok(t),
-                    Err(_) => Err(JsonRpcError::internal_error()),
-                },
-                Err(_) => Err(JsonRpcError::internal_error()),
-            }
+			match serde_json::to_value(chaintips) {
+				Ok(t) => Ok(t),
+				Err(_) => Err(JsonRpcError::internal_error()),
+			}
         }
         Err(args) => {
             let err = JsonRpcError::invalid_params(format!("Invalid parameters, {:?}", args));
@@ -214,6 +211,7 @@ fn handle_subscribe(exit: Arc<AtomicBool>, receiver: Receiver<ScannerMessage>, p
 					    error!("Error sending chaintips to client {:?}", e);
 					}
 				}
+				Ok(_) => {}
 				Err(RecvTimeoutError::Timeout) => {
 				    info!("No chaintip updates");
 				}
@@ -233,18 +231,18 @@ fn session_meta(context: &wss::RequestContext) -> Option<Arc<Session>> {
 /// RPC service endpoints for users of forkscanner.
 pub fn run_server(listen: String, rpc: u16, subs: u16, db_url: String, receiver: Receiver<ScannerMessage>) {
 	let manager = ConnectionManager::<PgConnection>::new(db_url);
+	let tips = Arc::new(RwLock::new(vec![]));
 	let pool = r2d2::Pool::builder()
 		.build(manager)
 		.expect("Connection pool");
     let pool2 = pool.clone();
 
+    let tips1 = tips.clone();
     let l1 = listen.clone();
     let t1 = thread::spawn(move || {
         let mut io = IoHandler::new();
-        let p = pool.clone();
         io.add_sync_method("get_tips", move |params: Params| {
-            let conn = p.get().unwrap();
-            get_tips(conn, params)
+            get_tips(params, tips1.read().expect("RwLock failed").clone())
         });
 
         let p = pool.clone();
@@ -278,7 +276,7 @@ pub fn run_server(listen: String, rpc: u16, subs: u16, db_url: String, receiver:
         server.wait();
     });
 
-    let subscriptions = Arc::new(std::sync::Mutex::new(HashMap::<&str, Vec<Sender<ScannerMessage>>>::default()));
+    let subscriptions = Arc::new(Mutex::new(HashMap::<&str, Vec<Sender<ScannerMessage>>>::default()));
 	let subscriptions2 = subscriptions.clone();
 	let t2 = thread::spawn(move || {
 	    loop {
@@ -291,6 +289,10 @@ pub fn run_server(listen: String, rpc: u16, subs: u16, db_url: String, receiver:
 						}
 					}
 				}
+				Ok(ScannerMessage::AllChaintips(mut t)) => {
+				    debug!("New chaintips {:?}", t);
+				    std::mem::swap(&mut t, &mut tips.write().expect("Lock poisoned"));
+				}
 				Err(e) => {
 				    error!("Channel broke {:?}", e);
 				    break;
@@ -300,7 +302,7 @@ pub fn run_server(listen: String, rpc: u16, subs: u16, db_url: String, receiver:
 	});
 
     let t3 = thread::spawn(move || {
-        let killers = Arc::new(std::sync::Mutex::new(HashMap::<SubscriptionId, Arc<AtomicBool>>::default()));
+        let killers = Arc::new(Mutex::new(HashMap::<SubscriptionId, Arc<AtomicBool>>::default()));
 
         let mut io = PubSubHandler::new(MetaIoHandler::default());
         io.add_sync_method("ping", |_: Params| Ok(Value::String("pong".into())));
