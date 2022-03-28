@@ -1,19 +1,23 @@
-use crate::{Block, Chaintip, Node, StaleCandidate, StaleCandidateChildren, Transaction};
+use crate::{Block, Chaintip, Node, StaleCandidate, StaleCandidateChildren, Transaction, TxOutset};
+use chrono::prelude::*;
+use bigdecimal::BigDecimal;
 use bitcoin::consensus::encode::serialize_hex;
 use bitcoincore_rpc::bitcoin as btc;
 use bitcoincore_rpc::bitcoincore_rpc_json::{
-    GetBlockHeaderResult, GetChainTipsResultTip, GetChainTipsResultStatus, GetPeerInfoResult,
-    GetRawTransactionResult,
+    GetBlockchainInfoResult, GetBlockHeaderResult, GetChainTipsResultTip, GetChainTipsResultStatus, GetPeerInfoResult,
+	GetTxOutSetInfoResult, GetRawTransactionResult,
 };
 use bitcoincore_rpc::Error as BitcoinRpcError;
 use bitcoincore_rpc::{Auth, Client, RpcApi};
 use crossbeam::channel::{Receiver, Sender, unbounded};
+use diesel::Connection;
 use diesel::prelude::PgConnection;
 use jsonrpc::error::Error as JsonRpcError;
 use jsonrpc::error::RpcError;
 use log::{debug, error, info};
 #[cfg(test)]
 use mockall::*;
+use rayon::prelude::*;
 use serde::Deserialize;
 use std::{
     collections::{HashMap, HashSet},
@@ -27,6 +31,7 @@ const MAX_BLOCK_DEPTH: i64 = 10;
 const BLOCK_NOT_FOUND: i32 = -5;
 const STALE_WINDOW: i64 = 100;
 const DOUBLE_SPEND_RANGE: i64 = 30;
+const REACHABLE_CHECK_INTERVAL: i64 = 10;
 
 type ForkScannerResult<T> = Result<T, ForkScannerError>;
 
@@ -111,6 +116,7 @@ pub struct ScriptPubKey {
 pub trait BtcClient: Sized {
     fn new(host: &String, auth: Auth) -> ForkScannerResult<Self>;
     fn disconnect_node(&self, id: u64) -> Result<serde_json::Value, bitcoincore_rpc::Error>;
+    fn get_blockchain_info(&self) -> Result<GetBlockchainInfoResult, bitcoincore_rpc::Error>;
     fn get_chain_tips(&self) -> Result<Vec<GetChainTipsResultTip>, bitcoincore_rpc::Error>;
     fn get_block_from_peer(
         &self,
@@ -133,6 +139,7 @@ pub trait BtcClient: Sized {
         txid: &btc::Txid,
         block_hash: Option<&'a btc::BlockHash>,
     ) -> Result<GetRawTransactionResult, bitcoincore_rpc::Error>;
+    fn get_tx_out_set_info(&self) -> Result<GetTxOutSetInfoResult, bitcoincore_rpc::Error>;
     fn set_network_active(&self, active: bool)
         -> Result<serde_json::Value, bitcoincore_rpc::Error>;
     fn submit_block(
@@ -158,6 +165,10 @@ impl BtcClient for Client {
             &[serde_json::Value::String("".into()), peer_id],
         )
     }
+
+    fn get_blockchain_info(&self) -> Result<GetBlockchainInfoResult, bitcoincore_rpc::Error> {
+	    RpcApi::get_blockchain_info(self)
+	}
 
     fn get_chain_tips(&self) -> Result<Vec<GetChainTipsResultTip>, bitcoincore_rpc::Error> {
 	    RpcApi::get_chain_tips(self)
@@ -216,6 +227,11 @@ impl BtcClient for Client {
     ) -> Result<GetRawTransactionResult, bitcoincore_rpc::Error> {
         RpcApi::get_raw_transaction_info(self, txid, block_hash)
     }
+
+
+    fn get_tx_out_set_info(&self) -> Result<GetTxOutSetInfoResult, bitcoincore_rpc::Error> {
+        RpcApi::get_tx_out_set_info(self)
+	}
 
     fn set_network_active(
         &self,
@@ -300,6 +316,104 @@ fn create_block_and_ancestors<BC: BtcClient>(
     }
 
     Ok(())
+}
+
+fn make_block_active<BC: BtcClient>(
+    client: &BC,
+    db_conn: &PgConnection,
+	block: &Block,
+) -> ForkScannerResult<Vec<btc::BlockHash>> {
+	let mut invalidated_hashes = Vec::new();
+	let mut retry_count = 0;
+
+	loop {
+		let tips = match client.get_chain_tips() {
+			Ok(t) => t,
+			Err(e) => {
+				error!("Chain tips error {:?}", e);
+				continue;
+			}
+		};
+
+		let active = tips
+			.iter()
+			.find(|t| t.status == GetChainTipsResultStatus::Active)
+			.unwrap();
+
+	    let active_hash = active.hash.to_string();
+		if active_hash == block.hash {
+			break;
+		}
+
+		if retry_count > 100 {
+			return Err(ForkScannerError::FailedRollback);
+		}
+
+		let mut blocks_to_invalidate = Vec::new();
+
+		if active.height as i64 == block.height {
+			blocks_to_invalidate.push(active.hash);
+		} else {
+			if let Some(branch) = find_fork_point(db_conn, active, block) {
+				blocks_to_invalidate.push(branch);
+			}
+
+			let children = match Block::children(db_conn, &block.hash.to_string()) {
+				Ok(c) => c,
+				Err(e) => {
+					error!("Children fetch failed {:?}", e);
+					continue;
+				}
+			};
+
+			for child in children {
+				let hash = btc::BlockHash::from_str(&child.hash).unwrap();
+				blocks_to_invalidate.push(hash);
+			}
+		}
+
+		for b in blocks_to_invalidate {
+			let _ = client.invalidate_block(&b);
+			invalidated_hashes.push(b);
+		}
+
+		retry_count += 1;
+	}
+	Ok(invalidated_hashes)
+}
+
+
+fn find_fork_point(
+    db_conn: &PgConnection,
+	active: &GetChainTipsResultTip,
+	block: &Block,
+) -> Option<btc::BlockHash> {
+	if active.height as i64 <= block.height {
+		return None;
+	}
+
+	let mut block1 = Block::get(&db_conn, &active.hash.to_string()).ok()?;
+
+	while block1.height > block.height {
+		block1 = block1.parent(db_conn).ok()?;
+	}
+
+	if block1.hash == block.hash {
+		None
+	} else {
+		loop {
+			block1 = block1.parent(db_conn).ok()?;
+
+			let desc = block1.descendants(db_conn, None).ok()?;
+
+			let fork = desc.into_iter().find(|b| b.hash == block.hash);
+
+			if let Some(_) = fork {
+				let hash = btc::BlockHash::from_str(&block1.hash).unwrap();
+				return Some(hash);
+			}
+		}
+	}
 }
 
 /// Holds connection info for a bitcoin node that forkscanner is
@@ -626,12 +740,186 @@ impl<BC: BtcClient> ForkScanner<BC> {
 
         // Now try to fill in missing blocks.
         self.find_missing_blocks();
+		self.inflation_checks();
         self.rollback_checks();
         self.find_stale_candidates();
 
         // for 3 most recent stale candidates...
         self.process_stale_candidates()
     }
+
+	fn inflation_checks(&self) {
+	    let mut mirrors = match Node::get_mirrors(&self.db_conn) {
+		    Ok(nodes) => nodes,
+			Err(e) => {
+			    error!("RPC Error {e:?}");
+				return;
+			}
+		};
+
+        info!("Checking mirror node reachability");
+		for mut mirror in mirrors {
+		    if let Some(ts) = mirror.unreachable_since {
+			    let last_poll = mirror.last_polled.expect("No last_polled");
+			    let elapsed = Utc::now().signed_duration_since(last_poll);
+				if elapsed.num_minutes() > REACHABLE_CHECK_INTERVAL {
+				    mirror.last_polled = Some(Utc::now());
+					let node = self
+						.clients
+						.iter()
+						.find(|c| c.node_id == mirror.id)
+						.unwrap()
+						.mirror()
+						.as_ref()
+						.unwrap();
+
+				    match node.get_blockchain_info() {
+					    Ok(info) => {
+						    mirror.initial_block_download = info.initial_block_download;
+						    mirror.unreachable_since = None;
+							mirror.last_polled = None;
+						}
+						Err(e) => debug!("Could not reach mirror on reachable check {e:?}"),
+					}
+
+					if let Err(e) = mirror.update(&self.db_conn) {
+					    error!("Updating mirror info failed {e:?}");
+					}
+				}
+			}
+		}
+
+		let mirrors = match Node::get_active_reachable(&self.db_conn) {
+		    Ok(m) => m,
+			Err(e) => {
+			    error!("Could not connect to database {e:?}");
+				return;
+			}
+		};
+
+        info!("Inflation checks for {} nodes", mirrors.len());
+		mirrors
+		    .par_iter()
+			.for_each(|mirror| {
+				let host = format!("http://{}:{}", mirror.rpc_host, mirror.mirror_rpc_port.expect("No mirror port"));
+				let auth = Auth::UserPass(mirror.rpc_user.clone(), mirror.rpc_pass.clone());
+				let client = BC::new(&host, auth).expect("Create client failed");
+
+				let db_url = std::env::var("DATABASE_URL").expect("No DB url");
+				let db_conn = PgConnection::establish(&db_url).expect("Connection failed");
+
+				// stop p2p traffic
+                if let Err(e) = client.set_network_active(false) {
+				    error!("RPC call failed: {e:?}");
+					return
+				};
+
+				let latest = match client.get_blockchain_info() {
+				    Ok(info) => {
+					    let hash = info.best_block_hash.to_string();
+
+						create_block_and_ancestors(
+						    &client, &db_conn, true, &hash, mirror.id
+						).expect("Fetching blocks for inflation checks failed");
+
+						// if we have one, we're done here.
+						match TxOutset::get(&db_conn, &hash, mirror.id) {
+							Ok(Some(_)) => return,
+							Err(e) => {
+								error!("Database error {e:?}");
+								return
+							}
+							_ => {}
+						};
+
+						hash
+					}
+					Err(e) => {
+					    error!("RPC call failed {e:?}");
+						// TODO: should make sure this succeeds, or re-enable elsewhere...
+                        let _ = client.set_network_active(true).expect("Could not re-enable network");
+						return;
+					}
+				};
+
+				let block = match Block::get(&db_conn, &latest) {
+				    Ok(block) => block,
+					Err(e) => {
+					    error!("Block not found {e:?}");
+                        let _ = client.set_network_active(true).expect("Could not re-enable network");
+						return;
+					}
+				};
+
+                let mut blocks_to_check = vec![block.clone()];
+				let mut comparison_block = block.clone();
+				let mut comparison_tx_outset = None;
+				let mut max_exceeded = false;
+
+				loop {
+				    if block.height - comparison_block.height >= MAX_BLOCK_DEPTH {
+					    max_exceeded = true;
+						break;
+					}
+
+					comparison_block = match comparison_block.parent(&db_conn) {
+					    Ok(block) => block,
+						Err(e) => {
+						    error!("Could not fetch parent block {e:?}");
+							return;
+						}
+					};
+
+					comparison_tx_outset = match TxOutset::get(&db_conn, &comparison_block.hash, mirror.id) {
+						Ok(outset) => outset,
+						Err(e) => {
+							error!("Database error {e:?}");
+							return
+						}
+					};
+
+					if comparison_tx_outset.is_some() {
+					    break;
+					}
+
+					blocks_to_check.push(comparison_block.clone());
+				}
+
+                for block in blocks_to_check.iter().rev() {
+				    match make_block_active(&client, &db_conn, block) {
+					    Ok(invalidated_hashes) => {
+						    let tx_outset_info = match client.get_tx_out_set_info() {
+							    Ok(o) => o,
+								Err(e) => {
+								    error!("TX outset info call failed {e:?}");
+									return;
+								}
+							};
+
+                            // Undo the rollback
+                            for hash in invalidated_hashes {
+                                let _ = client.reconsider_block(&hash);
+                            }
+
+                            // TODO: finish this up
+							let amount = BigDecimal::from_str(&tx_outset_info.total_amount.to_string()).expect("BigDecimal parsing failed");
+	                        TxOutset::create(&db_conn, tx_outset_info.tx_outs, amount, &block.hash, mirror.id).expect("Tx out failed");
+						}
+						Err(e) => {
+						    error!("Make block active failed {e:?}");
+							let _ = client.set_network_active(true).expect("Could not re-enable network");
+							return;
+						}
+					}
+				}
+
+				// restart p2p traffic
+                if let Err(e) = client.set_network_active(true) {
+				    error!("RPC call failed: {e:?}");
+					return
+				};
+			});
+	}
 
     fn process_stale_candidates(&self) {
         // Find top 3.
@@ -1039,6 +1327,7 @@ impl<BC: BtcClient> ForkScanner<BC> {
     }
 
     fn find_stale_candidates(&self) {
+	    info!("Stale candidate checks");
         let tip_height = match Block::max_height(&self.db_conn) {
             Ok(Some(tip)) => tip,
             _ => return,
@@ -1109,6 +1398,7 @@ impl<BC: BtcClient> ForkScanner<BC> {
     // off p2p on this node so the state doesn't change underneath us. Then, if the switch to new
     // chaintip is successful, we check if it would've been a valid tip.
     fn rollback_checks(&self) {
+	    info!("Running rollback checks");
         for node in self.clients.iter().filter(|c| c.mirror().is_some()) {
             let mirror = node.mirror().as_ref().unwrap();
             let chaintips = match mirror.get_chain_tips() {
@@ -1444,8 +1734,8 @@ impl<BC: BtcClient> ForkScanner<BC> {
 
             let peers = match mirror.get_peer_info() {
                 Ok(p) => p,
-                Err(_) => {
-                    error!("No peers");
+                Err(e) => {
+                    error!("No peers: {e:?}");
                     continue;
                 }
             };

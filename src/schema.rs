@@ -31,6 +31,19 @@ diesel::table! {
 }
 
 diesel::table! {
+    inflated_blocks (block_hash) {
+        block_hash -> Varchar,
+        max_inflation -> Numeric,
+        actual_inflation -> Numeric,
+        notified_at -> Timestamptz,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+        node_id -> Int8,
+        dismissed_at -> Nullable<Timestamptz>,
+    }
+}
+
+diesel::table! {
     invalid_blocks (hash, node) {
         hash -> Varchar,
         node -> Int8,
@@ -47,6 +60,8 @@ diesel::table! {
         rpc_user -> Varchar,
         rpc_pass -> Varchar,
         unreachable_since -> Nullable<Timestamptz>,
+        last_polled -> Nullable<Timestamptz>,
+        initial_block_download -> Bool,
     }
 }
 
@@ -98,20 +113,35 @@ diesel::table! {
 }
 
 diesel::table! {
+    tx_outsets (block_hash, node_id) {
+        block_hash -> Varchar,
+        node_id -> Int8,
+        txouts -> Int8,
+        total_amount -> Numeric,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+        inflated -> Bool,
+    }
+}
+
+diesel::table! {
     valid_blocks (hash, node) {
         hash -> Varchar,
         node -> Int8,
     }
 }
 
+diesel::joinable!(inflated_blocks -> blocks (block_hash));
 diesel::joinable!(peers -> nodes (node_id));
 diesel::joinable!(stale_candidate_children -> stale_candidate (candidate_height));
 diesel::joinable!(transaction -> blocks (block_id));
+diesel::joinable!(tx_outsets -> blocks (block_hash));
 
 diesel::allow_tables_to_appear_in_same_query!(
     blocks,
     chaintips,
     double_spent_by,
+    inflated_blocks,
     invalid_blocks,
     nodes,
     peers,
@@ -119,5 +149,6 @@ diesel::allow_tables_to_appear_in_same_query!(
     stale_candidate,
     stale_candidate_children,
     transaction,
+    tx_outsets,
     valid_blocks,
 );

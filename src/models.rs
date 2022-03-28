@@ -1,3 +1,4 @@
+use bigdecimal::BigDecimal;
 use bitcoincore_rpc::bitcoincore_rpc_json::GetBlockHeaderResult;
 use chrono::prelude::*;
 use diesel::prelude::*;
@@ -6,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::schema::{
     blocks, chaintips, double_spent_by, invalid_blocks, nodes, peers, rbf_by, stale_candidate,
-    stale_candidate_children, transaction, valid_blocks,
+    stale_candidate_children, transaction, tx_outsets, valid_blocks,
 };
 
 #[derive(Clone, Deserialize, Serialize, Debug, AsChangeset, QueryableByName, Queryable, Insertable)]
@@ -176,7 +177,53 @@ pub struct Height {
     pub height: i64,
 }
 
-#[derive(Serialize, AsChangeset, QueryableByName, Queryable, Insertable)]
+#[derive(AsChangeset, QueryableByName, Queryable, Insertable)]
+#[table_name = "tx_outsets"]
+pub struct TxOutset {
+	pub block_hash:  String,
+	pub node_id: i64,
+	pub txouts: i64,
+	pub total_amount: BigDecimal,
+	pub created_at: DateTime<Utc>,
+	pub updated_at: DateTime<Utc>,
+	pub inflated: bool,
+}
+
+impl TxOutset {
+    pub fn get(conn: &PgConnection, block: &String, node: i64) -> QueryResult<Option<TxOutset>> {
+        use crate::schema::tx_outsets::dsl::*;
+		let result = tx_outsets
+		    .filter(
+			    block_hash.eq(block)
+				.and(node_id.eq(node))
+			).get_result(conn);
+
+	    match result {
+            Err(diesel::result::Error::NotFound) => Ok(None),
+			Ok(ans) => Ok(Some(ans)),
+			Err(e) => Err(e),
+
+		}
+	}
+
+	pub fn create(conn: &PgConnection, tx_outs: u64, amount: BigDecimal, block: &String, node: i64) -> QueryResult<usize> {
+        use crate::schema::tx_outsets::dsl::*;
+		let outset = TxOutset {
+			block_hash: block.clone(),
+			node_id: node,
+			txouts: tx_outs as i64,
+			total_amount: amount,
+			created_at: Utc::now(),
+			updated_at: Utc::now(),
+			// TODO: this
+			inflated: false,
+		};
+		diesel::insert_into(tx_outsets).values(outset).execute(conn)
+	}
+}
+
+
+#[derive(Clone, Serialize, AsChangeset, QueryableByName, Queryable, Insertable)]
 #[table_name = "blocks"]
 pub struct Block {
     pub hash: String,
@@ -189,6 +236,11 @@ pub struct Block {
 }
 
 impl Block {
+    pub fn get_latest(conn: &PgConnection) -> QueryResult<Block> {
+        use crate::schema::blocks::dsl::*;
+        blocks.order_by(height.desc()).first(conn)
+	}
+
     pub fn get(conn: &PgConnection, block_hash: &String) -> QueryResult<Block> {
         use crate::schema::blocks::dsl::*;
         blocks.find(block_hash).first(conn)
@@ -220,8 +272,11 @@ impl Block {
     pub fn find_stale_candidates(conn: &PgConnection, height: i64) -> QueryResult<Vec<Height>> {
         let raw_query = format!(
             "
-            SELECT height FROM blocks
+            SELECT height FROM blocks as b
+			LEFT JOIN invalid_blocks as ib
+			ON b.hash = ib.hash
             WHERE height > {}
+			AND ib.node IS NULL
             GROUP BY height
             HAVING count(height) > 1
             ORDER BY height ASC
@@ -676,7 +731,7 @@ impl StaleCandidate {
     }
 }
 
-#[derive(QueryableByName, Queryable, Insertable)]
+#[derive(AsChangeset, QueryableByName, Queryable, Insertable)]
 #[table_name = "nodes"]
 pub struct Node {
     pub id: i64,
@@ -687,6 +742,8 @@ pub struct Node {
     pub rpc_user: String,
     pub rpc_pass: String,
     pub unreachable_since: Option<DateTime<Utc>>,
+    pub last_polled: Option<DateTime<Utc>>,
+	pub initial_block_download: bool,
 }
 
 impl Node {
@@ -704,6 +761,26 @@ impl Node {
         use crate::schema::nodes::dsl::*;
         diesel::delete(nodes).filter(id.eq(node_id)).execute(conn)
     }
+
+	pub fn update(&self, conn: &PgConnection) -> QueryResult<usize> {
+        use crate::schema::nodes::dsl::*;
+        diesel::update(
+		    nodes.filter(id.eq(self.id))
+		)
+		.set(self)
+		.execute(conn)
+	}
+
+	pub fn get_active_reachable(conn: &PgConnection) -> QueryResult<Vec<Node>> {
+        use crate::schema::nodes::dsl::*;
+        nodes.filter(
+		    mirror_rpc_port.is_not_null()
+			.and(
+			    initial_block_download.eq(false)
+				    .and(unreachable_since.is_null())
+			)
+		).load(conn)
+	}
 
     pub fn insert(
         conn: &PgConnection,
