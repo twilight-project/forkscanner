@@ -9,7 +9,7 @@ use crate::schema::{
     stale_candidate_children, transaction, valid_blocks,
 };
 
-#[derive(Deserialize, Serialize, Debug, AsChangeset, QueryableByName, Queryable, Insertable)]
+#[derive(Clone, Deserialize, Serialize, Debug, AsChangeset, QueryableByName, Queryable, Insertable)]
 #[table_name = "chaintips"]
 pub struct Chaintip {
     pub id: i64,
@@ -386,6 +386,8 @@ impl Block {
 
         diesel::insert_into(valid_blocks)
             .values(block)
+			.on_conflict((hash, node))
+			.do_nothing()
             .execute(conn)
     }
 
