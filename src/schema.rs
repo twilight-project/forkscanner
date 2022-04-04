@@ -1,6 +1,21 @@
 // @generated automatically by Diesel CLI.
 
 diesel::table! {
+    block_templates (parent_block_hash, node_id) {
+        parent_block_hash -> Varchar,
+        node_id -> Int8,
+        fee_total -> Numeric,
+        ts -> Timestamptz,
+        height -> Int8,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+        n_transactions -> Int4,
+        tx_ids -> Bytea,
+        lowest_fee_rate -> Int4,
+    }
+}
+
+diesel::table! {
     blocks (hash) {
         hash -> Varchar,
         height -> Int8,
@@ -9,6 +24,10 @@ diesel::table! {
         first_seen_by -> Int8,
         headers_only -> Bool,
         work -> Varchar,
+        txids -> Nullable<Bytea>,
+        pool_name -> Nullable<Varchar>,
+        total_fee -> Nullable<Numeric>,
+        coinbase_message -> Nullable<Varchar>,
     }
 }
 
@@ -27,6 +46,14 @@ diesel::table! {
     double_spent_by (candidate_height, txid) {
         candidate_height -> Int8,
         txid -> Varchar,
+    }
+}
+
+diesel::table! {
+    fee_rates (parent_block_hash, node_id, fee_rate) {
+        parent_block_hash -> Varchar,
+        node_id -> Int8,
+        fee_rate -> Int4,
     }
 }
 
@@ -72,6 +99,16 @@ diesel::table! {
         peer_id -> Int8,
         address -> Varchar,
         version -> Int8,
+    }
+}
+
+diesel::table! {
+    pool (tag, name, url) {
+        tag -> Varchar,
+        name -> Varchar,
+        url -> Varchar,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
     }
 }
 
@@ -138,13 +175,16 @@ diesel::joinable!(transaction -> blocks (block_id));
 diesel::joinable!(tx_outsets -> blocks (block_hash));
 
 diesel::allow_tables_to_appear_in_same_query!(
+    block_templates,
     blocks,
     chaintips,
     double_spent_by,
+    fee_rates,
     inflated_blocks,
     invalid_blocks,
     nodes,
     peers,
+    pool,
     rbf_by,
     stale_candidate,
     stale_candidate_children,

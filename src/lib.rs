@@ -8,4 +8,5 @@ mod service;
 
 pub use models::*;
 pub use scanner::{ForkScanner, ScannerMessage};
+pub(crate) use scanner::MinerPoolInfo;
 pub use service::run_server;

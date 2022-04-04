@@ -1,10 +1,10 @@
-use crate::{Block, Chaintip, Node, StaleCandidate, StaleCandidateChildren, Transaction, TxOutset};
+use crate::{Block, BlockTemplate, Chaintip, InflatedBlock, Node, Pool, StaleCandidate, StaleCandidateChildren, Transaction, TxOutset};
 use chrono::prelude::*;
-use bigdecimal::BigDecimal;
+use bigdecimal::{BigDecimal, FromPrimitive};
 use bitcoin::consensus::encode::serialize_hex;
 use bitcoincore_rpc::bitcoin as btc;
 use bitcoincore_rpc::bitcoincore_rpc_json::{
-    GetBlockchainInfoResult, GetBlockHeaderResult, GetChainTipsResultTip, GetChainTipsResultStatus, GetPeerInfoResult,
+    GetBlockchainInfoResult, GetBlockHeaderResult, GetBlockTemplateResult, GetBlockTemplateModes, GetBlockTemplateRules, GetBlockTemplateCapabilities, GetBlockResult, GetChainTipsResultTip, GetChainTipsResultStatus, GetPeerInfoResult,
 	GetTxOutSetInfoResult, GetRawTransactionResult,
 };
 use bitcoincore_rpc::Error as BitcoinRpcError;
@@ -14,7 +14,7 @@ use diesel::Connection;
 use diesel::prelude::PgConnection;
 use jsonrpc::error::Error as JsonRpcError;
 use jsonrpc::error::RpcError;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 #[cfg(test)]
 use mockall::*;
 use rayon::prelude::*;
@@ -32,8 +32,22 @@ const BLOCK_NOT_FOUND: i32 = -5;
 const STALE_WINDOW: i64 = 100;
 const DOUBLE_SPEND_RANGE: i64 = 30;
 const REACHABLE_CHECK_INTERVAL: i64 = 10;
+const MINER_POOL_INFO: &str = "https://raw.githubusercontent.com/0xB10C/known-mining-pools/master/pools.json";
+const SATOSHI_TO_BTC: i64 = 100_000_000;
 
 type ForkScannerResult<T> = Result<T, ForkScannerError>;
+
+#[derive(Debug, Deserialize)]
+pub struct MinerPool {
+    pub name: String,
+	pub link: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MinerPoolInfo {
+    pub coinbase_tags: HashMap<String, MinerPool>,
+	pub payout_addresses: HashMap<String, MinerPool>,
+}
 
 pub enum ScannerMessage {
     NewChaintip,
@@ -65,6 +79,7 @@ pub struct FullBlock {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(unused)]
 pub struct JsonTransaction {
     hash: String,
     hex: String,
@@ -80,6 +95,7 @@ pub struct JsonTransaction {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(unused)]
 pub struct Vin {
     txid: Option<String>,
     vout: Option<usize>,
@@ -90,6 +106,7 @@ pub struct Vin {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(unused)]
 pub struct Vout {
     value: f64,
     n: usize,
@@ -97,6 +114,7 @@ pub struct Vout {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(unused)]
 pub struct ScriptSig {
     asm: String,
     hex: String,
@@ -104,6 +122,7 @@ pub struct ScriptSig {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(unused)]
 pub struct ScriptPubKey {
     asm: String,
     hex: String,
@@ -127,6 +146,11 @@ pub trait BtcClient: Sized {
         &self,
         hash: &btc::BlockHash,
     ) -> Result<btc::BlockHeader, bitcoincore_rpc::Error>;
+    fn get_block_info(
+        &self,
+        hash: &btc::BlockHash,
+    ) -> Result<GetBlockResult, bitcoincore_rpc::Error>;
+    fn get_block_template(&self, mode: GetBlockTemplateModes, rules: &[GetBlockTemplateRules], capabilities: &[GetBlockTemplateCapabilities]) -> Result<GetBlockTemplateResult, bitcoincore_rpc::Error>;
     fn get_block_verbose(&self, hash: String) -> Result<FullBlock, bitcoincore_rpc::Error>;
     fn get_block_header_info(
         &self,
@@ -193,6 +217,17 @@ impl BtcClient for Client {
     ) -> Result<btc::BlockHeader, bitcoincore_rpc::Error> {
         RpcApi::get_block_header(self, hash)
     }
+
+    fn get_block_info(
+        &self,
+        hash: &btc::BlockHash,
+    ) -> Result<GetBlockResult, bitcoincore_rpc::Error> {
+        RpcApi::get_block_info(self, hash)
+	}
+
+    fn get_block_template(&self, mode: GetBlockTemplateModes, rules: &[GetBlockTemplateRules], capabilities: &[GetBlockTemplateCapabilities]) -> Result<GetBlockTemplateResult, bitcoincore_rpc::Error> {
+        RpcApi::get_block_template(self, mode, rules, capabilities)
+	}
 
     fn get_block_verbose(&self, hash: String) -> Result<FullBlock, bitcoincore_rpc::Error> {
         RpcApi::call::<FullBlock>(
@@ -285,6 +320,15 @@ pub enum ForkScannerError {
     ParentBlockFetchError,
     #[error("Failed to roll back.")]
     FailedRollback,
+    #[error("Invalid coinbase")]
+    InvalidCoinbase,
+}
+
+
+fn calc_max_inflation(height: i64) -> Option<BigDecimal> {
+    let interval = height as usize / 210_000;
+	let reward = 50 * SATOSHI_TO_BTC;
+	BigDecimal::from_i64(reward >> interval)
 }
 
 /// Once we have a block hash, we want to enter it into the database.
@@ -301,7 +345,53 @@ fn create_block_and_ancestors<BC: BtcClient>(
 
     for _ in 0..MAX_ANCESTRY_DEPTH {
         let bh = client.get_block_header_info(&hash)?;
-        let block = Block::get_or_create(&conn, headers_only, node_id, &bh)?;
+        let mut block = Block::get_or_create(&conn, headers_only, node_id, &bh)?;
+
+		let GetBlockResult { tx, .. } = client.get_block_info(&hash)?;
+		if let Some((coinbase_tx, rest_txs)) = tx.split_first() {
+			let coinbase_info = client.get_raw_transaction_info(&coinbase_tx, Some(&hash))?;
+
+			let hash_bytes: Vec<u8> = rest_txs.iter().flat_map(|tx| tx.as_hash().as_ref().to_vec()).collect();
+
+			if coinbase_info.vin.len() == 0 {
+			    error!("Invalid coinbase!");
+				return Err(ForkScannerError::InvalidCoinbase);
+			}
+
+			let mut pool = None;
+			let mut coinbase_message = None;
+
+			for vin in coinbase_info.vin.into_iter() {
+			    if let Some(cb) = vin.coinbase {
+				    let pool_tag = String::from_utf8_lossy(&cb).to_string();
+				    coinbase_message = Some(pool_tag.clone());
+					pool = Pool::get(&conn, pool_tag)?;
+					break;
+				}
+			}
+
+			if pool.is_none() {
+			    error!("Missing coinbase info!");
+				return Err(ForkScannerError::InvalidCoinbase);
+			}
+
+			let pool = pool.unwrap();
+
+            let mut amount = 0;
+			for vout in coinbase_info.vout.iter() {
+			    amount += vout.value.as_sat();
+			}
+
+            let max_inflation = calc_max_inflation(block.height).expect("Could not calculate inflation");
+			let total_fee = (BigDecimal::from(amount) - max_inflation) / SATOSHI_TO_BTC;
+
+			block.txids = Some(hash_bytes);
+			block.pool_name = Some(pool.name);
+			block.total_fee = Some(total_fee);
+			block.coinbase_message = coinbase_message;
+		} else {
+		    warn!("No coinbase tx in block!");
+		}
 
         if block.connected {
             break;
@@ -488,6 +578,27 @@ impl<BC: BtcClient> ForkScanner<BC> {
 			notify_tx,
         }, notify_rx))
     }
+
+
+	fn fetch_block_templates(&self, client: &BC, node: &Node) {
+        match client.get_block_template(GetBlockTemplateModes::Template, &[GetBlockTemplateRules::SegWit], &[]) {
+		    Ok(template) => {
+			    let parent = template.previous_block_hash.to_string();
+				let height = template.height as i64;
+				let n_txs = template.transactions.len() as i32;
+				let tx_ids = template.transactions.iter().flat_map(|tx| tx.txid.as_hash().as_ref().to_vec()).collect();
+				let rates = template.transactions.iter().map(|tx| tx.fee.as_sat() as i32 / (tx.weight as i32 / 4)).collect();
+
+				let total = BigDecimal::from(template.coinbase_value.as_sat()) - calc_max_inflation(height).expect("Could not get max_inflation") / SATOSHI_TO_BTC; 
+			    if let Err(e) = BlockTemplate::create(&self.db_conn, parent, node.id, total, height, n_txs, tx_ids, rates) {
+				    error!("Failed to create template entry {e:?}");
+				}
+			}
+			Err(e) => {
+			    error!("Error fetching block templates! {e:?}");
+			}
+		}
+	}
 
     // process chaintip entries for a client, log to database.
     fn process_client(&self, client: &BC, node: &Node) -> ForkScannerResult<bool> {
@@ -682,6 +793,26 @@ impl<BC: BtcClient> ForkScanner<BC> {
     // for new blocks, and fetch ancestors up to MAX_BLOCK_HEIGHT postgres
     // will do the rest for us.
     pub fn run(&self) {
+	    // update the miner pools info
+		match ureq::get(MINER_POOL_INFO).call() {
+		    Ok(info) => {
+			    match info.into_string() {
+				    Ok(info) => {
+					    if let Ok::<MinerPoolInfo, _>(pool_info) = serde_json::from_str(&info) {
+						    if let Err(e) = Pool::create_or_update_batch(&self.db_conn, pool_info) {
+							    error!("Failed to update miner pool info! {e:?}");
+							}
+						}
+					}
+					Err(e) => {
+					    warn!("Failed to fetch miner pool info! {e:?}");
+					}
+				};
+			}
+			Err(e) => {
+			    warn!("Could not fetch miner pool info! {e:?}");
+			}
+		};
         // start by purging chaintips, keeping only the previously 'active' chaintips.
         if let Err(e) = Chaintip::purge(&self.db_conn) {
             error!("Error purging database {:?}", e);
@@ -697,6 +828,8 @@ impl<BC: BtcClient> ForkScanner<BC> {
 					continue;
 				}
             };
+
+			self.fetch_block_templates(client.client(), node);
         }
 
 		if changed {
@@ -749,7 +882,7 @@ impl<BC: BtcClient> ForkScanner<BC> {
     }
 
 	fn inflation_checks(&self) {
-	    let mut mirrors = match Node::get_mirrors(&self.db_conn) {
+	    let mirrors = match Node::get_mirrors(&self.db_conn) {
 		    Ok(nodes) => nodes,
 			Err(e) => {
 			    error!("RPC Error {e:?}");
@@ -759,7 +892,7 @@ impl<BC: BtcClient> ForkScanner<BC> {
 
         info!("Checking mirror node reachability");
 		for mut mirror in mirrors {
-		    if let Some(ts) = mirror.unreachable_since {
+		    if let Some(_ts) = mirror.unreachable_since {
 			    let last_poll = mirror.last_polled.expect("No last_polled");
 			    let elapsed = Utc::now().signed_duration_since(last_poll);
 				if elapsed.num_minutes() > REACHABLE_CHECK_INTERVAL {
@@ -853,12 +986,9 @@ impl<BC: BtcClient> ForkScanner<BC> {
 
                 let mut blocks_to_check = vec![block.clone()];
 				let mut comparison_block = block.clone();
-				let mut comparison_tx_outset = None;
-				let mut max_exceeded = false;
 
 				loop {
 				    if block.height - comparison_block.height >= MAX_BLOCK_DEPTH {
-					    max_exceeded = true;
 						break;
 					}
 
@@ -870,7 +1000,7 @@ impl<BC: BtcClient> ForkScanner<BC> {
 						}
 					};
 
-					comparison_tx_outset = match TxOutset::get(&db_conn, &comparison_block.hash, mirror.id) {
+					let comparison_tx_outset = match TxOutset::get(&db_conn, &comparison_block.hash, mirror.id) {
 						Ok(outset) => outset,
 						Err(e) => {
 							error!("Database error {e:?}");
@@ -903,7 +1033,51 @@ impl<BC: BtcClient> ForkScanner<BC> {
 
                             // TODO: finish this up
 							let amount = BigDecimal::from_str(&tx_outset_info.total_amount.to_string()).expect("BigDecimal parsing failed");
-	                        TxOutset::create(&db_conn, tx_outset_info.tx_outs, amount, &block.hash, mirror.id).expect("Tx out failed");
+	                        let mut outset = match TxOutset::create(&db_conn, tx_outset_info.tx_outs, amount, &block.hash, mirror.id) {
+							    Ok(outset) => outset,
+								Err(e) => {
+								    error!("Database connection failed {e:?}");
+									return;
+								}
+							};
+
+							let prev_block = match block.parent(&db_conn) {
+							    Ok(b) => b,
+								Err(e) => {
+								    error!("Could not fetch parent for fee tx outsets {e:?}");
+									return;
+								}
+							};
+							
+							// if we have one, we're done here.
+							let prev_outset = match TxOutset::get(&db_conn, &prev_block.hash, mirror.id) {
+								Ok(Some(os)) => os,
+								Ok(None) => {
+								    error!("No previous outset to compare against!");
+									return;
+								}
+								Err(e) => {
+									error!("Database error {e:?}");
+									return
+								}
+							};
+
+							let inflation = outset.total_amount.clone() - prev_outset.total_amount;
+
+							let max_inflation = calc_max_inflation(block.height).expect("Could not calculate inflation");
+
+							if inflation > max_inflation {
+							    outset.inflated = true;
+								if let Err(e) = outset.update(&db_conn) {
+								    error!("Could not update inflation status for block {e:?}");
+									return;
+								}
+
+								if let Err(e) = InflatedBlock::create(&db_conn, outset.node_id, block, max_inflation, inflation) {
+								    error!("Could not insert inflated block {e:?}");
+									return;
+								}
+							}
 						}
 						Err(e) => {
 						    error!("Make block active failed {e:?}");
