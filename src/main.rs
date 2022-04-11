@@ -11,7 +11,8 @@ fn main() {
     let db_url = std::env::var("DATABASE_URL").expect("No DB url");
     let db_conn = PgConnection::establish(&db_url).expect("Connection failed");
 
-    let (scanner, receiver) = ForkScanner::<Client>::new(db_conn).expect("Launching forkscanner failed");
+    let (scanner, receiver) =
+        ForkScanner::<Client>::new(db_conn).expect("Launching forkscanner failed");
     let duration = std::time::Duration::from_millis(10_000);
 
     let _handle = std::thread::spawn(move || loop {

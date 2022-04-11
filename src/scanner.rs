@@ -1,17 +1,23 @@
-use crate::{Block, BlockTemplate, Chaintip, InflatedBlock, Node, Pool, StaleCandidate, StaleCandidateChildren, Transaction, TxOutset};
-use chrono::prelude::*;
+use crate::{
+    Block, BlockTemplate, Chaintip, FeeRate, InflatedBlock, Node, Pool, StaleCandidate,
+    StaleCandidateChildren, Transaction, TxOutset,
+};
 use bigdecimal::{BigDecimal, FromPrimitive};
 use bitcoin::consensus::encode::serialize_hex;
+use bitcoin_hashes::{Hash, sha256d};
 use bitcoincore_rpc::bitcoin as btc;
 use bitcoincore_rpc::bitcoincore_rpc_json::{
-    GetBlockchainInfoResult, GetBlockHeaderResult, GetBlockTemplateResult, GetBlockTemplateModes, GetBlockTemplateRules, GetBlockTemplateCapabilities, GetBlockResult, GetChainTipsResultTip, GetChainTipsResultStatus, GetPeerInfoResult,
-	GetTxOutSetInfoResult, GetRawTransactionResult,
+    GetBlockHeaderResult, GetBlockResult, GetBlockTemplateCapabilities, GetBlockTemplateModes,
+    GetBlockTemplateResult, GetBlockTemplateRules, GetBlockchainInfoResult,
+    GetChainTipsResultStatus, GetChainTipsResultTip, GetPeerInfoResult, GetRawTransactionResult,
+    GetTxOutSetInfoResult,
 };
 use bitcoincore_rpc::Error as BitcoinRpcError;
 use bitcoincore_rpc::{Auth, Client, RpcApi};
-use crossbeam::channel::{Receiver, Sender, unbounded};
-use diesel::Connection;
+use chrono::prelude::*;
+use crossbeam::channel::{unbounded, Receiver, Sender};
 use diesel::prelude::PgConnection;
+use diesel::Connection;
 use jsonrpc::error::Error as JsonRpcError;
 use jsonrpc::error::RpcError;
 use log::{debug, error, info, warn};
@@ -21,7 +27,7 @@ use rayon::prelude::*;
 use serde::Deserialize;
 use std::{
     collections::{HashMap, HashSet},
-    iter::FromIterator,
+    iter::{once, FromIterator},
     str::FromStr,
 };
 use thiserror::Error;
@@ -32,7 +38,8 @@ const BLOCK_NOT_FOUND: i32 = -5;
 const STALE_WINDOW: i64 = 100;
 const DOUBLE_SPEND_RANGE: i64 = 30;
 const REACHABLE_CHECK_INTERVAL: i64 = 10;
-const MINER_POOL_INFO: &str = "https://raw.githubusercontent.com/0xB10C/known-mining-pools/master/pools.json";
+const MINER_POOL_INFO: &str =
+    "https://raw.githubusercontent.com/0xB10C/known-mining-pools/master/pools.json";
 const SATOSHI_TO_BTC: i64 = 100_000_000;
 
 type ForkScannerResult<T> = Result<T, ForkScannerError>;
@@ -40,18 +47,18 @@ type ForkScannerResult<T> = Result<T, ForkScannerError>;
 #[derive(Debug, Deserialize)]
 pub struct MinerPool {
     pub name: String,
-	pub link: String,
+    pub link: String,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct MinerPoolInfo {
     pub coinbase_tags: HashMap<String, MinerPool>,
-	pub payout_addresses: HashMap<String, MinerPool>,
+    pub payout_addresses: HashMap<String, MinerPool>,
 }
 
 pub enum ScannerMessage {
     NewChaintip,
-	AllChaintips(Vec<Chaintip>),
+    AllChaintips(Vec<Chaintip>),
 }
 
 #[derive(Deserialize)]
@@ -150,7 +157,12 @@ pub trait BtcClient: Sized {
         &self,
         hash: &btc::BlockHash,
     ) -> Result<GetBlockResult, bitcoincore_rpc::Error>;
-    fn get_block_template(&self, mode: GetBlockTemplateModes, rules: &[GetBlockTemplateRules], capabilities: &[GetBlockTemplateCapabilities]) -> Result<GetBlockTemplateResult, bitcoincore_rpc::Error>;
+    fn get_block_template(
+        &self,
+        mode: GetBlockTemplateModes,
+        rules: &[GetBlockTemplateRules],
+        capabilities: &[GetBlockTemplateCapabilities],
+    ) -> Result<GetBlockTemplateResult, bitcoincore_rpc::Error>;
     fn get_block_verbose(&self, hash: String) -> Result<FullBlock, bitcoincore_rpc::Error>;
     fn get_block_header_info(
         &self,
@@ -191,11 +203,11 @@ impl BtcClient for Client {
     }
 
     fn get_blockchain_info(&self) -> Result<GetBlockchainInfoResult, bitcoincore_rpc::Error> {
-	    RpcApi::get_blockchain_info(self)
-	}
+        RpcApi::get_blockchain_info(self)
+    }
 
     fn get_chain_tips(&self) -> Result<Vec<GetChainTipsResultTip>, bitcoincore_rpc::Error> {
-	    RpcApi::get_chain_tips(self)
+        RpcApi::get_chain_tips(self)
     }
 
     fn get_block_from_peer(
@@ -223,11 +235,16 @@ impl BtcClient for Client {
         hash: &btc::BlockHash,
     ) -> Result<GetBlockResult, bitcoincore_rpc::Error> {
         RpcApi::get_block_info(self, hash)
-	}
+    }
 
-    fn get_block_template(&self, mode: GetBlockTemplateModes, rules: &[GetBlockTemplateRules], capabilities: &[GetBlockTemplateCapabilities]) -> Result<GetBlockTemplateResult, bitcoincore_rpc::Error> {
+    fn get_block_template(
+        &self,
+        mode: GetBlockTemplateModes,
+        rules: &[GetBlockTemplateRules],
+        capabilities: &[GetBlockTemplateCapabilities],
+    ) -> Result<GetBlockTemplateResult, bitcoincore_rpc::Error> {
         RpcApi::get_block_template(self, mode, rules, capabilities)
-	}
+    }
 
     fn get_block_verbose(&self, hash: String) -> Result<FullBlock, bitcoincore_rpc::Error> {
         RpcApi::call::<FullBlock>(
@@ -263,10 +280,9 @@ impl BtcClient for Client {
         RpcApi::get_raw_transaction_info(self, txid, block_hash)
     }
 
-
     fn get_tx_out_set_info(&self) -> Result<GetTxOutSetInfoResult, bitcoincore_rpc::Error> {
         RpcApi::get_tx_out_set_info(self)
-	}
+    }
 
     fn set_network_active(
         &self,
@@ -324,11 +340,10 @@ pub enum ForkScannerError {
     InvalidCoinbase,
 }
 
-
 fn calc_max_inflation(height: i64) -> Option<BigDecimal> {
     let interval = height as usize / 210_000;
-	let reward = 50 * SATOSHI_TO_BTC;
-	BigDecimal::from_i64(reward >> interval)
+    let reward = 50 * SATOSHI_TO_BTC;
+    BigDecimal::from_i64(reward >> interval)
 }
 
 /// Once we have a block hash, we want to enter it into the database.
@@ -347,51 +362,58 @@ fn create_block_and_ancestors<BC: BtcClient>(
         let bh = client.get_block_header_info(&hash)?;
         let mut block = Block::get_or_create(&conn, headers_only, node_id, &bh)?;
 
-		let GetBlockResult { tx, .. } = client.get_block_info(&hash)?;
-		if let Some((coinbase_tx, rest_txs)) = tx.split_first() {
-			let coinbase_info = client.get_raw_transaction_info(&coinbase_tx, Some(&hash))?;
+        let GetBlockResult { tx, .. } = client.get_block_info(&hash)?;
+        if let Some((coinbase_tx, rest_txs)) = tx.split_first() {
+            let coinbase_info = client.get_raw_transaction_info(&coinbase_tx, Some(&hash))?;
 
-			let hash_bytes: Vec<u8> = rest_txs.iter().flat_map(|tx| tx.as_hash().as_ref().to_vec()).collect();
+            let hash_bytes: Vec<u8> = once(coinbase_tx)
+                .chain(rest_txs.iter())
+                .flat_map(|tx| tx.as_hash().as_ref().to_vec())
+                .collect();
 
-			if coinbase_info.vin.len() == 0 {
-			    error!("Invalid coinbase!");
-				return Err(ForkScannerError::InvalidCoinbase);
-			}
+            if coinbase_info.vin.len() == 0 {
+                error!("Invalid coinbase!");
+                return Err(ForkScannerError::InvalidCoinbase);
+            }
 
-			let mut pool = None;
-			let mut coinbase_message = None;
+            let mut pool = None;
+            let mut coinbase_message = None;
 
-			for vin in coinbase_info.vin.into_iter() {
-			    if let Some(cb) = vin.coinbase {
-				    let pool_tag = String::from_utf8_lossy(&cb).to_string();
-				    coinbase_message = Some(pool_tag.clone());
-					pool = Pool::get(&conn, pool_tag)?;
-					break;
-				}
-			}
+            for vin in coinbase_info.vin.into_iter() {
+                if let Some(cb) = vin.coinbase {
+                    let pool_tag = String::from_utf8_lossy(&cb).to_string();
+                    coinbase_message = Some(pool_tag.clone());
+                    pool = Pool::get(&conn, pool_tag)?;
+                    break;
+                }
+            }
 
-			if pool.is_none() {
-			    error!("Missing coinbase info!");
-				return Err(ForkScannerError::InvalidCoinbase);
-			}
+            if pool.is_none() {
+                error!("Missing coinbase info!");
+                return Err(ForkScannerError::InvalidCoinbase);
+            }
 
-			let pool = pool.unwrap();
+            let pool = pool.unwrap();
 
             let mut amount = 0;
-			for vout in coinbase_info.vout.iter() {
-			    amount += vout.value.as_sat();
-			}
+            for vout in coinbase_info.vout.iter() {
+                amount += vout.value.as_sat();
+            }
 
-            let max_inflation = calc_max_inflation(block.height).expect("Could not calculate inflation");
-			let total_fee = (BigDecimal::from(amount) - max_inflation) / SATOSHI_TO_BTC;
+            let max_inflation =
+                calc_max_inflation(block.height).expect("Could not calculate inflation");
+            let total_fee = (BigDecimal::from(amount) - max_inflation) / SATOSHI_TO_BTC;
 
-			block.txids = Some(hash_bytes);
-			block.pool_name = Some(pool.name);
-			block.total_fee = Some(total_fee);
-			block.coinbase_message = coinbase_message;
-		} else {
-		    warn!("No coinbase tx in block!");
-		}
+            block.txids = Some(hash_bytes);
+            block.pool_name = Some(pool.name);
+            block.total_fee = Some(total_fee);
+            block.coinbase_message = coinbase_message;
+            if let Err(e) = block.update(&conn) {
+                error!("DB update failed for block fees {e:?}");
+            }
+        } else {
+            warn!("No coinbase tx in block!");
+        }
 
         if block.connected {
             break;
@@ -411,99 +433,98 @@ fn create_block_and_ancestors<BC: BtcClient>(
 fn make_block_active<BC: BtcClient>(
     client: &BC,
     db_conn: &PgConnection,
-	block: &Block,
+    block: &Block,
 ) -> ForkScannerResult<Vec<btc::BlockHash>> {
-	let mut invalidated_hashes = Vec::new();
-	let mut retry_count = 0;
+    let mut invalidated_hashes = Vec::new();
+    let mut retry_count = 0;
 
-	loop {
-		let tips = match client.get_chain_tips() {
-			Ok(t) => t,
-			Err(e) => {
-				error!("Chain tips error {:?}", e);
-				continue;
-			}
-		};
+    loop {
+        let tips = match client.get_chain_tips() {
+            Ok(t) => t,
+            Err(e) => {
+                error!("Chain tips error {:?}", e);
+                continue;
+            }
+        };
 
-		let active = tips
-			.iter()
-			.find(|t| t.status == GetChainTipsResultStatus::Active)
-			.unwrap();
+        let active = tips
+            .iter()
+            .find(|t| t.status == GetChainTipsResultStatus::Active)
+            .unwrap();
 
-	    let active_hash = active.hash.to_string();
-		if active_hash == block.hash {
-			break;
-		}
+        let active_hash = active.hash.to_string();
+        if active_hash == block.hash {
+            break;
+        }
 
-		if retry_count > 100 {
-			return Err(ForkScannerError::FailedRollback);
-		}
+        if retry_count > 100 {
+            return Err(ForkScannerError::FailedRollback);
+        }
 
-		let mut blocks_to_invalidate = Vec::new();
+        let mut blocks_to_invalidate = Vec::new();
 
-		if active.height as i64 == block.height {
-			blocks_to_invalidate.push(active.hash);
-		} else {
-			if let Some(branch) = find_fork_point(db_conn, active, block) {
-				blocks_to_invalidate.push(branch);
-			}
+        if active.height as i64 == block.height {
+            blocks_to_invalidate.push(active.hash);
+        } else {
+            if let Some(branch) = find_fork_point(db_conn, active, block) {
+                blocks_to_invalidate.push(branch);
+            }
 
-			let children = match Block::children(db_conn, &block.hash.to_string()) {
-				Ok(c) => c,
-				Err(e) => {
-					error!("Children fetch failed {:?}", e);
-					continue;
-				}
-			};
+            let children = match Block::children(db_conn, &block.hash.to_string()) {
+                Ok(c) => c,
+                Err(e) => {
+                    error!("Children fetch failed {:?}", e);
+                    continue;
+                }
+            };
 
-			for child in children {
-				let hash = btc::BlockHash::from_str(&child.hash).unwrap();
-				blocks_to_invalidate.push(hash);
-			}
-		}
+            for child in children {
+                let hash = btc::BlockHash::from_str(&child.hash).unwrap();
+                blocks_to_invalidate.push(hash);
+            }
+        }
 
-		for b in blocks_to_invalidate {
-			let _ = client.invalidate_block(&b);
-			invalidated_hashes.push(b);
-		}
+        for b in blocks_to_invalidate {
+            let _ = client.invalidate_block(&b);
+            invalidated_hashes.push(b);
+        }
 
-		retry_count += 1;
-	}
-	Ok(invalidated_hashes)
+        retry_count += 1;
+    }
+    Ok(invalidated_hashes)
 }
-
 
 fn find_fork_point(
     db_conn: &PgConnection,
-	active: &GetChainTipsResultTip,
-	block: &Block,
+    active: &GetChainTipsResultTip,
+    block: &Block,
 ) -> Option<btc::BlockHash> {
-	if active.height as i64 <= block.height {
-		return None;
-	}
+    if active.height as i64 <= block.height {
+        return None;
+    }
 
-	let mut block1 = Block::get(&db_conn, &active.hash.to_string()).ok()?;
+    let mut block1 = Block::get(&db_conn, &active.hash.to_string()).ok()?;
 
-	while block1.height > block.height {
-		block1 = block1.parent(db_conn).ok()?;
-	}
+    while block1.height > block.height {
+        block1 = block1.parent(db_conn).ok()?;
+    }
 
-	if block1.hash == block.hash {
-		None
-	} else {
-		loop {
-			block1 = block1.parent(db_conn).ok()?;
+    if block1.hash == block.hash {
+        None
+    } else {
+        loop {
+            block1 = block1.parent(db_conn).ok()?;
 
-			let desc = block1.descendants(db_conn, None).ok()?;
+            let desc = block1.descendants(db_conn, None).ok()?;
 
-			let fork = desc.into_iter().find(|b| b.hash == block.hash);
+            let fork = desc.into_iter().find(|b| b.hash == block.hash);
 
-			if let Some(_) = fork {
-				let hash = btc::BlockHash::from_str(&block1.hash).unwrap();
-				return Some(hash);
-			}
-		}
-	}
+            if let Some(_) = fork {
+                let hash = btc::BlockHash::from_str(&block1.hash).unwrap();
+                return Some(hash);
+            }
+        }
+    }
 }
 
 /// Holds connection info for a bitcoin node that forkscanner is
@@ -549,11 +570,13 @@ pub struct ForkScanner<BC: BtcClient> {
     node_list: Vec<Node>,
     clients: Vec<ScannerClient<BC>>,
     db_conn: PgConnection,
-	notify_tx: Sender<ScannerMessage>,
+    notify_tx: Sender<ScannerMessage>,
 }
 
 impl<BC: BtcClient> ForkScanner<BC> {
-    pub fn new(db_conn: PgConnection) -> ForkScannerResult<(ForkScanner<BC>, Receiver<ScannerMessage>)> {
+    pub fn new(
+        db_conn: PgConnection,
+    ) -> ForkScannerResult<(ForkScanner<BC>, Receiver<ScannerMessage>)> {
         let node_list = Node::list(&db_conn)?;
 
         let mut clients = Vec::new();
@@ -569,36 +592,61 @@ impl<BC: BtcClient> ForkScanner<BC> {
             clients.push(client);
         }
 
-		let (notify_tx, notify_rx) = unbounded();
+        let (notify_tx, notify_rx) = unbounded();
 
-        Ok((ForkScanner {
-            node_list,
-            clients,
-            db_conn,
-			notify_tx,
-        }, notify_rx))
+        Ok((
+            ForkScanner {
+                node_list,
+                clients,
+                db_conn,
+                notify_tx,
+            },
+            notify_rx,
+        ))
     }
 
+    fn fetch_block_templates(&self, client: &BC, node: &Node) {
+        match client.get_block_template(
+            GetBlockTemplateModes::Template,
+            &[GetBlockTemplateRules::SegWit],
+            &[],
+        ) {
+            Ok(template) => {
+                let parent = template.previous_block_hash.to_string();
+                let height = template.height as i64;
+                let n_txs = template.transactions.len() as i32;
+                let tx_ids = template
+                    .transactions
+                    .iter()
+                    .flat_map(|tx| tx.txid.as_hash().as_ref().to_vec())
+                    .collect();
+                let rates = template
+                    .transactions
+                    .iter()
+                    .map(|tx| tx.fee.as_sat() as i32 / (tx.weight as i32 / 4))
+                    .collect();
 
-	fn fetch_block_templates(&self, client: &BC, node: &Node) {
-        match client.get_block_template(GetBlockTemplateModes::Template, &[GetBlockTemplateRules::SegWit], &[]) {
-		    Ok(template) => {
-			    let parent = template.previous_block_hash.to_string();
-				let height = template.height as i64;
-				let n_txs = template.transactions.len() as i32;
-				let tx_ids = template.transactions.iter().flat_map(|tx| tx.txid.as_hash().as_ref().to_vec()).collect();
-				let rates = template.transactions.iter().map(|tx| tx.fee.as_sat() as i32 / (tx.weight as i32 / 4)).collect();
-
-				let total = BigDecimal::from(template.coinbase_value.as_sat()) - calc_max_inflation(height).expect("Could not get max_inflation") / SATOSHI_TO_BTC; 
-			    if let Err(e) = BlockTemplate::create(&self.db_conn, parent, node.id, total, height, n_txs, tx_ids, rates) {
-				    error!("Failed to create template entry {e:?}");
-				}
-			}
-			Err(e) => {
-			    error!("Error fetching block templates! {e:?}");
-			}
-		}
-	}
+                let total = BigDecimal::from(template.coinbase_value.as_sat())
+                    - calc_max_inflation(height).expect("Could not get max_inflation")
+                        / SATOSHI_TO_BTC;
+                if let Err(e) = BlockTemplate::create(
+                    &self.db_conn,
+                    parent,
+                    node.id,
+                    total,
+                    height,
+                    n_txs,
+                    tx_ids,
+                    rates,
+                ) {
+                    error!("Failed to create template entry {e:?}");
+                }
+            }
+            Err(e) => {
+                error!("Error fetching block templates! {e:?}");
+            }
+        }
+    }
 
     // process chaintip entries for a client, log to database.
     fn process_client(&self, client: &BC, node: &Node) -> ForkScannerResult<bool> {
@@ -630,12 +678,13 @@ impl<BC: BtcClient> ForkScanner<BC> {
                     Block::set_valid(&self.db_conn, &hash, node.id)?;
                 }
                 GetChainTipsResultStatus::Active => {
-                    let rows = Chaintip::set_active_tip(&self.db_conn, tip.height as i64, &hash, node.id)?;
+                    let rows =
+                        Chaintip::set_active_tip(&self.db_conn, tip.height as i64, &hash, node.id)?;
 
                     create_block_and_ancestors(client, &self.db_conn, false, &hash, node.id)?;
 
                     Block::set_valid(&self.db_conn, &hash, node.id)?;
-					changed |= rows > 0;
+                    changed |= rows > 0;
                 }
             }
         }
@@ -793,28 +842,33 @@ impl<BC: BtcClient> ForkScanner<BC> {
     // for new blocks, and fetch ancestors up to MAX_BLOCK_HEIGHT postgres
     // will do the rest for us.
     pub fn run(&self) {
-	    // update the miner pools info
-		match ureq::get(MINER_POOL_INFO).call() {
-		    Ok(info) => {
-			    match info.into_string() {
-				    Ok(info) => {
-					    if let Ok::<MinerPoolInfo, _>(pool_info) = serde_json::from_str(&info) {
-						    if let Err(e) = Pool::create_or_update_batch(&self.db_conn, pool_info) {
-							    error!("Failed to update miner pool info! {e:?}");
-							}
-						}
-					}
-					Err(e) => {
-					    warn!("Failed to fetch miner pool info! {e:?}");
-					}
-				};
-			}
-			Err(e) => {
-			    warn!("Could not fetch miner pool info! {e:?}");
-			}
-		};
+        // update the miner pools info
+        match ureq::get(MINER_POOL_INFO).call() {
+            Ok(info) => {
+                match info.into_string() {
+                    Ok(info) => {
+                        if let Ok::<MinerPoolInfo, _>(pool_info) = serde_json::from_str(&info) {
+                            if let Err(e) = Pool::create_or_update_batch(&self.db_conn, pool_info) {
+                                error!("Failed to update miner pool info! {e:?}");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to fetch miner pool info! {e:?}");
+                    }
+                };
+            }
+            Err(e) => {
+                warn!("Could not fetch miner pool info! {e:?}");
+            }
+        };
         // start by purging chaintips, keeping only the previously 'active' chaintips.
         if let Err(e) = Chaintip::purge(&self.db_conn) {
+            error!("Error purging database {:?}", e);
+            return;
+        }
+
+        if let Err(e) = BlockTemplate::purge(&self.db_conn) {
             error!("Error purging database {:?}", e);
             return;
         }
@@ -822,26 +876,98 @@ impl<BC: BtcClient> ForkScanner<BC> {
         let mut changed = false;
         for (client, node) in self.clients.iter().zip(&self.node_list) {
             changed |= match self.process_client(client.client(), node) {
-			    Ok(changed) => changed,
-			    Err(e) => {
-					error!("Error processing client {:?}", e);
-					continue;
-				}
+                Ok(changed) => changed,
+                Err(e) => {
+                    error!("Error processing client {:?}", e);
+                    continue;
+                }
             };
 
-			self.fetch_block_templates(client.client(), node);
+            self.fetch_block_templates(client.client(), node);
         }
 
-		if changed {
-			self.notify_tx.send(ScannerMessage::NewChaintip).expect("Channel closed");
-		}
+        if changed {
+            self.notify_tx
+                .send(ScannerMessage::NewChaintip)
+                .expect("Channel closed");
+        }
+
+		match BlockTemplate::get_min(&self.db_conn) {
+		    Ok(Some(min_template)) => {
+				if let Ok(blocks) = Block::get_with_fee_no_diffs(&self.db_conn, min_template) {
+				    for mut block in blocks {
+					    if block.txids.is_none() {
+						    continue;
+						}
+
+						let latest_template = match BlockTemplate::get_with_txs(&self.db_conn, block.height) {
+						    Ok(lb) => lb,
+							Err(e) => {
+							    error!("Could not fetch latest template! {e:?}");
+								continue;
+							}
+						};
+
+						if latest_template.tx_ids.len() == 0 {
+						    continue;
+						}
+
+						let template_txids: Vec<_> = (latest_template.tx_ids).chunks(32).map(|chunk| sha256d::Hash::from_slice(chunk).expect("Bad hash value")).collect();
+						let block_txids = HashSet::<_>::from_iter((block.txids.unwrap()).chunks(32).map(|chunk| sha256d::Hash::from_slice(chunk).expect("Bad hash value")));
+
+						let tx_pos_omitted = template_txids
+						    .iter()
+							.enumerate()
+							.filter_map(|(idx, txid)| {
+							    if block_txids.contains(txid) {
+								    None
+								} else {
+								    Some(idx)
+								}
+							});
+						let tx_template = HashSet::<_>::from_iter(template_txids.iter().cloned());
+
+					    let total_fee = block.total_fee.unwrap();
+						let added = block_txids.difference(&tx_template);
+						let omitted = tx_template.difference(&block_txids);
+						match FeeRate::list_by(&self.db_conn, latest_template.parent_block_hash, latest_template.node_id) {
+						    Ok(fee_rates) => {
+							    for mut fee_rate in tx_pos_omitted.into_iter().map(|i| fee_rates[i].clone()) {
+								    fee_rate.omitted = true;
+									if let Err(e) = fee_rate.update(&self.db_conn) {
+									    error!("Fee rate update failed {e:?}");
+										return;
+									}
+								}
+							}
+							Err(e) => {
+							    error!("Could not fetch fee rates {e:?}");
+								return;
+							}
+						};
+
+						block.txids_added = Some(added.into_iter().flat_map(|a| a.to_vec()).collect());
+						block.txids_omitted = Some(omitted.into_iter().flat_map(|a| a.to_vec()).collect());
+						block.lowest_template_fee_rate = Some(BigDecimal::from(latest_template.lowest_fee_rate));
+						block.template_txs_fee_diff = Some(total_fee - latest_template.fee_total);
+					}
+				}
+			}
+			Ok(None) => warn!("No block templates!"),
+			Err(e) => {
+			    error!("Error fetching min template! {e:?}");
+				return;
+			}
+		};
 
         match Chaintip::list(&self.db_conn) {
-		    Ok(tips) => {
-				self.notify_tx.send(ScannerMessage::AllChaintips(tips)).expect("Channel closed");
-			}
-			Err(e) => error!("Database error: {:?}", e),
-		}
+            Ok(tips) => {
+                self.notify_tx
+                    .send(ScannerMessage::AllChaintips(tips))
+                    .expect("Channel closed");
+            }
+            Err(e) => error!("Database error: {:?}", e),
+        }
 
         // For each node, start with their active chaintip and see if
         // other chaintips are behind this one. Link them via 'parent_chaintip'
@@ -873,7 +999,7 @@ impl<BC: BtcClient> ForkScanner<BC> {
 
         // Now try to fill in missing blocks.
         self.find_missing_blocks();
-		self.inflation_checks();
+        self.inflation_checks();
         self.rollback_checks();
         self.find_stale_candidates();
 
@@ -881,219 +1007,275 @@ impl<BC: BtcClient> ForkScanner<BC> {
         self.process_stale_candidates()
     }
 
-	fn inflation_checks(&self) {
-	    let mirrors = match Node::get_mirrors(&self.db_conn) {
-		    Ok(nodes) => nodes,
-			Err(e) => {
-			    error!("RPC Error {e:?}");
-				return;
-			}
-		};
+    fn inflation_checks(&self) {
+        let mirrors = match Node::get_mirrors(&self.db_conn) {
+            Ok(nodes) => nodes,
+            Err(e) => {
+                error!("RPC Error {e:?}");
+                return;
+            }
+        };
 
         info!("Checking mirror node reachability");
-		for mut mirror in mirrors {
-		    if let Some(_ts) = mirror.unreachable_since {
-			    let last_poll = mirror.last_polled.expect("No last_polled");
-			    let elapsed = Utc::now().signed_duration_since(last_poll);
-				if elapsed.num_minutes() > REACHABLE_CHECK_INTERVAL {
-				    mirror.last_polled = Some(Utc::now());
-					let node = self
-						.clients
-						.iter()
-						.find(|c| c.node_id == mirror.id)
-						.unwrap()
-						.mirror()
-						.as_ref()
-						.unwrap();
+        for mut mirror in mirrors {
+            if let Some(_ts) = mirror.unreachable_since {
+                let last_poll = mirror.last_polled.expect("No last_polled");
+                let elapsed = Utc::now().signed_duration_since(last_poll);
+                if elapsed.num_minutes() > REACHABLE_CHECK_INTERVAL {
+                    mirror.last_polled = Some(Utc::now());
+                    let node = self
+                        .clients
+                        .iter()
+                        .find(|c| c.node_id == mirror.id)
+                        .unwrap()
+                        .mirror()
+                        .as_ref()
+                        .unwrap();
 
-				    match node.get_blockchain_info() {
-					    Ok(info) => {
-						    mirror.initial_block_download = info.initial_block_download;
-						    mirror.unreachable_since = None;
-							mirror.last_polled = None;
-						}
-						Err(e) => debug!("Could not reach mirror on reachable check {e:?}"),
-					}
+                    match node.get_blockchain_info() {
+                        Ok(info) => {
+                            mirror.initial_block_download = info.initial_block_download;
+                            mirror.unreachable_since = None;
+                            mirror.last_polled = None;
+                        }
+                        Err(e) => debug!("Could not reach mirror on reachable check {e:?}"),
+                    }
 
-					if let Err(e) = mirror.update(&self.db_conn) {
-					    error!("Updating mirror info failed {e:?}");
-					}
-				}
-			}
-		}
+                    if let Err(e) = mirror.update(&self.db_conn) {
+                        error!("Updating mirror info failed {e:?}");
+                    }
+                }
+            }
+        }
 
-		let mirrors = match Node::get_active_reachable(&self.db_conn) {
-		    Ok(m) => m,
-			Err(e) => {
-			    error!("Could not connect to database {e:?}");
-				return;
-			}
-		};
+        let mirrors = match Node::get_active_reachable(&self.db_conn) {
+            Ok(m) => m,
+            Err(e) => {
+                error!("Could not connect to database {e:?}");
+                return;
+            }
+        };
 
         info!("Inflation checks for {} nodes", mirrors.len());
-		mirrors
-		    .par_iter()
-			.for_each(|mirror| {
-				let host = format!("http://{}:{}", mirror.rpc_host, mirror.mirror_rpc_port.expect("No mirror port"));
-				let auth = Auth::UserPass(mirror.rpc_user.clone(), mirror.rpc_pass.clone());
-				let client = BC::new(&host, auth).expect("Create client failed");
+        mirrors.par_iter().for_each(|mirror| {
+            let host = format!(
+                "http://{}:{}",
+                mirror.rpc_host,
+                mirror.mirror_rpc_port.expect("No mirror port")
+            );
+            let auth = Auth::UserPass(mirror.rpc_user.clone(), mirror.rpc_pass.clone());
+            let client = BC::new(&host, auth).expect("Create client failed");
 
-				let db_url = std::env::var("DATABASE_URL").expect("No DB url");
-				let db_conn = PgConnection::establish(&db_url).expect("Connection failed");
+            let db_url = std::env::var("DATABASE_URL").expect("No DB url");
+            let db_conn = PgConnection::establish(&db_url).expect("Connection failed");
 
-				// stop p2p traffic
-                if let Err(e) = client.set_network_active(false) {
-				    error!("RPC call failed: {e:?}");
-					return
-				};
+            // stop p2p traffic
+            if let Err(e) = client.set_network_active(false) {
+                error!("RPC call failed: {e:?}");
+                return;
+            };
 
-				let latest = match client.get_blockchain_info() {
-				    Ok(info) => {
-					    let hash = info.best_block_hash.to_string();
+            let latest = match client.get_blockchain_info() {
+                Ok(info) => {
+                    let hash = info.best_block_hash.to_string();
 
-						create_block_and_ancestors(
-						    &client, &db_conn, true, &hash, mirror.id
-						).expect("Fetching blocks for inflation checks failed");
+                    create_block_and_ancestors(&client, &db_conn, true, &hash, mirror.id)
+                        .expect("Fetching blocks for inflation checks failed");
 
-						// if we have one, we're done here.
-						match TxOutset::get(&db_conn, &hash, mirror.id) {
-							Ok(Some(_)) => return,
-							Err(e) => {
-								error!("Database error {e:?}");
-								return
-							}
-							_ => {}
-						};
+                    // if we have one, we're done here.
+                    match TxOutset::get(&db_conn, &hash, mirror.id) {
+                        Ok(Some(_)) => {
+                            let _ = client
+                                .set_network_active(true)
+                                .expect("Could not re-enable network");
+                            return;
+                        }
+                        Err(e) => {
+                            error!("Database error {e:?}");
+                            let _ = client
+                                .set_network_active(true)
+                                .expect("Could not re-enable network");
+                            return;
+                        }
+                        _ => {}
+                    };
 
-						hash
-					}
-					Err(e) => {
-					    error!("RPC call failed {e:?}");
-						// TODO: should make sure this succeeds, or re-enable elsewhere...
-                        let _ = client.set_network_active(true).expect("Could not re-enable network");
-						return;
-					}
-				};
+                    hash
+                }
+                Err(e) => {
+                    error!("RPC call failed {e:?}");
+                    let _ = client
+                        .set_network_active(true)
+                        .expect("Could not re-enable network");
+                    return;
+                }
+            };
 
-				let block = match Block::get(&db_conn, &latest) {
-				    Ok(block) => block,
-					Err(e) => {
-					    error!("Block not found {e:?}");
-                        let _ = client.set_network_active(true).expect("Could not re-enable network");
-						return;
-					}
-				};
+            let block = match Block::get(&db_conn, &latest) {
+                Ok(block) => block,
+                Err(e) => {
+                    error!("Block not found {e:?}");
+                    let _ = client
+                        .set_network_active(true)
+                        .expect("Could not re-enable network");
+                    return;
+                }
+            };
 
-                let mut blocks_to_check = vec![block.clone()];
-				let mut comparison_block = block.clone();
+            let mut blocks_to_check = vec![block.clone()];
+            let mut comparison_block = block.clone();
 
-				loop {
-				    if block.height - comparison_block.height >= MAX_BLOCK_DEPTH {
-						break;
-					}
+            loop {
+                if block.height - comparison_block.height >= MAX_BLOCK_DEPTH {
+                    break;
+                }
 
-					comparison_block = match comparison_block.parent(&db_conn) {
-					    Ok(block) => block,
-						Err(e) => {
-						    error!("Could not fetch parent block {e:?}");
-							return;
-						}
-					};
+                comparison_block = match comparison_block.parent(&db_conn) {
+                    Ok(block) => block,
+                    Err(e) => {
+                        error!("Could not fetch parent block {e:?}");
+                        let _ = client
+                            .set_network_active(true)
+                            .expect("Could not re-enable network");
+                        return;
+                    }
+                };
 
-					let comparison_tx_outset = match TxOutset::get(&db_conn, &comparison_block.hash, mirror.id) {
-						Ok(outset) => outset,
-						Err(e) => {
-							error!("Database error {e:?}");
-							return
-						}
-					};
+                let comparison_tx_outset =
+                    match TxOutset::get(&db_conn, &comparison_block.hash, mirror.id) {
+                        Ok(outset) => outset,
+                        Err(e) => {
+                            error!("Database error {e:?}");
+                            let _ = client
+                                .set_network_active(true)
+                                .expect("Could not re-enable network");
+                            return;
+                        }
+                    };
 
-					if comparison_tx_outset.is_some() {
-					    break;
-					}
+                if comparison_tx_outset.is_some() {
+                    break;
+                }
 
-					blocks_to_check.push(comparison_block.clone());
-				}
+                blocks_to_check.push(comparison_block.clone());
+            }
 
-                for block in blocks_to_check.iter().rev() {
-				    match make_block_active(&client, &db_conn, block) {
-					    Ok(invalidated_hashes) => {
-						    let tx_outset_info = match client.get_tx_out_set_info() {
-							    Ok(o) => o,
-								Err(e) => {
-								    error!("TX outset info call failed {e:?}");
-									return;
-								}
-							};
+            for block in blocks_to_check.iter().rev() {
+                match make_block_active(&client, &db_conn, block) {
+                    Ok(invalidated_hashes) => {
+                        let tx_outset_info = match client.get_tx_out_set_info() {
+                            Ok(o) => o,
+                            Err(e) => {
+                                error!("TX outset info call failed {e:?}");
+                                let _ = client
+                                    .set_network_active(true)
+                                    .expect("Could not re-enable network");
+                                return;
+                            }
+                        };
 
-                            // Undo the rollback
-                            for hash in invalidated_hashes {
-                                let _ = client.reconsider_block(&hash);
+                        // Undo the rollback
+                        for hash in invalidated_hashes {
+                            let _ = client.reconsider_block(&hash);
+                        }
+
+                        let amount = BigDecimal::from_str(&tx_outset_info.total_amount.to_string())
+                            .expect("BigDecimal parsing failed");
+                        let mut outset = match TxOutset::create(
+                            &db_conn,
+                            tx_outset_info.tx_outs,
+                            amount,
+                            &block.hash,
+                            mirror.id,
+                        ) {
+                            Ok(outset) => outset,
+                            Err(e) => {
+                                error!("Database connection failed {e:?}");
+                                let _ = client
+                                    .set_network_active(true)
+                                    .expect("Could not re-enable network");
+                                return;
+                            }
+                        };
+
+                        let prev_block = match block.parent(&db_conn) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                error!("Could not fetch parent for fee tx outsets {e:?}");
+                                let _ = client
+                                    .set_network_active(true)
+                                    .expect("Could not re-enable network");
+                                return;
+                            }
+                        };
+
+                        // if we have one, we're done here.
+                        let prev_outset = match TxOutset::get(&db_conn, &prev_block.hash, mirror.id)
+                        {
+                            Ok(Some(os)) => os,
+                            Ok(None) => {
+                                error!("No previous outset to compare against!");
+                                let _ = client
+                                    .set_network_active(true)
+                                    .expect("Could not re-enable network");
+                                return;
+                            }
+                            Err(e) => {
+                                error!("Database error {e:?}");
+                                let _ = client
+                                    .set_network_active(true)
+                                    .expect("Could not re-enable network");
+                                return;
+                            }
+                        };
+
+                        let inflation = outset.total_amount.clone() - prev_outset.total_amount;
+
+                        let max_inflation = calc_max_inflation(block.height)
+                            .expect("Could not calculate inflation");
+
+                        if inflation > max_inflation {
+                            outset.inflated = true;
+                            if let Err(e) = outset.update(&db_conn) {
+                                error!("Could not update inflation status for block {e:?}");
+                                let _ = client
+                                    .set_network_active(true)
+                                    .expect("Could not re-enable network");
+                                return;
                             }
 
-                            // TODO: finish this up
-							let amount = BigDecimal::from_str(&tx_outset_info.total_amount.to_string()).expect("BigDecimal parsing failed");
-	                        let mut outset = match TxOutset::create(&db_conn, tx_outset_info.tx_outs, amount, &block.hash, mirror.id) {
-							    Ok(outset) => outset,
-								Err(e) => {
-								    error!("Database connection failed {e:?}");
-									return;
-								}
-							};
+                            if let Err(e) = InflatedBlock::create(
+                                &db_conn,
+                                outset.node_id,
+                                block,
+                                max_inflation,
+                                inflation,
+                            ) {
+                                error!("Could not insert inflated block {e:?}");
+                                let _ = client
+                                    .set_network_active(true)
+                                    .expect("Could not re-enable network");
+                                return;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Make block active failed {e:?}");
+                        let _ = client
+                            .set_network_active(true)
+                            .expect("Could not re-enable network");
+                        return;
+                    }
+                }
+            }
 
-							let prev_block = match block.parent(&db_conn) {
-							    Ok(b) => b,
-								Err(e) => {
-								    error!("Could not fetch parent for fee tx outsets {e:?}");
-									return;
-								}
-							};
-							
-							// if we have one, we're done here.
-							let prev_outset = match TxOutset::get(&db_conn, &prev_block.hash, mirror.id) {
-								Ok(Some(os)) => os,
-								Ok(None) => {
-								    error!("No previous outset to compare against!");
-									return;
-								}
-								Err(e) => {
-									error!("Database error {e:?}");
-									return
-								}
-							};
-
-							let inflation = outset.total_amount.clone() - prev_outset.total_amount;
-
-							let max_inflation = calc_max_inflation(block.height).expect("Could not calculate inflation");
-
-							if inflation > max_inflation {
-							    outset.inflated = true;
-								if let Err(e) = outset.update(&db_conn) {
-								    error!("Could not update inflation status for block {e:?}");
-									return;
-								}
-
-								if let Err(e) = InflatedBlock::create(&db_conn, outset.node_id, block, max_inflation, inflation) {
-								    error!("Could not insert inflated block {e:?}");
-									return;
-								}
-							}
-						}
-						Err(e) => {
-						    error!("Make block active failed {e:?}");
-							let _ = client.set_network_active(true).expect("Could not re-enable network");
-							return;
-						}
-					}
-				}
-
-				// restart p2p traffic
-                if let Err(e) = client.set_network_active(true) {
-				    error!("RPC call failed: {e:?}");
-					return
-				};
-			});
-	}
+            // restart p2p traffic
+            if let Err(e) = client.set_network_active(true) {
+                error!("RPC call failed: {e:?}");
+                return;
+            };
+        });
+    }
 
     fn process_stale_candidates(&self) {
         // Find top 3.
@@ -1501,7 +1683,7 @@ impl<BC: BtcClient> ForkScanner<BC> {
     }
 
     fn find_stale_candidates(&self) {
-	    info!("Stale candidate checks");
+        info!("Stale candidate checks");
         let tip_height = match Block::max_height(&self.db_conn) {
             Ok(Some(tip)) => tip,
             _ => return,
@@ -1572,7 +1754,7 @@ impl<BC: BtcClient> ForkScanner<BC> {
     // off p2p on this node so the state doesn't change underneath us. Then, if the switch to new
     // chaintip is successful, we check if it would've been a valid tip.
     fn rollback_checks(&self) {
-	    info!("Running rollback checks");
+        info!("Running rollback checks");
         for node in self.clients.iter().filter(|c| c.mirror().is_some()) {
             let mirror = node.mirror().as_ref().unwrap();
             let chaintips = match mirror.get_chain_tips() {

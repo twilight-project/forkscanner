@@ -25,7 +25,12 @@ diesel::table! {
         headers_only -> Bool,
         work -> Varchar,
         txids -> Nullable<Bytea>,
+        txids_added -> Nullable<Bytea>,
+        txids_omitted -> Nullable<Bytea>,
         pool_name -> Nullable<Varchar>,
+        template_txs_fee_diff -> Nullable<Numeric>,
+        tx_omitted_fee_rates -> Nullable<Numeric>,
+        lowest_template_fee_rate -> Nullable<Numeric>,
         total_fee -> Nullable<Numeric>,
         coinbase_message -> Nullable<Varchar>,
     }
@@ -54,6 +59,7 @@ diesel::table! {
         parent_block_hash -> Varchar,
         node_id -> Int8,
         fee_rate -> Int4,
+        omitted -> Bool,
     }
 }
 

@@ -55,6 +55,7 @@ CREATE TABLE fee_rates (
     parent_block_hash varchar not null,
 	node_id bigint not null,
 	fee_rate integer not null,
+	omitted boolean not null,
 	PRIMARY KEY (parent_block_hash, node_id, fee_rate),
 	CONSTRAINT fx_fee_rate_block_template
 		FOREIGN KEY(parent_block_hash, node_id)
@@ -63,7 +64,12 @@ CREATE TABLE fee_rates (
 
 ALTER TABLE blocks
 ADD COLUMN txids bytea,
+ADD COLUMN txids_added bytea,
+ADD COLUMN txids_omitted bytea,
 ADD COLUMN pool_name varchar,
+ADD COLUMN template_txs_fee_diff decimal,
+ADD COLUMN tx_omitted_fee_rates decimal,
+ADD COLUMN lowest_template_fee_rate decimal,
 ADD COLUMN total_fee decimal,
 ADD COLUMN coinbase_message varchar;
 

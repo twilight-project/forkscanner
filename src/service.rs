@@ -7,9 +7,9 @@ use jsonrpc_http_server as hts;
 use jsonrpc_pubsub::{PubSubHandler, Session, Sink, Subscriber, SubscriptionId};
 use jsonrpc_ws_server as wss;
 use log::{debug, error, info};
-use rand::Rng;
 use r2d2::PooledConnection;
 use r2d2_diesel::ConnectionManager;
+use rand::Rng;
 use serde::Deserialize;
 use std::{
     collections::{HashMap, HashSet},
@@ -31,8 +31,8 @@ pub enum WsError {
     R2D2Error(#[from] r2d2::Error),
     #[error("Serde error {0:?}")]
     SerdeError(#[from] serde_json::Error),
-	#[error("Sink error {0:?}")]
-	SinkError(#[from] futures::channel::mpsc::TrySendError<std::string::String>),
+    #[error("Sink error {0:?}")]
+    SinkError(#[from] futures::channel::mpsc::TrySendError<std::string::String>),
 }
 
 #[derive(Debug, Deserialize)]
@@ -167,16 +167,19 @@ fn remove_node(conn: Conn, params: Params) -> Result<Value> {
 fn get_tips(params: Params, tips: Vec<Chaintip>) -> Result<Value> {
     match params.parse::<TipArgs>() {
         Ok(t) => {
-		    let chaintips = if t.active_only {
-			    tips.iter().filter(|t| t.status == "active").cloned().collect::<Vec<Chaintip>>()
-			} else {
-			    tips.to_vec()
-			};
+            let chaintips = if t.active_only {
+                tips.iter()
+                    .filter(|t| t.status == "active")
+                    .cloned()
+                    .collect::<Vec<Chaintip>>()
+            } else {
+                tips.to_vec()
+            };
 
-			match serde_json::to_value(chaintips) {
-				Ok(t) => Ok(t),
-				Err(_) => Err(JsonRpcError::internal_error()),
-			}
+            match serde_json::to_value(chaintips) {
+                Ok(t) => Ok(t),
+                Err(_) => Err(JsonRpcError::internal_error()),
+            }
         }
         Err(args) => {
             let err = JsonRpcError::invalid_params(format!("Invalid parameters, {:?}", args));
@@ -185,56 +188,68 @@ fn get_tips(params: Params, tips: Vec<Chaintip>) -> Result<Value> {
     }
 }
 
-fn handle_subscribe(exit: Arc<AtomicBool>, receiver: Receiver<ScannerMessage>, pool: ManagedPool,  _: Params, sink: Sink) {
+fn handle_subscribe(
+    exit: Arc<AtomicBool>,
+    receiver: Receiver<ScannerMessage>,
+    pool: ManagedPool,
+    _: Params,
+    sink: Sink,
+) {
     info!("New subscription");
-	fn send_update(pool: &ManagedPool, sink: &Sink) -> std::result::Result<(), WsError> {
-		let conn = pool.get()?;
-		let values = Chaintip::list(&conn)?;
-		let tips = serde_json::to_value(values)?;
+    fn send_update(pool: &ManagedPool, sink: &Sink) -> std::result::Result<(), WsError> {
+        let conn = pool.get()?;
+        let values = Chaintip::list(&conn)?;
+        let tips = serde_json::to_value(values)?;
 
-		Ok(sink.notify(Params::Array(vec![tips]))?)
-	}
+        Ok(sink.notify(Params::Array(vec![tips]))?)
+    }
 
     thread::spawn(move || {
-	    if let Err(e) = send_update(&pool, &sink) {
-			error!("Error sending chaintips to initialize client {:?}", e);
-		}
+        if let Err(e) = send_update(&pool, &sink) {
+            error!("Error sending chaintips to initialize client {:?}", e);
+        }
 
         loop {
-		    if exit.load(Ordering::SeqCst) {
-			    break;
-			}
+            if exit.load(Ordering::SeqCst) {
+                break;
+            }
 
             match receiver.recv_timeout(time::Duration::from_millis(5000)) {
-			    Ok(ScannerMessage::NewChaintip) => {
-					if let Err(e) = send_update(&pool, &sink) {
-					    error!("Error sending chaintips to client {:?}", e);
-					}
-				}
-				Ok(_) => {}
-				Err(RecvTimeoutError::Timeout) => {
-				    info!("No chaintip updates");
-				}
-				Err(e) => {
-				    error!("Error! {:?}", e);
-				}
-			}
+                Ok(ScannerMessage::NewChaintip) => {
+                    if let Err(e) = send_update(&pool, &sink) {
+                        error!("Error sending chaintips to client {:?}", e);
+                    }
+                }
+                Ok(_) => {}
+                Err(RecvTimeoutError::Timeout) => {
+                    info!("No chaintip updates");
+                }
+                Err(e) => {
+                    error!("Error! {:?}", e);
+                }
+            }
         }
     });
 }
 
 fn session_meta(context: &wss::RequestContext) -> Option<Arc<Session>> {
     debug!("Request context {:#?}", context);
-	Some(Arc::new(Session::new(context.sender())))
+    Some(Arc::new(Session::new(context.sender())))
 }
 
 /// RPC service endpoints for users of forkscanner.
-pub fn run_server(listen: String, rpc: u16, subs: u16, db_url: String, receiver: Receiver<ScannerMessage>) {
-	let manager = ConnectionManager::<PgConnection>::new(db_url);
-	let tips = Arc::new(RwLock::new(vec![]));
-	let pool = r2d2::Pool::builder()
-		.build(manager)
-		.expect("Connection pool");
+pub fn run_server(
+    listen: String,
+    rpc: u16,
+    subs: u16,
+    db_url: String,
+    receiver: Receiver<ScannerMessage>,
+) {
+    let manager = ConnectionManager::<PgConnection>::new(db_url);
+    let tips = Arc::new(RwLock::new(vec![]));
+    let pool = r2d2::Pool::builder()
+        .build(manager)
+        .expect("Connection pool");
     let pool2 = pool.clone();
 
     let tips1 = tips.clone();
@@ -276,33 +291,36 @@ pub fn run_server(listen: String, rpc: u16, subs: u16, db_url: String, receiver:
         server.wait();
     });
 
-    let subscriptions = Arc::new(Mutex::new(HashMap::<&str, Vec<Sender<ScannerMessage>>>::default()));
-	let subscriptions2 = subscriptions.clone();
-	let t2 = thread::spawn(move || {
-	    loop {
-		    match receiver.recv() {
-			    Ok(ScannerMessage::NewChaintip) => {
-				    debug!("New chaintip updates");
-				    if let Some(subs) = subscriptions2.lock().expect("Lock poisoned").get("forks") {
-					    for sub in subs {
-						    sub.send(ScannerMessage::NewChaintip).expect("Channel broke");
-						}
-					}
-				}
-				Ok(ScannerMessage::AllChaintips(mut t)) => {
-				    debug!("New chaintips {:?}", t);
-				    std::mem::swap(&mut t, &mut tips.write().expect("Lock poisoned"));
-				}
-				Err(e) => {
-				    error!("Channel broke {:?}", e);
-				    break;
-				}
-			}
-		}
-	});
+    let subscriptions = Arc::new(Mutex::new(
+        HashMap::<&str, Vec<Sender<ScannerMessage>>>::default(),
+    ));
+    let subscriptions2 = subscriptions.clone();
+    let t2 = thread::spawn(move || loop {
+        match receiver.recv() {
+            Ok(ScannerMessage::NewChaintip) => {
+                debug!("New chaintip updates");
+                if let Some(subs) = subscriptions2.lock().expect("Lock poisoned").get("forks") {
+                    for sub in subs {
+                        sub.send(ScannerMessage::NewChaintip)
+                            .expect("Channel broke");
+                    }
+                }
+            }
+            Ok(ScannerMessage::AllChaintips(mut t)) => {
+                debug!("New chaintips {:?}", t);
+                std::mem::swap(&mut t, &mut tips.write().expect("Lock poisoned"));
+            }
+            Err(e) => {
+                error!("Channel broke {:?}", e);
+                break;
+            }
+        }
+    });
 
     let t3 = thread::spawn(move || {
-        let killers = Arc::new(Mutex::new(HashMap::<SubscriptionId, Arc<AtomicBool>>::default()));
+        let killers = Arc::new(Mutex::new(
+            HashMap::<SubscriptionId, Arc<AtomicBool>>::default(),
+        ));
 
         let mut io = PubSubHandler::new(MetaIoHandler::default());
         io.add_sync_method("ping", |_: Params| Ok(Value::String("pong".into())));
@@ -314,7 +332,7 @@ pub fn run_server(listen: String, rpc: u16, subs: u16, db_url: String, receiver:
                 "subscribe_forks",
                 move |params: Params, _, subscriber: Subscriber| {
                     info!("Subscribe to forks");
-					let mut rng = rand::rngs::OsRng::default();
+                    let mut rng = rand::rngs::OsRng::default();
                     if params != Params::None {
                         subscriber
                             .reject(Error {
@@ -327,29 +345,31 @@ pub fn run_server(listen: String, rpc: u16, subs: u16, db_url: String, receiver:
                     }
 
                     let kill_switch = Arc::new(AtomicBool::new(false));
-					let sub_id = SubscriptionId::Number(rng.gen());
-					let sink = subscriber.assign_id(sub_id.clone()).unwrap();
-					killers.lock().expect("Lock poisoned").insert(sub_id, kill_switch.clone());
-					let (notify_tx, notify_rx) = unbounded();
-					{
-						let mut sub_lock = subscriptions.lock().expect("Lock poisoned");
-						sub_lock.entry("forks").or_insert(vec![]).push(notify_tx);
-					}
+                    let sub_id = SubscriptionId::Number(rng.gen());
+                    let sink = subscriber.assign_id(sub_id.clone()).unwrap();
+                    killers
+                        .lock()
+                        .expect("Lock poisoned")
+                        .insert(sub_id, kill_switch.clone());
+                    let (notify_tx, notify_rx) = unbounded();
+                    {
+                        let mut sub_lock = subscriptions.lock().expect("Lock poisoned");
+                        sub_lock.entry("forks").or_insert(vec![]).push(notify_tx);
+                    }
 
                     handle_subscribe(kill_switch, notify_rx, pool2.clone(), params, sink)
                 },
             ),
             ("unsubscribe_forks", move |id: SubscriptionId, _| {
-			    if let Some(arc) = killer_clone.lock().expect("Lock poisoned").remove(&id) {
-				    arc.store(true, Ordering::SeqCst);
-				}
-				Box::pin(futures::future::ok(Value::Bool(true)))
+                if let Some(arc) = killer_clone.lock().expect("Lock poisoned").remove(&id) {
+                    arc.store(true, Ordering::SeqCst);
+                }
+                Box::pin(futures::future::ok(Value::Bool(true)))
             }),
         );
 
         info!("Coming up on {} {}", listen, subs);
-        let server =
-            wss::ServerBuilder::with_meta_extractor(io, session_meta)
+        let server = wss::ServerBuilder::with_meta_extractor(io, session_meta)
             .start(&SocketAddr::from((listen.parse::<IpAddr>().unwrap(), subs)))
             .expect("Failed to start sub server");
 

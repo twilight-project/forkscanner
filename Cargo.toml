@@ -8,6 +8,7 @@ edition = "2018"
 [dependencies]
 bigdecimal = "0.1.2"
 bitcoin = "0.27"
+bitcoin_hashes = "0.10"
 bitcoincore-rpc = "0.14"
 chrono = "0.4"
 crossbeam = "0.8"

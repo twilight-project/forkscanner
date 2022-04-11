@@ -7,6 +7,6 @@ mod schema;
 mod service;
 
 pub use models::*;
-pub use scanner::{ForkScanner, ScannerMessage};
 pub(crate) use scanner::MinerPoolInfo;
+pub use scanner::{ForkScanner, ScannerMessage};
 pub use service::run_server;
