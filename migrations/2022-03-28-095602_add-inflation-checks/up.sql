@@ -60,6 +60,23 @@ CREATE TABLE fee_rates (
 	CONSTRAINT fx_fee_rate_block_template
 		FOREIGN KEY(parent_block_hash, node_id)
 		    REFERENCES block_templates(parent_block_hash, node_id)
+			ON DELETE CASCADE
+);
+
+CREATE TABLE softforks (
+	node_id bigint not null,
+	fork_type integer not null,
+	name varchar not null,
+	bit integer,
+	status integer not null,
+	since bigint,
+	notified_at timestamp with time zone not null,
+	created_at timestamp with time zone not null,
+	updated_at timestamp with time zone not null,
+	PRIMARY KEY (node_id, fork_type, name),
+	CONSTRAINT fk_softfork_node_id
+	    FOREIGN KEY(node_id)
+		REFERENCES nodes(id)
 );
 
 ALTER TABLE blocks
@@ -71,7 +88,7 @@ ADD COLUMN template_txs_fee_diff decimal,
 ADD COLUMN tx_omitted_fee_rates decimal,
 ADD COLUMN lowest_template_fee_rate decimal,
 ADD COLUMN total_fee decimal,
-ADD COLUMN coinbase_message varchar;
+ADD COLUMN coinbase_message bytea;
 
 ALTER TABLE nodes
 ADD COLUMN last_polled timestamp with time zone;

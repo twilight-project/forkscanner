@@ -1,14 +1,15 @@
 use bigdecimal::BigDecimal;
-use bitcoincore_rpc::bitcoincore_rpc_json::GetBlockHeaderResult;
+use bitcoincore_rpc::bitcoincore_rpc_json::{GetBlockHeaderResult, Softfork};
 use chrono::prelude::*;
 use diesel::prelude::*;
 use diesel::result::QueryResult;
 use serde::{Deserialize, Serialize, Serializer};
+use std::collections::HashMap;
 
 use crate::schema::{
     block_templates, blocks, chaintips, double_spent_by, fee_rates, inflated_blocks,
     invalid_blocks, nodes, peers, pool, rbf_by, stale_candidate, stale_candidate_children,
-    transaction, tx_outsets, valid_blocks,
+    softforks, transaction, tx_outsets, valid_blocks,
 };
 use crate::MinerPoolInfo;
 
@@ -191,7 +192,7 @@ pub struct Height {
     pub height: i64,
 }
 
-#[derive(AsChangeset, QueryableByName, Queryable, Insertable)]
+#[derive(Debug, AsChangeset, QueryableByName, Queryable, Insertable)]
 #[table_name = "pool"]
 pub struct Pool {
     pub tag: String,
@@ -228,16 +229,10 @@ impl Pool {
             .execute(conn)
     }
 
-    pub fn get(conn: &PgConnection, pool_tag: String) -> QueryResult<Option<Pool>> {
+	pub fn list(conn: &PgConnection) -> QueryResult<Vec<Pool>> {
         use crate::schema::pool::dsl::*;
-        let result = pool.filter(tag.eq(pool_tag)).get_result(conn);
-
-        match result {
-            Err(diesel::result::Error::NotFound) => Ok(None),
-            Ok(ans) => Ok(Some(ans)),
-            Err(e) => Err(e),
-        }
-    }
+		pool.load(conn)
+	}
 }
 
 #[derive(AsChangeset, QueryableByName, Queryable, Insertable)]
@@ -352,10 +347,6 @@ impl BlockTemplate {
             })
             .collect();
 
-        diesel::insert_into(frd::fee_rates)
-            .values(fee_rates)
-            .on_conflict_do_nothing()
-            .execute(conn)?;
 
         let tpl = BlockTemplate {
             parent_block_hash: parent,
@@ -372,6 +363,11 @@ impl BlockTemplate {
 
         diesel::insert_into(btd::block_templates)
             .values(tpl)
+            .on_conflict_do_nothing()
+            .execute(conn)?;
+
+        diesel::insert_into(frd::fee_rates)
+            .values(fee_rates)
             .on_conflict_do_nothing()
             .execute(conn)
     }
@@ -463,6 +459,53 @@ impl TxOutset {
     }
 }
 
+#[derive(Clone, AsChangeset, QueryableByName, Queryable, Insertable)]
+#[table_name = "softforks"]
+pub struct SoftForks {
+	pub node_id: i64,
+	pub fork_type: i32,
+	pub name: String,
+	pub bit: Option<i32>,
+	pub status: i32,
+	pub since: Option<i64>,
+    pub notified_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl SoftForks {
+    pub fn update_or_insert(conn: &PgConnection, node: i64, forks: HashMap<String, Softfork>) -> QueryResult<()> {
+	    use crate::schema::softforks::dsl::*;
+
+		for (key, info) in forks.into_iter() {
+		    let b = if let Some(b9) = info.bip9 {
+			    b9.bit.map(|b| b as i32)
+			} else {
+			    None
+			};
+
+			let sf = SoftForks {
+				node_id: node,
+				fork_type: info.type_ as i32,
+				name: key,
+				bit: b,
+				status: info.active as i32,
+				since: info.height.map(|k| k as i64),
+				notified_at: Utc::now(),
+				updated_at: Utc::now(),
+				created_at: Utc::now(),
+			};
+			diesel::insert_into(softforks)
+				.values(&sf)
+				.on_conflict((node_id, fork_type, name))
+				.do_update()
+				.set(&sf)
+				.execute(conn)?;
+		}
+		Ok(())
+	}
+}
+
 #[derive(Clone, Serialize, AsChangeset, QueryableByName, Queryable, Insertable)]
 #[table_name = "blocks"]
 pub struct Block {
@@ -485,7 +528,7 @@ pub struct Block {
     pub lowest_template_fee_rate: Option<BigDecimal>,
     #[serde(serialize_with = "serde_bigdecimal")]
     pub total_fee: Option<BigDecimal>,
-    pub coinbase_message: Option<String>,
+    pub coinbase_message: Option<Vec<u8>>,
 }
 
 impl Block {

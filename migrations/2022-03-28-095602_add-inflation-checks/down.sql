@@ -4,6 +4,7 @@ DROP TABLE tx_outsets;
 DROP TABLE pool;
 DROP TABLE fee_rates;
 DROP TABLE block_templates;
+DROP TABLE softforks;
 
 ALTER TABLE nodes
 DROP COLUMN last_polled,

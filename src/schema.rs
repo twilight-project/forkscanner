@@ -32,7 +32,7 @@ diesel::table! {
         tx_omitted_fee_rates -> Nullable<Numeric>,
         lowest_template_fee_rate -> Nullable<Numeric>,
         total_fee -> Nullable<Numeric>,
-        coinbase_message -> Nullable<Varchar>,
+        coinbase_message -> Nullable<Bytea>,
     }
 }
 
@@ -126,6 +126,20 @@ diesel::table! {
 }
 
 diesel::table! {
+    softforks (node_id, fork_type, name) {
+        node_id -> Int8,
+        fork_type -> Int4,
+        name -> Varchar,
+        bit -> Nullable<Int4>,
+        status -> Int4,
+        since -> Nullable<Int8>,
+        notified_at -> Timestamptz,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
     stale_candidate (height) {
         height -> Int8,
         n_children -> Int4,
@@ -176,6 +190,7 @@ diesel::table! {
 
 diesel::joinable!(inflated_blocks -> blocks (block_hash));
 diesel::joinable!(peers -> nodes (node_id));
+diesel::joinable!(softforks -> nodes (node_id));
 diesel::joinable!(stale_candidate_children -> stale_candidate (candidate_height));
 diesel::joinable!(transaction -> blocks (block_id));
 diesel::joinable!(tx_outsets -> blocks (block_hash));
@@ -192,6 +207,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     peers,
     pool,
     rbf_by,
+    softforks,
     stale_candidate,
     stale_candidate_children,
     transaction,

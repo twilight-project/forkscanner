@@ -1,15 +1,15 @@
 use crate::{
     Block, BlockTemplate, Chaintip, FeeRate, InflatedBlock, Node, Pool, StaleCandidate,
-    StaleCandidateChildren, Transaction, TxOutset,
+    StaleCandidateChildren, SoftForks, Transaction, TxOutset,
 };
 use bigdecimal::{BigDecimal, FromPrimitive};
-use bitcoin::consensus::encode::serialize_hex;
+use bitcoin::{consensus::encode::serialize_hex, util::amount::Amount};
 use bitcoin_hashes::{Hash, sha256d};
 use bitcoincore_rpc::bitcoin as btc;
 use bitcoincore_rpc::bitcoincore_rpc_json::{
     GetBlockHeaderResult, GetBlockResult, GetBlockTemplateCapabilities, GetBlockTemplateModes,
     GetBlockTemplateResult, GetBlockTemplateRules, GetBlockchainInfoResult,
-    GetChainTipsResultStatus, GetChainTipsResultTip, GetPeerInfoResult, GetRawTransactionResult,
+    GetChainTipsResultStatus, GetChainTipsResultTip, GetPeerInfoResultConnectionType, GetPeerInfoResultNetwork, GetRawTransactionResult,
     GetTxOutSetInfoResult,
 };
 use bitcoincore_rpc::Error as BitcoinRpcError;
@@ -35,6 +35,7 @@ use thiserror::Error;
 const MAX_ANCESTRY_DEPTH: usize = 100;
 const MAX_BLOCK_DEPTH: i64 = 10;
 const BLOCK_NOT_FOUND: i32 = -5;
+const BLOCK_NOT_ON_DISK: i32 = -1;
 const STALE_WINDOW: i64 = 100;
 const DOUBLE_SPEND_RANGE: i64 = 30;
 const REACHABLE_CHECK_INTERVAL: i64 = 10;
@@ -138,6 +139,45 @@ pub struct ScriptPubKey {
     addresses: Option<Vec<String>>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(unused)]
+pub struct PeerInfo {
+    pub id: u64,
+    pub addr: String,
+    pub addrbind: String,
+    pub addrlocal: Option<String>,
+    pub network: Option<GetPeerInfoResultNetwork>,
+    pub services: String,
+    pub relaytxes: bool,
+    pub lastsend: u64,
+    pub lastrecv: u64,
+    pub last_transaction: Option<u64>,
+    pub last_block: Option<u64>,
+    pub bytessent: u64,
+    pub bytesrecv: u64,
+    pub conntime: u64,
+    pub timeoffset: i64,
+    pub pingtime: Option<f64>,
+    pub minping: Option<f64>,
+    pub pingwait: Option<f64>,
+    pub version: u64,
+    pub subver: String,
+    pub inbound: bool,
+    pub addnode: Option<bool>,
+    pub startingheight: Option<i64>,
+    pub banscore: Option<i64>,
+    pub synced_headers: Option<i64>,
+    pub synced_blocks: Option<i64>,
+    pub inflight: Option<Vec<u64>>,
+    pub whitelisted: Option<bool>,
+	#[serde(rename = "minfeefilter", default, with = "bitcoin::util::amount::serde::as_btc::opt")]
+    pub min_fee_filter: Option<Amount>,
+    pub bytessent_per_msg: Option<HashMap<String, u64>>,
+    pub bytesrecv_per_msg: Option<HashMap<String, u64>>,
+    pub connection_type: Option<GetPeerInfoResultConnectionType>,
+}
+
 #[cfg_attr(test, automock)]
 pub trait BtcClient: Sized {
     fn new(host: &String, auth: Auth) -> ForkScannerResult<Self>;
@@ -169,7 +209,7 @@ pub trait BtcClient: Sized {
         hash: &btc::BlockHash,
     ) -> Result<GetBlockHeaderResult, bitcoincore_rpc::Error>;
     fn get_block_hex(&self, hash: &btc::BlockHash) -> Result<String, bitcoincore_rpc::Error>;
-    fn get_peer_info(&self) -> Result<Vec<GetPeerInfoResult>, bitcoincore_rpc::Error>;
+    fn get_peer_info(&self) -> Result<Vec<PeerInfo>, bitcoincore_rpc::Error>;
     fn get_raw_transaction_info<'a>(
         &self,
         txid: &btc::Txid,
@@ -268,8 +308,8 @@ impl BtcClient for Client {
         RpcApi::get_block_hex(self, hash)
     }
 
-    fn get_peer_info(&self) -> Result<Vec<GetPeerInfoResult>, bitcoincore_rpc::Error> {
-        RpcApi::get_peer_info(self)
+    fn get_peer_info(&self) -> Result<Vec<PeerInfo>, bitcoincore_rpc::Error> {
+        RpcApi::call(self, "getpeerinfo", &[])
     }
 
     fn get_raw_transaction_info(
@@ -381,10 +421,19 @@ fn create_block_and_ancestors<BC: BtcClient>(
 
             for vin in coinbase_info.vin.into_iter() {
                 if let Some(cb) = vin.coinbase {
+                    coinbase_message = Some(cb.clone());
                     let pool_tag = String::from_utf8_lossy(&cb).to_string();
-                    coinbase_message = Some(pool_tag.clone());
-                    pool = Pool::get(&conn, pool_tag)?;
-                    break;
+
+                    for p in Pool::list(&conn)? {
+					    if let Some(_) = pool_tag.find(&p.tag) {
+						    pool = Some(p);
+							break;
+						}
+					}
+
+					if pool.is_some() {
+					    break;
+					}
                 }
             }
 
@@ -658,7 +707,19 @@ impl<BC: BtcClient> ForkScanner<BC> {
 
             match tip.status {
                 GetChainTipsResultStatus::HeadersOnly => {
-                    create_block_and_ancestors(client, &self.db_conn, true, &hash, node.id)?;
+                    match create_block_and_ancestors(client, &self.db_conn, true, &hash, node.id) {
+					    Err(ForkScannerError::RpcClientError(e)) => {
+							if let BitcoinRpcError::JsonRpc(JsonRpcError::Rpc(RpcError { code, .. })) = e {
+							    if code != BLOCK_NOT_ON_DISK {
+									return Err(ForkScannerError::RpcClientError(e));
+								}
+							} else {
+							    return Err(ForkScannerError::RpcClientError(e));
+							}
+						}
+						Err(e) => return Err(e),
+						_ => {}
+					}
                 }
                 GetChainTipsResultStatus::ValidHeaders => {
                     create_block_and_ancestors(client, &self.db_conn, true, &hash, node.id)?;
@@ -875,6 +936,16 @@ impl<BC: BtcClient> ForkScanner<BC> {
 
         let mut changed = false;
         for (client, node) in self.clients.iter().zip(&self.node_list) {
+			if let Ok(info) = client.client().get_blockchain_info() {
+			    if let Err(e) = SoftForks::update_or_insert(&self.db_conn, client.node_id, info.softforks) {
+				    error!("Softfork update failed: {:?}", e);
+				}
+			} else {
+			    error!("Failed to fetch blockchain info!");
+			}
+
+            self.fetch_block_templates(client.client(), node);
+
             changed |= match self.process_client(client.client(), node) {
                 Ok(changed) => changed,
                 Err(e) => {
@@ -882,8 +953,6 @@ impl<BC: BtcClient> ForkScanner<BC> {
                     continue;
                 }
             };
-
-            self.fetch_block_templates(client.client(), node);
         }
 
         if changed {
