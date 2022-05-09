@@ -958,9 +958,15 @@ pub struct StaleCandidate {
     pub double_spent_in_one_branch_total: f64,
     pub rbf_total: f64,
     pub height_processed: Option<i64>,
+	pub created_at: DateTime<Utc>,
 }
 
 impl StaleCandidate {
+    pub fn list_ge(conn: &PgConnection, block_height: i64) -> QueryResult<Vec<StaleCandidate>> {
+        use crate::schema::stale_candidate::dsl::*;
+        stale_candidate.filter(height.ge(block_height)).load(conn)
+	}
+
     pub fn get(conn: &PgConnection, candidate: i64) -> QueryResult<StaleCandidate> {
         use crate::schema::stale_candidate::dsl::*;
         stale_candidate.find(candidate).first(conn)
@@ -1033,6 +1039,7 @@ impl StaleCandidate {
             double_spent_in_one_branch_total: 0.,
             rbf_total: 0.,
             height_processed: None,
+			created_at: Utc::now(),
         };
 
         diesel::insert_into(stale_candidate)

@@ -20,3 +20,6 @@ DROP COLUMN txids_omitted,
 DROP COLUMN tx_omitted_fee_rates,
 DROP COLUMN lowest_template_fee_rate,
 DROP COLUMN coinbase_message;
+
+ALTER TABLE stale_candidate
+DROP COLUMN created_at;

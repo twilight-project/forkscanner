@@ -147,6 +147,7 @@ diesel::table! {
         double_spent_in_one_branch_total -> Float8,
         rbf_total -> Float8,
         height_processed -> Nullable<Int8>,
+        created_at -> Timestamptz,
     }
 }
 

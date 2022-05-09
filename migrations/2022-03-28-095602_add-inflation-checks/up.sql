@@ -95,3 +95,6 @@ ADD COLUMN last_polled timestamp with time zone;
 
 ALTER TABLE nodes
 ADD COLUMN initial_block_download boolean not null default true;
+
+ALTER TABLE stale_candidate
+ADD COLUMN created_at timestamp with time zone not null;

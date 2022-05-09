@@ -1,4 +1,5 @@
-use crate::{Block, Chaintip, Node, ScannerMessage, Transaction};
+use chrono::prelude::*;
+use crate::{Block, Chaintip, Node, ScannerMessage, StaleCandidate, Transaction};
 use crossbeam::channel::{unbounded, Receiver, RecvTimeoutError, Sender};
 use diesel::prelude::PgConnection;
 use jsonrpc_core::types::error::Error as JsonRpcError;
@@ -10,7 +11,7 @@ use log::{debug, error, info};
 use r2d2::PooledConnection;
 use r2d2_diesel::ConnectionManager;
 use rand::Rng;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     net::{IpAddr, SocketAddr},
@@ -65,6 +66,44 @@ struct NodeArgs {
 enum BlockQuery {
     Height(i64),
     Hash(String),
+}
+
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+struct ValidationCheck {
+    tip: String,
+	tip_height: i64,
+	stale_height: i64,
+	stale_timestamp: DateTime<Utc>,
+}
+
+
+fn validation_checks(conn: Conn, _: Params) -> Result<Value> {
+	let tips = Chaintip::list_active(&conn);
+
+	if tips.is_err() {
+		return Err(JsonRpcError::internal_error());
+	}
+
+	let tips = tips.unwrap();
+
+	let checks: Vec<ValidationCheck> = tips.into_iter().flat_map(|tip| {
+	    let candidates = StaleCandidate::list_ge(&conn, tip.height).unwrap_or_default();
+		candidates.into_iter().map(|candidate| {
+		    ValidationCheck {
+			    tip: tip.block.clone(),
+				tip_height: tip.height,
+				stale_height: candidate.height,
+				stale_timestamp: candidate.created_at,
+			}
+		}).collect::<Vec<ValidationCheck>>()
+	}).collect();
+
+	match serde_json::to_value(checks) {
+		Ok(t) => Ok(t),
+		Err(_) => Err(JsonRpcError::internal_error()),
+	}
 }
 
 fn tx_is_active(conn: Conn, params: Params) -> Result<Value> {
@@ -283,6 +322,12 @@ pub fn run_server(
             let conn = p.get().unwrap();
             tx_is_active(conn, params)
         });
+
+        let p = pool.clone();
+        io.add_sync_method("validation_checks", move |params: Params| {
+            let conn = p.get().unwrap();
+            validation_checks(conn, params)
+		});
 
         let server = hts::ServerBuilder::new(io)
             .start_http(&SocketAddr::from((l1.parse::<IpAddr>().unwrap(), rpc)))

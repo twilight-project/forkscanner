@@ -10,7 +10,7 @@ bigdecimal = "0.1.2"
 bitcoin = "0.27"
 bitcoin_hashes = "0.10"
 bitcoincore-rpc = "0.14"
-chrono = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
 crossbeam = "0.8"
 diesel = { version = "1.4", features = ["chrono", "numeric", "postgres"] }
 dotenv = "0.15"
