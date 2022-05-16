@@ -60,6 +60,7 @@ pub struct MinerPoolInfo {
 pub enum ScannerMessage {
     NewChaintip,
     AllChaintips(Vec<Chaintip>),
+	StaleCandidateUpdate,
 }
 
 #[derive(Deserialize)]
@@ -1073,7 +1074,9 @@ impl<BC: BtcClient> ForkScanner<BC> {
         self.find_stale_candidates();
 
         // for 3 most recent stale candidates...
-        self.process_stale_candidates()
+        self.process_stale_candidates();
+		self.notify_tx.send(ScannerMessage::StaleCandidateUpdate)
+			.expect("Channel closed");
     }
 
     fn inflation_checks(&self) {

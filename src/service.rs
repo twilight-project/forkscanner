@@ -21,6 +21,8 @@ use std::{
 };
 use thiserror::Error;
 
+const BLOCK_WINDOW: i64 = 10;
+
 type Conn = PooledConnection<ConnectionManager<diesel::PgConnection>>;
 type ManagedPool = r2d2::Pool<ConnectionManager<PgConnection>>;
 
@@ -75,11 +77,18 @@ struct ValidationCheck {
     tip: String,
 	tip_height: i64,
 	stale_height: i64,
+	height_difference: i64,
 	stale_timestamp: DateTime<Utc>,
 }
 
 
-fn validation_checks(conn: Conn, _: Params) -> Result<Value> {
+#[derive(Debug, Deserialize, Serialize)]
+struct BlockArg {
+    max_height: i64,
+}
+
+
+fn validation_checks(conn: Conn, window: i64) -> Result<Value> {
 	let tips = Chaintip::list_active(&conn);
 
 	if tips.is_err() {
@@ -89,11 +98,12 @@ fn validation_checks(conn: Conn, _: Params) -> Result<Value> {
 	let tips = tips.unwrap();
 
 	let checks: Vec<ValidationCheck> = tips.into_iter().flat_map(|tip| {
-	    let candidates = StaleCandidate::list_ge(&conn, tip.height).unwrap_or_default();
+	    let candidates = StaleCandidate::list_ge(&conn, tip.height - window).unwrap_or_default();
 		candidates.into_iter().map(|candidate| {
 		    ValidationCheck {
 			    tip: tip.block.clone(),
 				tip_height: tip.height,
+				height_difference: tip.height - candidate.height,
 				stale_height: candidate.height,
 				stale_timestamp: candidate.created_at,
 			}
@@ -227,6 +237,51 @@ fn get_tips(params: Params, tips: Vec<Chaintip>) -> Result<Value> {
     }
 }
 
+fn handle_validation_subscribe(
+    exit: Arc<AtomicBool>,
+    receiver: Receiver<ScannerMessage>,
+    pool: ManagedPool,
+    window: i64,
+    sink: Sink,
+) {
+    info!("New subscription");
+    let send_update = move |pool: &ManagedPool, sink: &Sink| -> std::result::Result<(), WsError> {
+        let conn = pool.get()?;
+	    match validation_checks(conn, window) {
+		    Ok(resp) => Ok(sink.notify(Params::Array(vec![resp]))?),
+			Err(_) => Ok(sink.notify(Params::Array(vec!["Failed to update validation checks".into()]))?),
+		}
+
+    };
+
+    thread::spawn(move || {
+        if let Err(e) = send_update(&pool, &sink) {
+            error!("Error sending validation checks to initialize client {:?}", e);
+        }
+
+        loop {
+            if exit.load(Ordering::SeqCst) {
+                break;
+            }
+
+            match receiver.recv_timeout(time::Duration::from_millis(5000)) {
+                Ok(ScannerMessage::NewChaintip) => {
+                    if let Err(e) = send_update(&pool, &sink) {
+                        error!("Error sending chaintips to client {:?}", e);
+                    }
+                }
+                Ok(_) => {}
+                Err(RecvTimeoutError::Timeout) => {
+                    info!("No chaintip updates");
+                }
+                Err(e) => {
+                    error!("Error! {:?}", e);
+                }
+            }
+        }
+    });
+}
+
 fn handle_subscribe(
     exit: Arc<AtomicBool>,
     receiver: Receiver<ScannerMessage>,
@@ -323,12 +378,6 @@ pub fn run_server(
             tx_is_active(conn, params)
         });
 
-        let p = pool.clone();
-        io.add_sync_method("validation_checks", move |params: Params| {
-            let conn = p.get().unwrap();
-            validation_checks(conn, params)
-		});
-
         let server = hts::ServerBuilder::new(io)
             .start_http(&SocketAddr::from((l1.parse::<IpAddr>().unwrap(), rpc)))
             .expect("Failed to start RPC server");
@@ -351,6 +400,15 @@ pub fn run_server(
                     }
                 }
             }
+			Ok(ScannerMessage::StaleCandidateUpdate) => {
+                debug!("New stale candidate updates");
+                if let Some(subs) = subscriptions2.lock().expect("Lock poisoned").get("validation_checks") {
+                    for sub in subs {
+                        sub.send(ScannerMessage::StaleCandidateUpdate)
+                            .expect("Channel broke");
+                    }
+                }
+			}
             Ok(ScannerMessage::AllChaintips(mut t)) => {
                 debug!("New chaintips {:?}", t);
                 std::mem::swap(&mut t, &mut tips.write().expect("Lock poisoned"));
@@ -370,7 +428,11 @@ pub fn run_server(
         let mut io = PubSubHandler::new(MetaIoHandler::default());
         io.add_sync_method("ping", |_: Params| Ok(Value::String("pong".into())));
 
-        let killer_clone = killers.clone();
+        let killer_clone1 = killers.clone();
+        let killer_clone2 = killers.clone();
+        let killer_clone3 = killers.clone();
+		let pool3 = pool2.clone();
+		let subscriptions2 = subscriptions.clone();
         io.add_subscription(
             "forks",
             (
@@ -392,7 +454,7 @@ pub fn run_server(
                     let kill_switch = Arc::new(AtomicBool::new(false));
                     let sub_id = SubscriptionId::Number(rng.gen());
                     let sink = subscriber.assign_id(sub_id.clone()).unwrap();
-                    killers
+                    killer_clone1
                         .lock()
                         .expect("Lock poisoned")
                         .insert(sub_id, kill_switch.clone());
@@ -406,13 +468,62 @@ pub fn run_server(
                 },
             ),
             ("unsubscribe_forks", move |id: SubscriptionId, _| {
-                if let Some(arc) = killer_clone.lock().expect("Lock poisoned").remove(&id) {
+                if let Some(arc) = killer_clone2.lock().expect("Lock poisoned").remove(&id) {
                     arc.store(true, Ordering::SeqCst);
                 }
                 Box::pin(futures::future::ok(Value::Bool(true)))
             }),
         );
 
+        io.add_subscription(
+            "validation_checks",
+            (
+                "validation_checks",
+                move |params: Params, _, subscriber: Subscriber| {
+                    info!("Subscribe to validations checks");
+                    let mut rng = rand::rngs::OsRng::default();
+
+					let block_window = if let Params::None = params {
+					    BLOCK_WINDOW
+					} else {
+					    let BlockArg { max_height } = if let Ok(parm) = params.parse() {
+						    parm
+						} else {
+							subscriber
+								.reject(Error {
+									code: ErrorCode::ParseError,
+									message: "Invalid parameters. Expected None, or max_height: i64".into(),
+									data: None,
+								})
+								.unwrap();
+							return;
+						};
+						max_height
+					};
+
+                    let kill_switch = Arc::new(AtomicBool::new(false));
+                    let sub_id = SubscriptionId::Number(rng.gen());
+                    let sink = subscriber.assign_id(sub_id.clone()).unwrap();
+                    killers
+                        .lock()
+                        .expect("Lock poisoned")
+                        .insert(sub_id, kill_switch.clone());
+                    let (notify_tx, notify_rx) = unbounded();
+                    {
+                        let mut sub_lock = subscriptions2.lock().expect("Lock poisoned");
+                        sub_lock.entry("validation_checks").or_insert(vec![]).push(notify_tx);
+                    }
+
+                    handle_validation_subscribe(kill_switch, notify_rx, pool3.clone(), block_window, sink)
+                },
+            ),
+            ("unsubscribe_validation_checks", move |id: SubscriptionId, _| {
+                if let Some(arc) = killer_clone3.lock().expect("Lock poisoned").remove(&id) {
+                    arc.store(true, Ordering::SeqCst);
+                }
+                Box::pin(futures::future::ok(Value::Bool(true)))
+            }),
+        );
         info!("Coming up on {} {}", listen, subs);
         let server = wss::ServerBuilder::with_meta_extractor(io, session_meta)
             .start(&SocketAddr::from((listen.parse::<IpAddr>().unwrap(), subs)))
