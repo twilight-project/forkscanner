@@ -110,6 +110,7 @@ fn validation_checks(conn: Conn, window: i64) -> Result<Value> {
 		}).collect::<Vec<ValidationCheck>>()
 	}).collect();
 
+    debug!("{} stale candidates in window {}", checks.len(), window);
 	match serde_json::to_value(checks) {
 		Ok(t) => Ok(t),
 		Err(_) => Err(JsonRpcError::internal_error()),
@@ -265,7 +266,7 @@ fn handle_validation_subscribe(
             }
 
             match receiver.recv_timeout(time::Duration::from_millis(5000)) {
-                Ok(ScannerMessage::NewChaintip) => {
+                Ok(ScannerMessage::StaleCandidateUpdate) => {
                     if let Err(e) = send_update(&pool, &sink) {
                         error!("Error sending chaintips to client {:?}", e);
                     }
@@ -403,6 +404,7 @@ pub fn run_server(
 			Ok(ScannerMessage::StaleCandidateUpdate) => {
                 debug!("New stale candidate updates");
                 if let Some(subs) = subscriptions2.lock().expect("Lock poisoned").get("validation_checks") {
+					debug!("New stale candidates: updating {} subscriptions", subs.len());
                     for sub in subs {
                         sub.send(ScannerMessage::StaleCandidateUpdate)
                             .expect("Channel broke");
@@ -480,7 +482,7 @@ pub fn run_server(
             (
                 "validation_checks",
                 move |params: Params, _, subscriber: Subscriber| {
-                    info!("Subscribe to validations checks");
+                    info!("Subscribe to validation checks");
                     let mut rng = rand::rngs::OsRng::default();
 
 					let block_window = if let Params::None = params {
