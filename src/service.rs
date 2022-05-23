@@ -1,3 +1,4 @@
+use bitcoincore_rpc::{Auth, Client, RpcApi};
 use crate::{Block, Chaintip, Node, ScannerCommand, ScannerMessage, StaleCandidate, Transaction};
 use chrono::prelude::*;
 use crossbeam::channel::{unbounded, Receiver, RecvTimeoutError, Sender};
@@ -41,6 +42,13 @@ pub enum WsError {
 #[derive(Debug, Deserialize)]
 struct NodeId {
     id: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct GetBlockFromPeer {
+    node_id: i64,
+	hash: String,
+	peer_id: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -126,6 +134,7 @@ fn validation_checks(conn: Conn, window: i64) -> Result<Value> {
     }
 }
 
+// check if tx is in active tip
 fn tx_is_active(conn: Conn, params: Params) -> Result<Value> {
     match params.parse::<TxId>() {
         Ok(id) => {
@@ -152,6 +161,7 @@ fn tx_is_active(conn: Conn, params: Params) -> Result<Value> {
     }
 }
 
+// updated chaintip to the provided block
 fn set_tip(conn: Conn, cmd: Sender<ScannerCommand>, params: Params) -> Result<Value> {
     match params.parse::<SetTipQuery>() {
         Ok(query) => {
@@ -180,6 +190,60 @@ fn set_tip(conn: Conn, cmd: Sender<ScannerCommand>, params: Params) -> Result<Va
             };
             cmd.send(c).expect("Command channel broke");
             Ok("success".into())
+        }
+        Err(e) => {
+            let err = JsonRpcError::invalid_params(format!("Invalid parameters, {:?}", e));
+            Err(err)
+        }
+    }
+}
+
+// get a block from a connected peer
+fn get_block_from_peer(conn: Conn, params: Params) -> Result<Value> {
+    match params.parse::<GetBlockFromPeer>() {
+        Ok(query) => {
+            match Node::list(&conn) {
+                Ok(nodes) => {
+                    let n = nodes.iter().find(|n| n.id == query.node_id );
+
+                    if n.is_none() {
+                        let err = JsonRpcError::invalid_params(format!(
+                            "Node not found: {:?}",
+                            query.node_id
+                        ));
+                        return Err(err);
+                    }
+
+					let node = n.unwrap();
+
+					let auth = Auth::UserPass(node.rpc_user.clone(), node.rpc_pass.clone());
+					if let Ok(client) = Client::new(&node.rpc_host, auth) {
+						let peer_id = serde_json::Value::Number(serde_json::Number::from(query.peer_id));
+						let result = RpcApi::call::<serde_json::Value>(
+						    &client, "getblockfrompeer",
+							&[serde_json::Value::String(query.hash), peer_id],
+						);
+
+						match result {
+						    Ok(result) => Ok(result),
+							Err(e) => {
+							    let errmsg = format!("Call to get blocks failed. {:?}", e);
+								return Err(JsonRpcError::invalid_params(errmsg));
+							}
+						}
+					} else {
+						let err =
+							JsonRpcError::invalid_params(format!("Failed to establish a node connection."));
+						return Err(err);
+					}
+                }
+                Err(e) => {
+                    let err =
+                        JsonRpcError::invalid_params(format!("Could not get node list, {:?}", e));
+                    return Err(err);
+                }
+            }
+
         }
         Err(e) => {
             let err = JsonRpcError::invalid_params(format!("Invalid parameters, {:?}", e));
@@ -219,6 +283,7 @@ fn get_block(conn: Conn, params: Params) -> Result<Value> {
     }
 }
 
+// add a new node to forkscanner
 fn add_node(conn: Conn, params: Params) -> Result<Value> {
     match params.parse::<NodeArgs>() {
         Ok(args) => {
@@ -243,6 +308,7 @@ fn add_node(conn: Conn, params: Params) -> Result<Value> {
     }
 }
 
+// remove node from database
 fn remove_node(conn: Conn, params: Params) -> Result<Value> {
     match params.parse::<NodeId>() {
         Ok(id) => {
@@ -259,6 +325,7 @@ fn remove_node(conn: Conn, params: Params) -> Result<Value> {
     }
 }
 
+// fetch currently active chaintips
 fn get_tips(params: Params, tips: Vec<Chaintip>) -> Result<Value> {
     match params.parse::<TipArgs>() {
         Ok(t) => {
@@ -283,6 +350,7 @@ fn get_tips(params: Params, tips: Vec<Chaintip>) -> Result<Value> {
     }
 }
 
+// validation endpoint subscription handler
 fn handle_validation_subscribe(
     exit: Arc<AtomicBool>,
     receiver: Receiver<ScannerMessage>,
@@ -332,6 +400,7 @@ fn handle_validation_subscribe(
     });
 }
 
+// handles subscriptions for chaintip updates
 fn handle_subscribe(
     exit: Arc<AtomicBool>,
     receiver: Receiver<ScannerMessage>,
@@ -399,6 +468,8 @@ pub fn run_server(
 
     let tips1 = tips.clone();
     let l1 = listen.clone();
+
+	// set up some rpc endpoints
     let t1 = thread::spawn(move || {
         let mut io = IoHandler::new();
         io.add_sync_method("get_tips", move |params: Params| {
@@ -421,6 +492,12 @@ pub fn run_server(
         io.add_sync_method("get_block", move |params: Params| {
             let conn = p.get().unwrap();
             get_block(conn, params)
+        });
+
+        let p = pool.clone();
+        io.add_sync_method("get_block_from_peer", move |params: Params| {
+            let conn = p.get().unwrap();
+            get_block_from_peer(conn, params)
         });
 
         let p = pool.clone();
@@ -448,6 +525,7 @@ pub fn run_server(
         HashMap::<&str, Vec<Sender<ScannerMessage>>>::default(),
     ));
     let subscriptions2 = subscriptions.clone();
+	// listener thread for notifications from forkscanner
     let t2 = thread::spawn(move || loop {
         match receiver.recv() {
             Ok(ScannerMessage::NewChaintip) => {
@@ -518,6 +596,7 @@ pub fn run_server(
         let killer_clone3 = killers.clone();
         let pool3 = pool2.clone();
         let subscriptions2 = subscriptions.clone();
+		// ws subscription endpoint for fork notifications
         io.add_subscription(
             "forks",
             (
@@ -560,6 +639,7 @@ pub fn run_server(
             }),
         );
 
+        // subscription endpoint for giving diff between tip height and stale block heights
         io.add_subscription(
             "validation_checks",
             (

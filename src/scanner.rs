@@ -45,6 +45,7 @@ const SATOSHI_TO_BTC: i64 = 100_000_000;
 
 type ForkScannerResult<T> = Result<T, ForkScannerError>;
 
+/// Types for the pool info fetched from MINER_POOL_INFO.
 #[derive(Debug, Deserialize)]
 pub struct MinerPool {
     pub name: String,
@@ -57,6 +58,7 @@ pub struct MinerPoolInfo {
     pub payout_addresses: HashMap<String, MinerPool>,
 }
 
+/// Notifications from forkscanner to the api server.
 pub enum ScannerMessage {
     NewChaintip,
     AllChaintips(Vec<Chaintip>),
@@ -65,6 +67,7 @@ pub enum ScannerMessage {
     TipUpdated(Vec<String>),
 }
 
+/// Command types from api to forkscanner.
 pub enum ScannerCommand {
     SetTip { node_id: i64, hash: String },
 }
@@ -189,6 +192,7 @@ pub struct PeerInfo {
     pub connection_type: Option<GetPeerInfoResultConnectionType>,
 }
 
+/// Trait defining interface to bitcoin RPC API
 #[cfg_attr(test, automock)]
 pub trait BtcClient: Sized {
     fn new(host: &String, auth: Auth) -> ForkScannerResult<Self>;
@@ -490,6 +494,8 @@ fn create_block_and_ancestors<BC: BtcClient>(
     Ok(())
 }
 
+/// Find fork point between given block and the current active block,
+/// then invalidate up to the fork point, and set the given block as active tip.
 fn make_block_active<BC: BtcClient>(
     client: &BC,
     db_conn: &PgConnection,
@@ -554,6 +560,7 @@ fn make_block_active<BC: BtcClient>(
     Ok(invalidated_hashes)
 }
 
+/// Find the fork point between given block and the active tip.
 fn find_fork_point(
     db_conn: &PgConnection,
     active: &GetChainTipsResultTip,
@@ -673,6 +680,7 @@ impl<BC: BtcClient> ForkScanner<BC> {
         ))
     }
 
+    // fetch block templates and calculate fee rates.
     fn fetch_block_templates(&self, client: &BC, node: &Node) {
         match client.get_block_template(
             GetBlockTemplateModes::Template,
@@ -952,11 +960,13 @@ impl<BC: BtcClient> ForkScanner<BC> {
             return;
         }
 
+        // purge block templates as well.
         if let Err(e) = BlockTemplate::purge(&self.db_conn) {
             error!("Error purging database {:?}", e);
             return;
         }
 
+        // check for requests from the api server
         while self.command.len() > 0 {
             match self.command.try_recv() {
                 Ok(msg) => match msg {
@@ -1018,6 +1028,7 @@ impl<BC: BtcClient> ForkScanner<BC> {
 
             self.fetch_block_templates(client.client(), node);
 
+            // process new chaintip entries from each client.
             changed |= match self.process_client(client.client(), node) {
                 Ok(changed) => changed,
                 Err(e) => {
@@ -1027,12 +1038,14 @@ impl<BC: BtcClient> ForkScanner<BC> {
             };
         }
 
+        // update the API server of chaintip updates
         if changed {
             self.notify_tx
                 .send(ScannerMessage::NewChaintip)
                 .expect("Channel closed");
         }
 
+        // get min height block template, and blocks with no fee diffs yet.
         match BlockTemplate::get_min(&self.db_conn) {
             Ok(Some(min_template)) => {
                 if let Ok(blocks) = Block::get_with_fee_no_diffs(&self.db_conn, min_template) {
@@ -1152,7 +1165,8 @@ impl<BC: BtcClient> ForkScanner<BC> {
             }
         }
 
-        // Now try to fill in missing blocks.
+        // Now try to fill in missing blocks,
+		// check inflation, do rollbacks, and stale candidates.
         self.find_missing_blocks();
         self.inflation_checks();
         self.rollback_checks();
@@ -1227,7 +1241,7 @@ impl<BC: BtcClient> ForkScanner<BC> {
             let db_url = std::env::var("DATABASE_URL").expect("No DB url");
             let db_conn = PgConnection::establish(&db_url).expect("Connection failed");
 
-            // stop p2p traffic
+            // stop p2p traffic so nothing changes underneath us.
             if let Err(e) = client.set_network_active(false) {
                 error!("RPC call failed: {e:?}");
                 return;
@@ -1318,6 +1332,7 @@ impl<BC: BtcClient> ForkScanner<BC> {
                 blocks_to_check.push(comparison_block.clone());
             }
 
+            // Go through all blocks to check, and make each one active one by one fetching tx outset info for each.
             for block in blocks_to_check.iter().rev() {
                 match make_block_active(&client, &db_conn, block) {
                     Ok(invalidated_hashes) => {
@@ -1493,6 +1508,7 @@ impl<BC: BtcClient> ForkScanner<BC> {
         }
     }
 
+    // point this candidate at its children.
     fn set_children(&self, candidate: &mut StaleCandidate) {
         if let Err(e) = candidate.purge_children(&self.db_conn) {
             error!("Could not purge children! {:?}", e);
@@ -1536,6 +1552,7 @@ impl<BC: BtcClient> ForkScanner<BC> {
         };
     }
 
+    // find conflicting transactions.
     fn set_conflicting_txs(&self, candidate: &mut StaleCandidate, tip_height: i64) {
         if let Some(confirmed_in_one) = self.get_confirmed_in_one_branch(candidate) {
             // TODO: this handles only 2 branches, shortest and longest.
@@ -1711,6 +1728,7 @@ impl<BC: BtcClient> ForkScanner<BC> {
         }
     }
 
+    // Get transactions that might be in one branch but not in the other.
     fn get_confirmed_in_one_branch(&self, candidate: &StaleCandidate) -> Option<Vec<String>> {
         // TODO: handle more than two branches
         if candidate.n_children != 2 {
@@ -1840,6 +1858,7 @@ impl<BC: BtcClient> ForkScanner<BC> {
         }
     }
 
+    // find blocks at same height, within a window, and mark them as possibly stale.
     fn find_stale_candidates(&self) {
         info!("Stale candidate checks");
         let tip_height = match Block::max_height(&self.db_conn) {
@@ -1876,6 +1895,7 @@ impl<BC: BtcClient> ForkScanner<BC> {
         }
     }
 
+    // get transactions for a block and save info to database.
     fn fetch_transactions(&self, block: &Block) {
         let node = self
             .clients
