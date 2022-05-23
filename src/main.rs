@@ -11,7 +11,7 @@ fn main() {
     let db_url = std::env::var("DATABASE_URL").expect("No DB url");
     let db_conn = PgConnection::establish(&db_url).expect("Connection failed");
 
-    let (scanner, receiver) =
+    let (scanner, receiver, command) =
         ForkScanner::<Client>::new(db_conn).expect("Launching forkscanner failed");
     let duration = std::time::Duration::from_millis(10_000);
 
@@ -22,5 +22,12 @@ fn main() {
     });
 
     info!("Starting RPC server on 127.0.0.1 rpc-port 8339 subscribe-port 8340");
-    run_server("0.0.0.0".into(), 8339, 8340, db_url.into(), receiver);
+    run_server(
+        "0.0.0.0".into(),
+        8339,
+        8340,
+        db_url.into(),
+        receiver,
+        command,
+    );
 }

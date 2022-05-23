@@ -1,21 +1,21 @@
 use crate::{
-    Block, BlockTemplate, Chaintip, FeeRate, InflatedBlock, Node, Pool, StaleCandidate,
-    StaleCandidateChildren, SoftForks, Transaction, TxOutset,
+    Block, BlockTemplate, Chaintip, FeeRate, InflatedBlock, Node, Pool, SoftForks, StaleCandidate,
+    StaleCandidateChildren, Transaction, TxOutset,
 };
 use bigdecimal::{BigDecimal, FromPrimitive};
 use bitcoin::{consensus::encode::serialize_hex, util::amount::Amount};
-use bitcoin_hashes::{Hash, sha256d};
+use bitcoin_hashes::{sha256d, Hash};
 use bitcoincore_rpc::bitcoin as btc;
 use bitcoincore_rpc::bitcoincore_rpc_json::{
     GetBlockHeaderResult, GetBlockResult, GetBlockTemplateCapabilities, GetBlockTemplateModes,
     GetBlockTemplateResult, GetBlockTemplateRules, GetBlockchainInfoResult,
-    GetChainTipsResultStatus, GetChainTipsResultTip, GetPeerInfoResultConnectionType, GetPeerInfoResultNetwork, GetRawTransactionResult,
-    GetTxOutSetInfoResult,
+    GetChainTipsResultStatus, GetChainTipsResultTip, GetPeerInfoResultConnectionType,
+    GetPeerInfoResultNetwork, GetRawTransactionResult, GetTxOutSetInfoResult,
 };
 use bitcoincore_rpc::Error as BitcoinRpcError;
 use bitcoincore_rpc::{Auth, Client, RpcApi};
 use chrono::prelude::*;
-use crossbeam::channel::{unbounded, Receiver, Sender};
+use crossbeam::channel::{unbounded, Receiver, Sender, TryRecvError};
 use diesel::prelude::PgConnection;
 use diesel::Connection;
 use jsonrpc::error::Error as JsonRpcError;
@@ -60,7 +60,13 @@ pub struct MinerPoolInfo {
 pub enum ScannerMessage {
     NewChaintip,
     AllChaintips(Vec<Chaintip>),
-	StaleCandidateUpdate,
+    StaleCandidateUpdate,
+    TipUpdateFailed(String),
+    TipUpdated(Vec<String>),
+}
+
+pub enum ScannerCommand {
+    SetTip { node_id: i64, hash: String },
 }
 
 #[derive(Deserialize)]
@@ -172,7 +178,11 @@ pub struct PeerInfo {
     pub synced_blocks: Option<i64>,
     pub inflight: Option<Vec<u64>>,
     pub whitelisted: Option<bool>,
-	#[serde(rename = "minfeefilter", default, with = "bitcoin::util::amount::serde::as_btc::opt")]
+    #[serde(
+        rename = "minfeefilter",
+        default,
+        with = "bitcoin::util::amount::serde::as_btc::opt"
+    )]
     pub min_fee_filter: Option<Amount>,
     pub bytessent_per_msg: Option<HashMap<String, u64>>,
     pub bytesrecv_per_msg: Option<HashMap<String, u64>>,
@@ -426,15 +436,15 @@ fn create_block_and_ancestors<BC: BtcClient>(
                     let pool_tag = String::from_utf8_lossy(&cb).to_string();
 
                     for p in Pool::list(&conn)? {
-					    if let Some(_) = pool_tag.find(&p.tag) {
-						    pool = Some(p);
-							break;
-						}
-					}
+                        if let Some(_) = pool_tag.find(&p.tag) {
+                            pool = Some(p);
+                            break;
+                        }
+                    }
 
-					if pool.is_some() {
-					    break;
-					}
+                    if pool.is_some() {
+                        break;
+                    }
                 }
             }
 
@@ -621,12 +631,17 @@ pub struct ForkScanner<BC: BtcClient> {
     clients: Vec<ScannerClient<BC>>,
     db_conn: PgConnection,
     notify_tx: Sender<ScannerMessage>,
+    command: Receiver<ScannerCommand>,
 }
 
 impl<BC: BtcClient> ForkScanner<BC> {
     pub fn new(
         db_conn: PgConnection,
-    ) -> ForkScannerResult<(ForkScanner<BC>, Receiver<ScannerMessage>)> {
+    ) -> ForkScannerResult<(
+        ForkScanner<BC>,
+        Receiver<ScannerMessage>,
+        Sender<ScannerCommand>,
+    )> {
         let node_list = Node::list(&db_conn)?;
 
         let mut clients = Vec::new();
@@ -643,6 +658,7 @@ impl<BC: BtcClient> ForkScanner<BC> {
         }
 
         let (notify_tx, notify_rx) = unbounded();
+        let (cmd_tx, cmd_rx) = unbounded();
 
         Ok((
             ForkScanner {
@@ -650,8 +666,10 @@ impl<BC: BtcClient> ForkScanner<BC> {
                 clients,
                 db_conn,
                 notify_tx,
+                command: cmd_rx,
             },
             notify_rx,
+            cmd_tx,
         ))
     }
 
@@ -709,18 +727,22 @@ impl<BC: BtcClient> ForkScanner<BC> {
             match tip.status {
                 GetChainTipsResultStatus::HeadersOnly => {
                     match create_block_and_ancestors(client, &self.db_conn, true, &hash, node.id) {
-					    Err(ForkScannerError::RpcClientError(e)) => {
-							if let BitcoinRpcError::JsonRpc(JsonRpcError::Rpc(RpcError { code, .. })) = e {
-							    if code != BLOCK_NOT_ON_DISK {
-									return Err(ForkScannerError::RpcClientError(e));
-								}
-							} else {
-							    return Err(ForkScannerError::RpcClientError(e));
-							}
-						}
-						Err(e) => return Err(e),
-						_ => {}
-					}
+                        Err(ForkScannerError::RpcClientError(e)) => {
+                            if let BitcoinRpcError::JsonRpc(JsonRpcError::Rpc(RpcError {
+                                code,
+                                ..
+                            })) = e
+                            {
+                                if code != BLOCK_NOT_ON_DISK {
+                                    return Err(ForkScannerError::RpcClientError(e));
+                                }
+                            } else {
+                                return Err(ForkScannerError::RpcClientError(e));
+                            }
+                        }
+                        Err(e) => return Err(e),
+                        _ => {}
+                    }
                 }
                 GetChainTipsResultStatus::ValidHeaders => {
                     create_block_and_ancestors(client, &self.db_conn, true, &hash, node.id)?;
@@ -935,15 +957,64 @@ impl<BC: BtcClient> ForkScanner<BC> {
             return;
         }
 
+        while self.command.len() > 0 {
+            match self.command.try_recv() {
+                Ok(msg) => match msg {
+                    ScannerCommand::SetTip { node_id, hash } => {
+                        let node = self
+                            .clients
+                            .iter()
+                            .find(|c| c.node_id == node_id)
+                            .expect("Node not found!");
+
+                        let block = match Block::get(&self.db_conn, &hash) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                error!("Could not fetch block from db!");
+                                self.notify_tx
+                                    .send(ScannerMessage::TipUpdateFailed(e.to_string()))
+                                    .expect("Notify channel broken");
+                                continue;
+                            }
+                        };
+
+                        match self.set_tip_active(node.client(), block.hash, block.height as u64) {
+                            Ok(invalidated_hashes) => {
+                                let hashes = invalidated_hashes
+                                    .into_iter()
+                                    .map(|h| h.to_string())
+                                    .collect();
+                                let update = ScannerMessage::TipUpdated(hashes);
+                                self.notify_tx.send(update).expect("Notify channel broken");
+                            }
+                            Err(e) => {
+                                error!("Could not set chaintip for node {}!", node_id);
+                                self.notify_tx
+                                    .send(ScannerMessage::TipUpdateFailed(e.to_string()))
+                                    .expect("Notify channel broken");
+                            }
+                        }
+                    }
+                },
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    error!("Command channel disconnected!");
+                    return;
+                }
+            }
+        }
+
         let mut changed = false;
         for (client, node) in self.clients.iter().zip(&self.node_list) {
-			if let Ok(info) = client.client().get_blockchain_info() {
-			    if let Err(e) = SoftForks::update_or_insert(&self.db_conn, client.node_id, info.softforks) {
-				    error!("Softfork update failed: {:?}", e);
-				}
-			} else {
-			    error!("Failed to fetch blockchain info!");
-			}
+            if let Ok(info) = client.client().get_blockchain_info() {
+                if let Err(e) =
+                    SoftForks::update_or_insert(&self.db_conn, client.node_id, info.softforks)
+                {
+                    error!("Softfork update failed: {:?}", e);
+                }
+            } else {
+                error!("Failed to fetch blockchain info!");
+            }
 
             self.fetch_block_templates(client.client(), node);
 
@@ -962,73 +1033,87 @@ impl<BC: BtcClient> ForkScanner<BC> {
                 .expect("Channel closed");
         }
 
-		match BlockTemplate::get_min(&self.db_conn) {
-		    Ok(Some(min_template)) => {
-				if let Ok(blocks) = Block::get_with_fee_no_diffs(&self.db_conn, min_template) {
-				    for mut block in blocks {
-					    if block.txids.is_none() {
-						    continue;
-						}
+        match BlockTemplate::get_min(&self.db_conn) {
+            Ok(Some(min_template)) => {
+                if let Ok(blocks) = Block::get_with_fee_no_diffs(&self.db_conn, min_template) {
+                    for mut block in blocks {
+                        if block.txids.is_none() {
+                            continue;
+                        }
 
-						let latest_template = match BlockTemplate::get_with_txs(&self.db_conn, block.height) {
-						    Ok(lb) => lb,
-							Err(e) => {
-							    error!("Could not fetch latest template! {e:?}");
-								continue;
-							}
-						};
+                        let latest_template =
+                            match BlockTemplate::get_with_txs(&self.db_conn, block.height) {
+                                Ok(lb) => lb,
+                                Err(e) => {
+                                    error!("Could not fetch latest template! {e:?}");
+                                    continue;
+                                }
+                            };
 
-						if latest_template.tx_ids.len() == 0 {
-						    continue;
-						}
+                        if latest_template.tx_ids.len() == 0 {
+                            continue;
+                        }
 
-						let template_txids: Vec<_> = (latest_template.tx_ids).chunks(32).map(|chunk| sha256d::Hash::from_slice(chunk).expect("Bad hash value")).collect();
-						let block_txids = HashSet::<_>::from_iter((block.txids.unwrap()).chunks(32).map(|chunk| sha256d::Hash::from_slice(chunk).expect("Bad hash value")));
+                        let template_txids: Vec<_> = (latest_template.tx_ids)
+                            .chunks(32)
+                            .map(|chunk| sha256d::Hash::from_slice(chunk).expect("Bad hash value"))
+                            .collect();
+                        let block_txids =
+                            HashSet::<_>::from_iter((block.txids.unwrap()).chunks(32).map(
+                                |chunk| sha256d::Hash::from_slice(chunk).expect("Bad hash value"),
+                            ));
 
-						let tx_pos_omitted = template_txids
-						    .iter()
-							.enumerate()
-							.filter_map(|(idx, txid)| {
-							    if block_txids.contains(txid) {
-								    None
-								} else {
-								    Some(idx)
-								}
-							});
-						let tx_template = HashSet::<_>::from_iter(template_txids.iter().cloned());
+                        let tx_pos_omitted =
+                            template_txids.iter().enumerate().filter_map(|(idx, txid)| {
+                                if block_txids.contains(txid) {
+                                    None
+                                } else {
+                                    Some(idx)
+                                }
+                            });
+                        let tx_template = HashSet::<_>::from_iter(template_txids.iter().cloned());
 
-					    let total_fee = block.total_fee.unwrap();
-						let added = block_txids.difference(&tx_template);
-						let omitted = tx_template.difference(&block_txids);
-						match FeeRate::list_by(&self.db_conn, latest_template.parent_block_hash, latest_template.node_id) {
-						    Ok(fee_rates) => {
-							    for mut fee_rate in tx_pos_omitted.into_iter().map(|i| fee_rates[i].clone()) {
-								    fee_rate.omitted = true;
-									if let Err(e) = fee_rate.update(&self.db_conn) {
-									    error!("Fee rate update failed {e:?}");
-										return;
-									}
-								}
-							}
-							Err(e) => {
-							    error!("Could not fetch fee rates {e:?}");
-								return;
-							}
-						};
+                        let total_fee = block.total_fee.unwrap();
+                        let added = block_txids.difference(&tx_template);
+                        let omitted = tx_template.difference(&block_txids);
+                        match FeeRate::list_by(
+                            &self.db_conn,
+                            latest_template.parent_block_hash,
+                            latest_template.node_id,
+                        ) {
+                            Ok(fee_rates) => {
+                                for mut fee_rate in
+                                    tx_pos_omitted.into_iter().map(|i| fee_rates[i].clone())
+                                {
+                                    fee_rate.omitted = true;
+                                    if let Err(e) = fee_rate.update(&self.db_conn) {
+                                        error!("Fee rate update failed {e:?}");
+                                        return;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!("Could not fetch fee rates {e:?}");
+                                return;
+                            }
+                        };
 
-						block.txids_added = Some(added.into_iter().flat_map(|a| a.to_vec()).collect());
-						block.txids_omitted = Some(omitted.into_iter().flat_map(|a| a.to_vec()).collect());
-						block.lowest_template_fee_rate = Some(BigDecimal::from(latest_template.lowest_fee_rate));
-						block.template_txs_fee_diff = Some(total_fee - latest_template.fee_total);
-					}
-				}
-			}
-			Ok(None) => warn!("No block templates!"),
-			Err(e) => {
-			    error!("Error fetching min template! {e:?}");
-				return;
-			}
-		};
+                        block.txids_added =
+                            Some(added.into_iter().flat_map(|a| a.to_vec()).collect());
+                        block.txids_omitted =
+                            Some(omitted.into_iter().flat_map(|a| a.to_vec()).collect());
+                        block.lowest_template_fee_rate =
+                            Some(BigDecimal::from(latest_template.lowest_fee_rate));
+                        block.template_txs_fee_diff = Some(total_fee - latest_template.fee_total);
+                    }
+                }
+            }
+            Ok(None) => warn!("No block templates!"),
+            Err(e) => {
+                error!("Error fetching min template! {e:?}");
+                return;
+            }
+        };
 
         match Chaintip::list(&self.db_conn) {
             Ok(tips) => {
@@ -1075,8 +1160,9 @@ impl<BC: BtcClient> ForkScanner<BC> {
 
         // for 3 most recent stale candidates...
         self.process_stale_candidates();
-		self.notify_tx.send(ScannerMessage::StaleCandidateUpdate)
-			.expect("Channel closed");
+        self.notify_tx
+            .send(ScannerMessage::StaleCandidateUpdate)
+            .expect("Channel closed");
     }
 
     fn inflation_checks(&self) {
@@ -1889,7 +1975,7 @@ impl<BC: BtcClient> ForkScanner<BC> {
                     error!("Could not disable p2p {:?}", e);
                     continue;
                 }
-                match self.set_tip_active(mirror, tip) {
+                match self.set_tip_active(mirror, tip.hash.to_string(), tip.height) {
                     Ok(invalidated_hashes) => {
                         let tips = match mirror.get_chain_tips() {
                             Ok(t) => t,
@@ -1962,7 +2048,8 @@ impl<BC: BtcClient> ForkScanner<BC> {
     fn set_tip_active(
         &self,
         mirror: &BC,
-        tip: &GetChainTipsResultTip,
+        tip_hash: String,
+        tip_height: u64,
     ) -> ForkScannerResult<Vec<btc::BlockHash>> {
         let mut invalidated_hashes = Vec::new();
         let mut retry_count = 0;
@@ -1981,7 +2068,7 @@ impl<BC: BtcClient> ForkScanner<BC> {
                 .find(|t| t.status == GetChainTipsResultStatus::Active)
                 .unwrap();
 
-            if active.hash == tip.hash {
+            if active.hash.to_string() == tip_hash {
                 break;
             }
 
@@ -1991,14 +2078,14 @@ impl<BC: BtcClient> ForkScanner<BC> {
 
             let mut blocks_to_invalidate = Vec::new();
 
-            if active.height == tip.height {
+            if active.height == tip_height {
                 blocks_to_invalidate.push(active.hash);
             } else {
-                if let Some(branch) = self.find_branch_point(active, tip) {
+                if let Some(branch) = self.find_branch_point(active, &tip_hash, tip_height) {
                     blocks_to_invalidate.push(branch);
                 }
 
-                let children = match Block::children(&self.db_conn, &tip.hash.to_string()) {
+                let children = match Block::children(&self.db_conn, &tip_hash) {
                     Ok(c) => c,
                     Err(e) => {
                         error!("Children fetch failed {:?}", e);
@@ -2027,19 +2114,20 @@ impl<BC: BtcClient> ForkScanner<BC> {
     fn find_branch_point(
         &self,
         active: &GetChainTipsResultTip,
-        tip: &GetChainTipsResultTip,
+        tip_hash: &String,
+        tip_height: u64,
     ) -> Option<btc::BlockHash> {
-        if active.height <= tip.height {
+        if active.height <= tip_height {
             return None;
         }
 
         let mut block1 = Block::get(&self.db_conn, &active.hash.to_string()).ok()?;
 
-        while block1.height > tip.height as i64 {
+        while block1.height as u64 > tip_height {
             block1 = block1.parent(&self.db_conn).ok()?;
         }
 
-        if block1.hash == tip.hash.to_string() {
+        if &block1.hash == tip_hash {
             None
         } else {
             loop {
@@ -2047,7 +2135,7 @@ impl<BC: BtcClient> ForkScanner<BC> {
 
                 let desc = block1.descendants(&self.db_conn, None).ok()?;
 
-                let fork = desc.into_iter().find(|b| b.hash == tip.hash.to_string());
+                let fork = desc.into_iter().find(|b| &b.hash == tip_hash);
 
                 if let Some(_) = fork {
                     let hash = btc::BlockHash::from_str(&block1.hash).unwrap();

@@ -1,5 +1,5 @@
+use crate::{Block, Chaintip, Node, ScannerCommand, ScannerMessage, StaleCandidate, Transaction};
 use chrono::prelude::*;
-use crate::{Block, Chaintip, Node, ScannerMessage, StaleCandidate, Transaction};
 use crossbeam::channel::{unbounded, Receiver, RecvTimeoutError, Sender};
 use diesel::prelude::PgConnection;
 use jsonrpc_core::types::error::Error as JsonRpcError;
@@ -70,51 +70,60 @@ enum BlockQuery {
     Hash(String),
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct SetTipQuery {
+    node_id: i64,
+    hash: String,
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 struct ValidationCheck {
     tip: String,
-	tip_height: i64,
-	stale_height: i64,
-	height_difference: i64,
-	stale_timestamp: DateTime<Utc>,
+    tip_height: i64,
+    stale_height: i64,
+    height_difference: i64,
+    stale_timestamp: DateTime<Utc>,
 }
-
 
 #[derive(Debug, Deserialize, Serialize)]
 struct BlockArg {
     max_height: i64,
 }
 
-
 fn validation_checks(conn: Conn, window: i64) -> Result<Value> {
-	let tips = Chaintip::list_active(&conn);
+    let tips = Chaintip::list_active(&conn);
 
-	if tips.is_err() {
-		return Err(JsonRpcError::internal_error());
-	}
+    if tips.is_err() {
+        return Err(JsonRpcError::internal_error());
+    }
 
-	let tips = tips.unwrap();
+    let tips = tips.unwrap();
 
-	let checks: Vec<ValidationCheck> = tips.into_iter().flat_map(|tip| {
-	    let candidates = StaleCandidate::list_ge(&conn, tip.height - window).unwrap_or_default();
-		candidates.into_iter().map(|candidate| {
-		    ValidationCheck {
-			    tip: tip.block.clone(),
-				tip_height: tip.height,
-				height_difference: tip.height - candidate.height,
-				stale_height: candidate.height,
-				stale_timestamp: candidate.created_at,
-			}
-		}).collect::<Vec<ValidationCheck>>()
-	}).collect();
+    let checks: Vec<ValidationCheck> = tips
+        .into_iter()
+        .flat_map(|tip| {
+            let candidates =
+                StaleCandidate::list_ge(&conn, tip.height - window).unwrap_or_default();
+            candidates
+                .into_iter()
+                .map(|candidate| ValidationCheck {
+                    tip: tip.block.clone(),
+                    tip_height: tip.height,
+                    height_difference: tip.height - candidate.height,
+                    stale_height: candidate.height,
+                    stale_timestamp: candidate.created_at,
+                })
+                .collect::<Vec<ValidationCheck>>()
+        })
+        .collect();
 
     debug!("{} stale candidates in window {}", checks.len(), window);
-	match serde_json::to_value(checks) {
-		Ok(t) => Ok(t),
-		Err(_) => Err(JsonRpcError::internal_error()),
-	}
+    match serde_json::to_value(checks) {
+        Ok(t) => Ok(t),
+        Err(_) => Err(JsonRpcError::internal_error()),
+    }
 }
 
 fn tx_is_active(conn: Conn, params: Params) -> Result<Value> {
@@ -138,6 +147,42 @@ fn tx_is_active(conn: Conn, params: Params) -> Result<Value> {
         }
         Err(args) => {
             let err = JsonRpcError::invalid_params(format!("Invalid parameters, {:?}", args));
+            Err(err)
+        }
+    }
+}
+
+fn set_tip(conn: Conn, cmd: Sender<ScannerCommand>, params: Params) -> Result<Value> {
+    match params.parse::<SetTipQuery>() {
+        Ok(query) => {
+            match Node::list(&conn) {
+                Ok(nodes) => {
+                    let n = nodes.iter().find(|n| n.id == query.node_id);
+
+                    if n.is_none() {
+                        let err = JsonRpcError::invalid_params(format!(
+                            "Node not found: {:?}",
+                            query.node_id
+                        ));
+                        return Err(err);
+                    }
+                }
+                Err(e) => {
+                    let err =
+                        JsonRpcError::invalid_params(format!("Could not get node list, {:?}", e));
+                    return Err(err);
+                }
+            }
+
+            let c = ScannerCommand::SetTip {
+                node_id: query.node_id,
+                hash: query.hash,
+            };
+            cmd.send(c).expect("Command channel broke");
+            Ok("success".into())
+        }
+        Err(e) => {
+            let err = JsonRpcError::invalid_params(format!("Invalid parameters, {:?}", e));
             Err(err)
         }
     }
@@ -248,16 +293,20 @@ fn handle_validation_subscribe(
     info!("New subscription");
     let send_update = move |pool: &ManagedPool, sink: &Sink| -> std::result::Result<(), WsError> {
         let conn = pool.get()?;
-	    match validation_checks(conn, window) {
-		    Ok(resp) => Ok(sink.notify(Params::Array(vec![resp]))?),
-			Err(_) => Ok(sink.notify(Params::Array(vec!["Failed to update validation checks".into()]))?),
-		}
-
+        match validation_checks(conn, window) {
+            Ok(resp) => Ok(sink.notify(Params::Array(vec![resp]))?),
+            Err(_) => Ok(sink.notify(Params::Array(vec![
+                "Failed to update validation checks".into()
+            ]))?),
+        }
     };
 
     thread::spawn(move || {
         if let Err(e) = send_update(&pool, &sink) {
-            error!("Error sending validation checks to initialize client {:?}", e);
+            error!(
+                "Error sending validation checks to initialize client {:?}",
+                e
+            );
         }
 
         loop {
@@ -339,6 +388,7 @@ pub fn run_server(
     subs: u16,
     db_url: String,
     receiver: Receiver<ScannerMessage>,
+    command: Sender<ScannerCommand>,
 ) {
     let manager = ConnectionManager::<PgConnection>::new(db_url);
     let tips = Arc::new(RwLock::new(vec![]));
@@ -374,6 +424,14 @@ pub fn run_server(
         });
 
         let p = pool.clone();
+        let cmd = command.clone();
+        io.add_sync_method("set_tip", move |params: Params| {
+            let conn = p.get().unwrap();
+            let c = cmd.clone();
+            set_tip(conn, c, params)
+        });
+
+        let p = pool.clone();
         io.add_sync_method("tx_is_active", move |params: Params| {
             let conn = p.get().unwrap();
             tx_is_active(conn, params)
@@ -401,16 +459,41 @@ pub fn run_server(
                     }
                 }
             }
-			Ok(ScannerMessage::StaleCandidateUpdate) => {
+            Ok(ScannerMessage::TipUpdated(invalidated_hashes)) => {
+                debug!("New chaintip updates");
+                if let Some(subs) = subscriptions2.lock().expect("Lock poisoned").get("forks") {
+                    for sub in subs {
+                        sub.send(ScannerMessage::TipUpdated(invalidated_hashes.clone()))
+                            .expect("Channel broke");
+                    }
+                }
+            }
+            Ok(ScannerMessage::TipUpdateFailed(err)) => {
+                debug!("New chaintip updates");
+                if let Some(subs) = subscriptions2.lock().expect("Lock poisoned").get("forks") {
+                    for sub in subs {
+                        sub.send(ScannerMessage::TipUpdateFailed(err.clone()))
+                            .expect("Channel broke");
+                    }
+                }
+            }
+            Ok(ScannerMessage::StaleCandidateUpdate) => {
                 debug!("New stale candidate updates");
-                if let Some(subs) = subscriptions2.lock().expect("Lock poisoned").get("validation_checks") {
-					debug!("New stale candidates: updating {} subscriptions", subs.len());
+                if let Some(subs) = subscriptions2
+                    .lock()
+                    .expect("Lock poisoned")
+                    .get("validation_checks")
+                {
+                    debug!(
+                        "New stale candidates: updating {} subscriptions",
+                        subs.len()
+                    );
                     for sub in subs {
                         sub.send(ScannerMessage::StaleCandidateUpdate)
                             .expect("Channel broke");
                     }
                 }
-			}
+            }
             Ok(ScannerMessage::AllChaintips(mut t)) => {
                 debug!("New chaintips {:?}", t);
                 std::mem::swap(&mut t, &mut tips.write().expect("Lock poisoned"));
@@ -433,8 +516,8 @@ pub fn run_server(
         let killer_clone1 = killers.clone();
         let killer_clone2 = killers.clone();
         let killer_clone3 = killers.clone();
-		let pool3 = pool2.clone();
-		let subscriptions2 = subscriptions.clone();
+        let pool3 = pool2.clone();
+        let subscriptions2 = subscriptions.clone();
         io.add_subscription(
             "forks",
             (
@@ -485,23 +568,25 @@ pub fn run_server(
                     info!("Subscribe to validation checks");
                     let mut rng = rand::rngs::OsRng::default();
 
-					let block_window = if let Params::None = params {
-					    BLOCK_WINDOW
-					} else {
-					    let BlockArg { max_height } = if let Ok(parm) = params.parse() {
-						    parm
-						} else {
-							subscriber
-								.reject(Error {
-									code: ErrorCode::ParseError,
-									message: "Invalid parameters. Expected None, or max_height: i64".into(),
-									data: None,
-								})
-								.unwrap();
-							return;
-						};
-						max_height
-					};
+                    let block_window = if let Params::None = params {
+                        BLOCK_WINDOW
+                    } else {
+                        let BlockArg { max_height } = if let Ok(parm) = params.parse() {
+                            parm
+                        } else {
+                            subscriber
+                                .reject(Error {
+                                    code: ErrorCode::ParseError,
+                                    message:
+                                        "Invalid parameters. Expected None, or max_height: i64"
+                                            .into(),
+                                    data: None,
+                                })
+                                .unwrap();
+                            return;
+                        };
+                        max_height
+                    };
 
                     let kill_switch = Arc::new(AtomicBool::new(false));
                     let sub_id = SubscriptionId::Number(rng.gen());
@@ -513,18 +598,30 @@ pub fn run_server(
                     let (notify_tx, notify_rx) = unbounded();
                     {
                         let mut sub_lock = subscriptions2.lock().expect("Lock poisoned");
-                        sub_lock.entry("validation_checks").or_insert(vec![]).push(notify_tx);
+                        sub_lock
+                            .entry("validation_checks")
+                            .or_insert(vec![])
+                            .push(notify_tx);
                     }
 
-                    handle_validation_subscribe(kill_switch, notify_rx, pool3.clone(), block_window, sink)
+                    handle_validation_subscribe(
+                        kill_switch,
+                        notify_rx,
+                        pool3.clone(),
+                        block_window,
+                        sink,
+                    )
                 },
             ),
-            ("unsubscribe_validation_checks", move |id: SubscriptionId, _| {
-                if let Some(arc) = killer_clone3.lock().expect("Lock poisoned").remove(&id) {
-                    arc.store(true, Ordering::SeqCst);
-                }
-                Box::pin(futures::future::ok(Value::Bool(true)))
-            }),
+            (
+                "unsubscribe_validation_checks",
+                move |id: SubscriptionId, _| {
+                    if let Some(arc) = killer_clone3.lock().expect("Lock poisoned").remove(&id) {
+                        arc.store(true, Ordering::SeqCst);
+                    }
+                    Box::pin(futures::future::ok(Value::Bool(true)))
+                },
+            ),
         );
         info!("Coming up on {} {}", listen, subs);
         let server = wss::ServerBuilder::with_meta_extractor(io, session_meta)
