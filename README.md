@@ -6,13 +6,6 @@ CREATE USER forkscanner WITH ENCRYPTED PASSWORD 'forkscanner';
 CREATE DATABASE forkscanner;
 GRANT ALL PRIVILEGES ON DATABASE forkscanner TO forkscanner;
 ```
-
-## Insert nodes into node table
-Edit setup_nodes.sql with credentials and rpc endpoints for your nodes, then run:
-```
-psql -f nodes_setup.sql postgres://forkscanner:forkscanner@localhost/forkscanner
-```
-
 Do the above with user forktester as well to run the tests.
 
 ## Install diesel cli-tool
@@ -22,6 +15,12 @@ On linux if you get cc linker error `cannot find -lpq` run below command
 `sudo apt-get install libpq-dev`
 
 `diesel migration run`
+
+## Insert nodes into node table
+Edit setup_nodes.sql with credentials and rpc endpoints for your nodes, then run:
+```
+psql -f scripts/nodes_setup.sql postgres://forkscanner:forkscanner@localhost/forkscanner
+```
 
 ## Test program
 This needs to be run on a node with bitcoin running.
