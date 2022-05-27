@@ -18,6 +18,9 @@ Do the above with user forktester as well to run the tests.
 ## Install diesel cli-tool
 `cargo install diesel_cli --no-default-features --features postgres`
 
+On linux if you get cc linker error `cannot find -lpq` run below command
+`sudo apt-get install libpq-dev`
+
 `diesel migration run`
 
 ## Test program
