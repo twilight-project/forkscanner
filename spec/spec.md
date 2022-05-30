@@ -227,6 +227,59 @@ bigint "node_id"
 boolean "inflated", default: false, null: false
 
 
+## Tx outsets:
+
+This model is used to save information about mininig pool. Please refer to the schema below
+
+**Struct**
+
+string "tag"
+string "name"
+string "url"
+datetime "created\_at"
+datetime "updated\_at"
+
+
+
+## Block Template:
+
+This model is used to saves the block template shared by the bitcoin core to the miner, this template is used by miner to generate a block. Please refer to the schema below
+
+**Struct**
+
+bigint "parent\_block\_id"
+bigint "node\_id"
+decimal "fee\_total"
+datetime "timestamp"
+integer "height"
+datetime "created\_at",
+datetime "updated\_at"
+integer "n\_transactions”
+binary "tx\_ids"
+integer "coin", null: false
+integer "tx\_fee\_rates"
+integer "lowest\_fee\_rate"
+
+
+## Soft Forks :
+
+This model is used to keep a record of all the soft forks. Please refer to the schema below
+
+**Struct**
+
+create\_table "softforks
+integer "coin"
+bigint "node\_id"
+integer "fork\_type"
+string "name"
+integer "bit"
+integer "status"
+integer "since"
+datetime "created\_at”
+datetime "updated\_at"
+datetime "notified\_at"
+
+
 ## API Spec
 
 Following API endpoints are needed.
@@ -637,297 +690,160 @@ algorithm will run for each of the 3 latest stale candidates mentioned above.
 
 
 
-**Specification For Inflation Checks**
+##Specification For Inflation Checks##
 
 This part of the specs monitors inflation and keeps a track of miner rewards for each block mined. this should update our inflated blocks table and should add the blocks where inflation happened. This feature will be implemented in 2 steps mentioned below.
 
-\1. A service which will pick up all nodes which are available and are up to date.
-\2. Running inflation checks on each node independently, preferably in threads.
+- A service which will pick up all nodes which are available and are up to date.
+- Running inflation checks on each node independently, preferably in threads.
 
 we will also need to add 2 more data models. Schema for which will be shared later in the document
 
-\1. Inflated Blocks.
-\2. Tx\_outsets.
+- Inflated Blocks.
+- Tx_outsets.
 
 
 
-**Service to get a list of nodes.**
+###Service to get a list of nodes.###
 
 
-` `We are maintaining a list of nodes we pick up all nodes from there and run a loop with below mentioned specifications.
+We are maintaining a list of nodes we pick up all nodes from there and run a loop with below mentioned specifications.
 
-1. First step Is to check if the node is currently available and is reachable. Following below steps, we can manage a list of nodes which are currently active and from time to time check up on inactive nodes to update our list.
-   1. We maintain an unreachable\_since field (datetime type) in the Nodes table in DB.
-   1. If this field is null or the value is more then 10 min ago. we query the node with a getbestblockhash RPC call.
-   1. If we get a result back, we unpdate the DB and set unreachable\_since to null
-   1. If we get a timeout, we set the current datetime as the value for unreachable\_since.
-1. Then we filter the nodes by excluding any node which is in initial block download phase
-   1. This can be achieved by creating a bool field in nodes table, named IBD.
-   1. Than we compare getblockchaininfo RPC from this node and another fully running
-   1. If the difference in block height is more then 10 we can mark the node as IBD.
-1. Then we run a new thread for each node and call check\_inflation\_for\_node (explained below) method
-
-
+- First step Is to check if the node is currently available and is reachable. Following below steps, we can manage a list of nodes which are currently active and from time to time check up on inactive nodes to update our list.
+   - We maintain an unreachable_since field (datetime type) in the Nodes table in DB.
+   - If this field is null or the value is more then 10 min ago. we query the node with a getbestblockhash RPC call.
+   - If we get a result back, we unpdate the DB and set unreachable_since to null
+   - If we get a timeout, we set the current datetime as the value for unreachable_since.
+- Then we filter the nodes by excluding any node which is in initial block download phase
+   - This can be achieved by creating a bool field in nodes table, named IBD.
+   - Than we compare getblockchaininfo RPC from this node and another fully running
+   - If the difference in block height is more then 10 we can mark the node as IBD.
+- Then we run a new thread for each node and call check_inflation_for_node (explained below) method
 
 
-
-**Check Inflation on each Node.**
+###Check Inflation on each Node.###
 
 This method is where we check inflation on each node, please note that it is supposed to be run as a separate thread for each node to ensure real-time calculations. This method also relies on gettxoutsetinfo RPC call.  
 
-1. First query the DB and check if we have tx\_outsets for latest block and this Node.
-1. If we have the tx\_outsets, it means node does not have the latest block yet or we already have done the calculation for latest block. Either way we need to wait for next block. So, we can sleep for some time and exit the thread.
-1. If we don’t have the tx\_outsets. We start by stopping p2p networking on the node.
-1. We need to maintain a list of blocks we need to check. Let’s refer to it as blocks\_to\_check. Add the current block in this list.
-1. Run an infinite loop.
-   1. Add a check to only go to a depth of 10 blocks to calculate inflation. If it exceeds 10 blocks break the loop
-   1. We need the current block and parent block on each loop iteration. Let refer to them as current\_block and parent\_block.
-   1. If we cannot find the parent block throw an error stating that unable to calculate inflation due to missing blocks.
-   1. Look for tx\_outsets for the parent block
-   1. If we have the tx\_outsets for parent block. Break the loop otherwise add the parent block in the blocks\_to\_check list. Please make sure that the new blocks are added at the start to maintain an order.
-1. When the loop ends, we should have a list of blocks we need to check. That should not be more then 10 blocks. Going above that would be costly hence just 10 blocks should be enough.
-1. Run another loop on the blocks to check list.
-   1. Get the UTXO balance at the height by using RPC call gettxoutsetinfo.
-   1. Perform the undo\_rollback. The process is explained previously.
-   1. Make sure we have the right tx\_outset by comparing tx\_outset [ blockhash ] and best block hash.
-   1. Add this new tx\_outset into the DB according to the DB schema for this table.
-   1. Retrieve the tx\_outsets from DB for the parent block.
-   1. Throw exception if parent block not found.
-   1. Now inflation can be calculated as. Lets call it current\_inflation
+- First query the DB and check if we have tx_outsets for latest block and this Node.
+- If we have the tx_outsets, it means node does not have the latest block yet or we already have done the calculation for latest block. Either way we need to wait for next block. So, we can sleep for some time and exit the thread.
+- If we don’t have the tx_outsets. We start by stopping p2p networking on the node.
+- We need to maintain a list of blocks we need to check. Let’s refer to it as blocks_to_check. Add the current block in this list.
+- Run an infinite loop.
+   - Add a check to only go to a depth of 10 blocks to calculate inflation. If it exceeds 10 blocks break the loop
+   - We need the current block and parent block on each loop iteration. Let refer to them as current_block and parent_block.
+   - If we cannot find the parent block throw an error stating that unable to calculate inflation due to missing blocks.
+   - Look for tx_outsets for the parent block
+   - If we have the tx_outsets for parent block. Break the loop otherwise add the parent block in the blocks_to_check list. Please make sure that the new blocks are added at the start to maintain an order.
+- When the loop ends, we should have a list of blocks we need to check. That should not be more then 10 blocks. Going above that would be costly hence just 10 blocks should be enough.
+- Run another loop on the blocks to check list.
+   - Get the UTXO balance at the height by using RPC call gettxoutsetinfo.
+   - Perform the undo_rollback. The process is explained previously.
+   - Make sure we have the right tx_outset by comparing tx_outset [ blockhash ] and best block hash.
+   - Add this new tx_outset into the DB according to the DB schema for this table.
+   - Retrieve the tx_outsets from DB for the parent block.
+   - Throw exception if parent block not found.
+   - Now inflation can be calculated as. Lets call it current_inflation
 
-      inflation = current\_block.total\_amount – parent\_block.total\_amount
-   1. Now we calculate max inflation.
-      1. interval = current\_height / 210,000 (because after every 210,000 blocks miner reward changes)
-      1. reward = 50 \* 100,000,000 (to get satoshies)
-      1. max\_inflation = reward >> interval (divide by 2 every time the miner reward changes to get the current reward)
+      inflation = current_block.total_amount – parent_block.total_amount
+   - Now we calculate max inflation.
+      - interval = current_height / 210,000 (because after every 210,000 blocks miner reward changes)
+      - reward = 50 * 100,000,000 (to get satoshies)
+      - max_inflation = reward >> interval (divide by 2 every time the miner reward changes to get the current reward)
 
-1. now we compare max inflation. if current\_inflation < max\_inflation. Continue to next iteration of loop. Also please make sure that both current and max inflation have the same unit of measure.
-1. Otherwise add the current\_block in the inflated blocks table. 
-1. Turn the p2p networking back on.
-
-
-**Schema for DB tables.**
-
-**Inflated\_blocks:**
-
-**bigint "block\_id"**
-
-`    	`**decimal "max\_inflation",**
-
-`    	`**decimal "actual\_inflation**
-
-`    	`**datetime "notified\_at"**
-
-`    	`**datetime "created\_at", null: false**
-
-`    	`**datetime "updated\_at", null: false**
-
-`    	`**bigint "node\_id"**
-
-`    	`**datetime "dismissed\_at"
-
-tx\_outsets:**
-
-`	`**bigint "block\_id"**
-
-`   	`**integer "txouts"**
-
-`    	`**decimal "total\_amount”**
-
-`    	`**datetime "created\_at", null: false**
-
-`    	`**datetime "updated\_at", null: false**
-
-`    	`**bigint "node\_id"**
-
-`    	`**boolean "inflated", default: false, null: false**
+- now we compare max inflation. if current_inflation < max_inflation. Continue to next iteration of loop. Also please make sure that both current and max inflation have the same unit of measure.
+- Otherwise add the current_block in the inflated blocks table. 
+- Turn the p2p networking back on.
 
 
-
-
-
-
-
-**Specification For Fee Calculation**
+##Specification For Fee Calculation##
 
 This part of the fork scanner will investigate which miner pool mined a block and how much fee was charged. It’s a 2 step process.
 
-1. Update the pool table in DB
-1. Perform calculation and update blocks in DB.
+- Update the pool table in DB
+- Perform calculation and update blocks in DB.
 
 
-
-**Update the pool table in DB.**
+###Update the pool table in DB.###
 
 We will need to create a new DB table called pool for this. Schema is shared below.
 
-1. In the main service for forkscanner, send a get request to below URL to get a json of active pools and save them in DB according to schema provided.
+- In the main service for forkscanner, send a get request to below URL to get a json of active pools and save them in DB according to schema provided.
 
 https://raw.githubusercontent.com/0xB10C/known-mining-pools/master/pools.json
 
 
-**Perform Calculations.**
+###Perform Calculations.###
 
 
 To begin with we will need a list of blocks current height to a specific depth (suggested limit is 10). Run a loop on each block and perform the below mentioned steps.
 
-1. We will be using getrawtransaction json-RPC call. This call was not available before bitcoin version 0.16. so the first check will be to ensure that the node is running a version newer then 0.16. we save the version in out nodes table, and will be a simple check
-1. Then we need coinbase transaction and list of tx\_ids 
-   1. Get the block info by calling RPC getblock with verbose set to 1.
-   1. Return none if no tx in block or if the block height is 0.
-   1. The first transaction in each block is coinbase tx, so get its id and use in next step.
-   1. Use RPC getrawtrasaction to get coinbase raw transaction.
-   1. Return raw coinbase tx and list of tx ids.
-1. If there is no coinbase transaction return none
-1. Remove the first coinbase tx id from the list of tx ids.
-1. Converts tx id hashes to binary and add the list of binary ids to block.
-1. Next step is to detect the miner pool from coinbase transaction.
-   1. The coinbase transaction details will have a ‘coinbase’ field under ‘vin’. If coinbase field does not exist throw an error 
-   1. Convert the hash from coinbase field into corresponding ASCII representation and encode it UTF-8.
-   1. Retrieve all pools from the pool table and run a loop on it and check if any pool.tag is included in coinbase ( retrieved in step 6.b ).
-1. Assign the pool retrieved in step 6 as block.pool
-1. Calculate total fee
-   1. From coinbase tx, sum up all values.
-   1. Multiply by 100\_000\_000 to get satoshies.
-   1. Subtract block.max\_inflation (calculated and assigned to each block during inflation checks) 
-   1. Divide by 100\_000\_000 to get bitcoins.
-1. If we are unable to find a pool we can just add the complete coinbase field from step 6 to block.pool
-1. Update the block in DB.
+- We will be using getrawtransaction json-RPC call. This call was not available before bitcoin version 0.16. so the first check will be to ensure that the node is running a version newer then 0.16. we save the version in out nodes table, and will be a simple check
+- Then we need coinbase transaction and list of tx_ids 
+   - Get the block info by calling RPC getblock with verbose set to 1.
+   - Return none if no tx in block or if the block height is 0.
+   - The first transaction in each block is coinbase tx, so get its id and use in next step.
+   - Use RPC getrawtrasaction to get coinbase raw transaction.
+   - Return raw coinbase tx and list of tx ids.
+- If there is no coinbase transaction return none
+- Remove the first coinbase tx id from the list of tx ids.
+- Converts tx id hashes to binary and add the list of binary ids to block.
+- Next step is to detect the miner pool from coinbase transaction.
+   - The coinbase transaction details will have a ‘coinbase’ field under ‘vin’. If coinbase field does not exist throw an error 
+   - Convert the hash from coinbase field into corresponding ASCII representation and encode it UTF-8.
+   - Retrieve all pools from the pool table and run a loop on it and check if any pool.tag is included in coinbase ( retrieved in step 6.b ).
+- Assign the pool retrieved in step 6 as block.pool
+- Calculate total fee
+   - From coinbase tx, sum up all values.
+   - Multiply by 100_000_000 to get satoshies.
+   - Subtract block.max_inflation (calculated and assigned to each block during inflation checks) 
+   - Divide by 100_000_000 to get bitcoins.
+- If we are unable to find a pool we can just add the complete coinbase field from step 6 to block.pool
+- Update the block in DB.
 
 
-**DB schema for tables.**
-
-Pool:
-
-string "tag"
-
-`    	`string "name"
-
-`    	`string "url"
-
-`    	`datetime "created\_at"
-
-`    	`datetime "updated\_at"
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-**Specification For Process Template**
+##Specification For Process Template##
 
 Template processing is a two-step process
 
-1. Retrieve block templates.
-1. Process block templates.
+- Retrieve block templates.
+- Process block templates.
 
-**Retrieve block templates.**
+###Retrieve block templates.###
 
 This is a straightforward service which simply queries the Node using getblocktemplate RPC call and retrieves block template from the node and saves it in the block template table in the DB, (Schema is shared below). Please not that we retrieve template repeatedly from all nodes we are connected to. 
 
 Consider the following while adding template in DB
 
-1. We can retrieve the parent block from our DB using template[“previousblockhash”] in our query.
-1. While storing tx\_ids convert the hashes into binary.
-1. tx\_fee\_rates is a list of rates which can be calculated as below
-   1. run a loop on template[“transactions”]
-   1. for each transaction divide it’s fee by  (it’s weight  / 4)
-   1. return a list of tx\_fee\_rates.
-1. Fee\_total  =  template[“ coinbasevalue”] – max\_inflation at this template[“height”]. Convert to satoshies before saving. Also max inflation can be calculated using the steps mentioned above (under **check inflation for each node**)
+- We can retrieve the parent block from our DB using template[“previousblockhash”] in our query.
+- While storing tx_ids convert the hashes into binary.
+- tx_fee_rates is a list of rates which can be calculated as below
+   - run a loop on template[“transactions”]
+   - for each transaction divide it’s fee by  (it’s weight  / 4)
+   - return a list of tx_fee_rates.
+- Fee_total  =  template[“ coinbasevalue”] – max_inflation at this template[“height”]. Convert to satoshies before saving. Also max inflation can be calculated using the steps mentioned above (under **check inflation for each node**)
 
 
-**Process Block Templates.**
+###Process Block Templates.###
 
 This is where we process the templates we retrieved in previous step. 
 
-1. get the minimum height from the block templates table.
-1. Get blocks from blocks table where following conditions are met 
-   1. Block height >= minimum height retrieved from block templates table.
-   1. template\_txs\_fee\_diff is null
-   1. total\_fee is not null
-1. for each block retrieved in step 2, run the following steps.
-   1. Get the latest block template where template height = block height and tx\_ids are not null.
-   1. Retrieve tx\_ids from block template
-   1. Retrieve tx\_ids from block
-   1. Compare both the tx\_ids and figure out the omitted ones and unexpected ones.
-   1. Update the blocks table accordingly.
-
-**DB Schema.**
-
-`  `create\_table "block\_templates”
-
-`    `bigint "parent\_block\_id"
-
-`    `bigint "node\_id"
-
-`    `decimal "fee\_total"
-
-`    `datetime "timestamp"
-
-`    `integer "height"
-
-`    `datetime "created\_at",
-
-`    `datetime "updated\_at"
-
-`    `integer "n\_transactions”
-
-`    `binary "tx\_ids"
-
-`    `integer "coin", null: false
-
-`    `integer "tx\_fee\_rates"
-
-`    `integer "lowest\_fee\_rate"
+- get the minimum height from the block templates table.
+- Get blocks from blocks table where following conditions are met 
+   - Block height >= minimum height retrieved from block templates table.
+   - template_txs_fee_diff is null
+   - total_fee is not null
+- for each block retrieved in step 2, run the following steps.
+   - Get the latest block template where template height = block height and tx_ids are not null.
+   - Retrieve tx_ids from block template
+   - Retrieve tx_ids from block
+   - Compare both the tx_ids and figure out the omitted ones and unexpected ones.
+   - Update the blocks table accordingly.
 
 
-**Soft Fork Processing**
+###Soft Fork Processing###
 
-This part of the code simply keeps a track of soft forks that have occurred uptil now. Simply query the bitcoin node with get\_block\_chain\_info RPC call. In the result we will have information for all softforks. Create or update the entries in DB accordingly. Do this for each connected node.
-
-**DB Schema:**
-
-`  `create\_table "softforks
-
-`    `integer "coin"
-
-`    `bigint "node\_id"
-
-`    `integer "fork\_type"
-
-`    `string "name"
-
-`    `integer "bit"
-
-`    `integer "status"
-
-`    `integer "since"
-
-`    `datetime "created\_at”
-
-`    `datetime "updated\_at"
-
-`    `datetime "notified\_at"
-
-
+This part of the code simply keeps a track of soft forks that have occurred uptil now. Simply query the bitcoin node with get_block_chain_info RPC call. In the result we will have information for all softforks. Create or update the entries in DB accordingly. Do this for each connected node.
 
 
 ## DB SCHEMA
