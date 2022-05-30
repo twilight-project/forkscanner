@@ -1,8 +1,13 @@
+use crate::{
+    serde_bigdecimal, Block, Chaintip, Node, ScannerCommand, ScannerMessage, StaleCandidate,
+    Transaction,
+};
+use bigdecimal::BigDecimal;
 use bitcoincore_rpc::{Auth, Client, RpcApi};
-use crate::{Block, Chaintip, Node, ScannerCommand, ScannerMessage, StaleCandidate, Transaction};
 use chrono::prelude::*;
 use crossbeam::channel::{unbounded, Receiver, RecvTimeoutError, Sender};
 use diesel::prelude::PgConnection;
+use hex::ToHex;
 use jsonrpc_core::types::error::Error as JsonRpcError;
 use jsonrpc_core::*;
 use jsonrpc_http_server as hts;
@@ -47,8 +52,8 @@ struct NodeId {
 #[derive(Debug, Deserialize)]
 struct GetBlockFromPeer {
     node_id: i64,
-	hash: String,
-	peer_id: u64,
+    hash: String,
+    peer_id: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -98,6 +103,61 @@ struct ValidationCheck {
 #[derive(Debug, Deserialize, Serialize)]
 struct BlockArg {
     max_height: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct BlockResult {
+    pub hash: String,
+    pub height: i64,
+    pub parent_hash: Option<String>,
+    pub connected: bool,
+    pub first_seen_by: i64,
+    pub headers_only: bool,
+    pub work: String,
+    pub txids: Option<Vec<String>>,
+    pub txids_added: Option<Vec<String>>,
+    pub txids_omitted: Option<Vec<String>>,
+    pub pool_name: Option<String>,
+    #[serde(serialize_with = "serde_bigdecimal")]
+    pub template_txs_fee_diff: Option<BigDecimal>,
+    #[serde(serialize_with = "serde_bigdecimal")]
+    pub tx_omitted_fee_rates: Option<BigDecimal>,
+    #[serde(serialize_with = "serde_bigdecimal")]
+    pub lowest_template_fee_rate: Option<BigDecimal>,
+    #[serde(serialize_with = "serde_bigdecimal")]
+    pub total_fee: Option<BigDecimal>,
+    pub coinbase_message: Option<Vec<u8>>,
+}
+
+fn txid_bytes_to_hex(txids: Option<Vec<u8>>) -> Option<Vec<String>> {
+    txids.map(|txs| {
+        txs.chunks(32)
+            .map(|chunk| chunk.encode_hex::<String>())
+            .collect()
+    })
+}
+
+impl BlockResult {
+    pub fn from_block(block: Block) -> BlockResult {
+        BlockResult {
+            hash: block.hash,
+            height: block.height,
+            parent_hash: block.parent_hash,
+            connected: block.connected,
+            first_seen_by: block.first_seen_by,
+            headers_only: block.headers_only,
+            work: block.work,
+            txids: txid_bytes_to_hex(block.txids),
+            txids_added: txid_bytes_to_hex(block.txids_added),
+            txids_omitted: txid_bytes_to_hex(block.txids_omitted),
+            pool_name: block.pool_name,
+            template_txs_fee_diff: block.template_txs_fee_diff,
+            tx_omitted_fee_rates: block.tx_omitted_fee_rates,
+            lowest_template_fee_rate: block.lowest_template_fee_rate,
+            total_fee: block.total_fee,
+            coinbase_message: block.coinbase_message,
+        }
+    }
 }
 
 fn validation_checks(conn: Conn, window: i64) -> Result<Value> {
@@ -201,50 +261,49 @@ fn set_tip(conn: Conn, cmd: Sender<ScannerCommand>, params: Params) -> Result<Va
 // get a block from a connected peer
 fn get_block_from_peer(conn: Conn, params: Params) -> Result<Value> {
     match params.parse::<GetBlockFromPeer>() {
-        Ok(query) => {
-            match Node::list(&conn) {
-                Ok(nodes) => {
-                    let n = nodes.iter().find(|n| n.id == query.node_id );
+        Ok(query) => match Node::list(&conn) {
+            Ok(nodes) => {
+                let n = nodes.iter().find(|n| n.id == query.node_id);
 
-                    if n.is_none() {
-                        let err = JsonRpcError::invalid_params(format!(
-                            "Node not found: {:?}",
-                            query.node_id
-                        ));
-                        return Err(err);
-                    }
-
-					let node = n.unwrap();
-
-					let auth = Auth::UserPass(node.rpc_user.clone(), node.rpc_pass.clone());
-					if let Ok(client) = Client::new(&node.rpc_host, auth) {
-						let peer_id = serde_json::Value::Number(serde_json::Number::from(query.peer_id));
-						let result = RpcApi::call::<serde_json::Value>(
-						    &client, "getblockfrompeer",
-							&[serde_json::Value::String(query.hash), peer_id],
-						);
-
-						match result {
-						    Ok(result) => Ok(result),
-							Err(e) => {
-							    let errmsg = format!("Call to get blocks failed. {:?}", e);
-								return Err(JsonRpcError::invalid_params(errmsg));
-							}
-						}
-					} else {
-						let err =
-							JsonRpcError::invalid_params(format!("Failed to establish a node connection."));
-						return Err(err);
-					}
+                if n.is_none() {
+                    let err = JsonRpcError::invalid_params(format!(
+                        "Node not found: {:?}",
+                        query.node_id
+                    ));
+                    return Err(err);
                 }
-                Err(e) => {
-                    let err =
-                        JsonRpcError::invalid_params(format!("Could not get node list, {:?}", e));
+
+                let node = n.unwrap();
+
+                let auth = Auth::UserPass(node.rpc_user.clone(), node.rpc_pass.clone());
+                if let Ok(client) = Client::new(&node.rpc_host, auth) {
+                    let peer_id =
+                        serde_json::Value::Number(serde_json::Number::from(query.peer_id));
+                    let result = RpcApi::call::<serde_json::Value>(
+                        &client,
+                        "getblockfrompeer",
+                        &[serde_json::Value::String(query.hash), peer_id],
+                    );
+
+                    match result {
+                        Ok(result) => Ok(result),
+                        Err(e) => {
+                            let errmsg = format!("Call to get blocks failed. {:?}", e);
+                            return Err(JsonRpcError::invalid_params(errmsg));
+                        }
+                    }
+                } else {
+                    let err = JsonRpcError::invalid_params(format!(
+                        "Failed to establish a node connection."
+                    ));
                     return Err(err);
                 }
             }
-
-        }
+            Err(e) => {
+                let err = JsonRpcError::invalid_params(format!("Could not get node list, {:?}", e));
+                return Err(err);
+            }
+        },
         Err(e) => {
             let err = JsonRpcError::invalid_params(format!("Invalid parameters, {:?}", e));
             Err(err)
@@ -257,6 +316,11 @@ fn get_block(conn: Conn, params: Params) -> Result<Value> {
         Ok(q) => match q {
             BlockQuery::Height(h) => {
                 if let Ok(result) = Block::get_at_height(&conn, h) {
+                    let result: Vec<_> = result
+                        .into_iter()
+                        .map(|block| BlockResult::from_block(block))
+                        .collect();
+
                     match serde_json::to_value(result) {
                         Ok(s) => Ok(s),
                         Err(_) => Err(JsonRpcError::internal_error()),
@@ -267,6 +331,8 @@ fn get_block(conn: Conn, params: Params) -> Result<Value> {
             }
             BlockQuery::Hash(h) => {
                 if let Ok(result) = Block::get(&conn, &h) {
+                    let result = BlockResult::from_block(result);
+
                     match serde_json::to_value(vec![result]) {
                         Ok(s) => Ok(s),
                         Err(_) => Err(JsonRpcError::internal_error()),
@@ -469,7 +535,7 @@ pub fn run_server(
     let tips1 = tips.clone();
     let l1 = listen.clone();
 
-	// set up some rpc endpoints
+    // set up some rpc endpoints
     let t1 = thread::spawn(move || {
         let mut io = IoHandler::new();
         io.add_sync_method("get_tips", move |params: Params| {
@@ -525,7 +591,7 @@ pub fn run_server(
         HashMap::<&str, Vec<Sender<ScannerMessage>>>::default(),
     ));
     let subscriptions2 = subscriptions.clone();
-	// listener thread for notifications from forkscanner
+    // listener thread for notifications from forkscanner
     let t2 = thread::spawn(move || loop {
         match receiver.recv() {
             Ok(ScannerMessage::NewChaintip) => {
@@ -596,7 +662,7 @@ pub fn run_server(
         let killer_clone3 = killers.clone();
         let pool3 = pool2.clone();
         let subscriptions2 = subscriptions.clone();
-		// ws subscription endpoint for fork notifications
+        // ws subscription endpoint for fork notifications
         io.add_subscription(
             "forks",
             (

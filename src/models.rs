@@ -13,7 +13,7 @@ use crate::schema::{
 };
 use crate::MinerPoolInfo;
 
-fn serde_bigdecimal<S>(decimal: &Option<BigDecimal>, s: S) -> Result<S::Ok, S::Error>
+pub fn serde_bigdecimal<S>(decimal: &Option<BigDecimal>, s: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
@@ -306,7 +306,7 @@ impl FeeRate {
     }
 }
 
-#[derive(AsChangeset, QueryableByName, Queryable, Insertable)]
+#[derive(Debug, AsChangeset, QueryableByName, Queryable, Insertable)]
 #[table_name = "block_templates"]
 pub struct BlockTemplate {
     pub parent_block_hash: String,
@@ -504,7 +504,7 @@ impl SoftForks {
     }
 }
 
-#[derive(Clone, Serialize, AsChangeset, QueryableByName, Queryable, Insertable)]
+#[derive(Debug, Clone, Serialize, AsChangeset, QueryableByName, Queryable, Insertable)]
 #[table_name = "blocks"]
 pub struct Block {
     pub hash: String,

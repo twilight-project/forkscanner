@@ -452,12 +452,14 @@ fn create_block_and_ancestors<BC: BtcClient>(
                 }
             }
 
-            if pool.is_none() {
-                error!("Missing coinbase info!");
-                return Err(ForkScannerError::InvalidCoinbase);
-            }
-
-            let pool = pool.unwrap();
+            let pool_name = if pool.is_none() {
+                let cbm = coinbase_message.clone().unwrap_or(b"NONE".to_vec());
+                let name = format!("{:X?}", cbm);
+                error!("Missing coinbase info! Your mining pool info may be out of date. Coinbase message is {:?}", name);
+                name
+            } else {
+                pool.unwrap().name
+            };
 
             let mut amount = 0;
             for vout in coinbase_info.vout.iter() {
@@ -469,7 +471,7 @@ fn create_block_and_ancestors<BC: BtcClient>(
             let total_fee = (BigDecimal::from(amount) - max_inflation) / SATOSHI_TO_BTC;
 
             block.txids = Some(hash_bytes);
-            block.pool_name = Some(pool.name);
+            block.pool_name = Some(pool_name);
             block.total_fee = Some(total_fee);
             block.coinbase_message = coinbase_message;
             if let Err(e) = block.update(&conn) {
@@ -705,6 +707,8 @@ impl<BC: BtcClient> ForkScanner<BC> {
                 let total = BigDecimal::from(template.coinbase_value.as_sat())
                     - calc_max_inflation(height).expect("Could not get max_inflation")
                         / SATOSHI_TO_BTC;
+
+                // Create new db entry for the template
                 if let Err(e) = BlockTemplate::create(
                     &self.db_conn,
                     parent,
@@ -732,6 +736,7 @@ impl<BC: BtcClient> ForkScanner<BC> {
         for tip in tips {
             let hash = tip.hash.to_string();
 
+            // In all cases, try to fetch ancestor blocks as well.
             match tip.status {
                 GetChainTipsResultStatus::HeadersOnly => {
                     match create_block_and_ancestors(client, &self.db_conn, true, &hash, node.id) {
@@ -1166,7 +1171,7 @@ impl<BC: BtcClient> ForkScanner<BC> {
         }
 
         // Now try to fill in missing blocks,
-		// check inflation, do rollbacks, and stale candidates.
+        // check inflation, do rollbacks, and stale candidates.
         self.find_missing_blocks();
         self.inflation_checks();
         self.rollback_checks();
@@ -1851,6 +1856,7 @@ impl<BC: BtcClient> ForkScanner<BC> {
         let short = HashSet::<_>::from_iter(short_tx_ids.into_iter());
         let long = HashSet::<_>::from_iter(long_tx_ids.into_iter());
 
+        info!("Checking TX differences");
         if short.len() < long.len() {
             Some(short.difference(&long).cloned().collect())
         } else {
@@ -1872,6 +1878,7 @@ impl<BC: BtcClient> ForkScanner<BC> {
                 _ => return,
             };
 
+        info!("{} stale candidates", candidates.len());
         for candidate in candidates.iter() {
             match Block::count_at_height(&self.db_conn, candidate.height - 1) {
                 Ok(ct) if ct > 1 => continue,
