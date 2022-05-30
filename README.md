@@ -1,6 +1,6 @@
 # Fork Scanner
 
-Forkscannern is a tool designed to actively monitors bitcoin chain and keeps track of the following.
+Forkscanner is a tool designed to actively monitor bitcoin chain and keeps track of the following.
 
 - Chain forks
 - Double spent transactions
