@@ -690,7 +690,7 @@ algorithm will run for each of the 3 latest stale candidates mentioned above.
 
 
 
-##Specification For Inflation Checks##
+## Specification For Inflation Checks
 
 This part of the specs monitors inflation and keeps a track of miner rewards for each block mined. this should update our inflated blocks table and should add the blocks where inflation happened. This feature will be implemented in 2 steps mentioned below.
 
@@ -704,7 +704,7 @@ we will also need to add 2 more data models. Schema for which will be shared lat
 
 
 
-###Service to get a list of nodes.###
+### Service to get a list of nodes.
 
 
 We are maintaining a list of nodes we pick up all nodes from there and run a loop with below mentioned specifications.
@@ -721,7 +721,7 @@ We are maintaining a list of nodes we pick up all nodes from there and run a loo
 - Then we run a new thread for each node and call check_inflation_for_node (explained below) method
 
 
-###Check Inflation on each Node.###
+### Check Inflation on each Node.
 
 This method is where we check inflation on each node, please note that it is supposed to be run as a separate thread for each node to ensure real-time calculations. This method also relies on gettxoutsetinfo RPC call.  
 
@@ -756,7 +756,7 @@ This method is where we check inflation on each node, please note that it is sup
 - Turn the p2p networking back on.
 
 
-##Specification For Fee Calculation##
+## Specification For Fee Calculation.
 
 This part of the fork scanner will investigate which miner pool mined a block and how much fee was charged. It’s a 2 step process.
 
@@ -764,7 +764,7 @@ This part of the fork scanner will investigate which miner pool mined a block an
 - Perform calculation and update blocks in DB.
 
 
-###Update the pool table in DB.###
+### Update the pool table in DB.
 
 We will need to create a new DB table called pool for this. Schema is shared below.
 
@@ -773,7 +773,7 @@ We will need to create a new DB table called pool for this. Schema is shared bel
 https://raw.githubusercontent.com/0xB10C/known-mining-pools/master/pools.json
 
 
-###Perform Calculations.###
+### Perform Calculations.
 
 
 To begin with we will need a list of blocks current height to a specific depth (suggested limit is 10). Run a loop on each block and perform the below mentioned steps.
@@ -802,14 +802,14 @@ To begin with we will need a list of blocks current height to a specific depth (
 - Update the block in DB.
 
 
-##Specification For Process Template##
+## Specification For Process Template.
 
 Template processing is a two-step process
 
 - Retrieve block templates.
 - Process block templates.
 
-###Retrieve block templates.###
+### Retrieve block templates.
 
 This is a straightforward service which simply queries the Node using getblocktemplate RPC call and retrieves block template from the node and saves it in the block template table in the DB, (Schema is shared below). Please not that we retrieve template repeatedly from all nodes we are connected to. 
 
@@ -824,7 +824,7 @@ Consider the following while adding template in DB
 - Fee_total  =  template[“ coinbasevalue”] – max_inflation at this template[“height”]. Convert to satoshies before saving. Also max inflation can be calculated using the steps mentioned above (under **check inflation for each node**)
 
 
-###Process Block Templates.###
+### Process Block Templates.
 
 This is where we process the templates we retrieved in previous step. 
 
@@ -841,7 +841,7 @@ This is where we process the templates we retrieved in previous step.
    - Update the blocks table accordingly.
 
 
-###Soft Fork Processing###
+### Soft Fork Processing
 
 This part of the code simply keeps a track of soft forks that have occurred uptil now. Simply query the bitcoin node with get_block_chain_info RPC call. In the result we will have information for all softforks. Create or update the entries in DB accordingly. Do this for each connected node.
 
