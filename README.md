@@ -25,11 +25,29 @@ This needs to be run on a node with bitcoin running.
 `cargo run`
 
 ## RPC endpoints
+```
 - `get_tips`: params { active_only: bool }
+  Fetch the list of current chaintips, if active_only is set it will be only the active tips.
+
 - `add_node`: params { name: string, rpc_host: string, rpc_port: int, mirror_rpc_port: int, user: string, pass: string }
+  Add a node to forkscanner's list of nodes to query.
+
 - `remove_node`: { id: int }
+  Removes a node from forkscanner's list.
+
 - `get_block`: params { hash: string } OR { height: int } 
+  Get a block by hash or height.
+
+- `get_block_from_peer`: params { node_id: int, hash: string, peer_id: int } 
+  Fetch a block from a specified node.
+
 - `tx_is_active`: params: { id: string }
+  Query whether transaction is in active branch.
+```
+
+### WS notification endpoints
+- `validation_checks`: subscribe to this to get difference info between active tip and stale blocks.
+- `forks`: subscribe to this to get notifications of a new fork.
 
 ### POST example:
 `get_tips`: POST '{"method": "get_tips", "params": { "active_only": false }, "jsonrpc": "2.0", "id" 1}'

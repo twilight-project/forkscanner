@@ -417,7 +417,20 @@ fn create_block_and_ancestors<BC: BtcClient>(
         let bh = client.get_block_header_info(&hash)?;
         let mut block = Block::get_or_create(&conn, headers_only, node_id, &bh)?;
 
-        let GetBlockResult { tx, .. } = client.get_block_info(&hash)?;
+        if block.connected {
+            break;
+        }
+
+        // working with a pruned node, we'll get a BLOCK_NOT_ON_DISK message, this is okay.
+        let GetBlockResult { tx, .. } = match client.get_block_info(&hash) {
+            Ok(block) => block,
+            Err(BitcoinRpcError::JsonRpc(JsonRpcError::Rpc(RpcError { code, .. })))
+                if code == BLOCK_NOT_ON_DISK =>
+            {
+                return Ok(());
+            }
+            Err(e @ _) => return Err(e.into()),
+        };
         if let Some((coinbase_tx, rest_txs)) = tx.split_first() {
             let coinbase_info = client.get_raw_transaction_info(&coinbase_tx, Some(&hash))?;
 
@@ -479,10 +492,6 @@ fn create_block_and_ancestors<BC: BtcClient>(
             }
         } else {
             warn!("No coinbase tx in block!");
-        }
-
-        if block.connected {
-            break;
         }
 
         match block.parent_hash {
@@ -684,6 +693,7 @@ impl<BC: BtcClient> ForkScanner<BC> {
 
     // fetch block templates and calculate fee rates.
     fn fetch_block_templates(&self, client: &BC, node: &Node) {
+        info!("Block templates from {}", node.id);
         match client.get_block_template(
             GetBlockTemplateModes::Template,
             &[GetBlockTemplateRules::SegWit],
@@ -733,6 +743,7 @@ impl<BC: BtcClient> ForkScanner<BC> {
         let tips = client.get_chain_tips()?;
 
         let mut changed = false;
+        info!("Node {} has {} chaintips to process", node.id, tips.len());
         for tip in tips {
             let hash = tip.hash.to_string();
 
@@ -1045,12 +1056,14 @@ impl<BC: BtcClient> ForkScanner<BC> {
 
         // update the API server of chaintip updates
         if changed {
+            info!("Sending chaintip notifications");
             self.notify_tx
                 .send(ScannerMessage::NewChaintip)
                 .expect("Channel closed");
         }
 
         // get min height block template, and blocks with no fee diffs yet.
+        info!("Fecthing block templates");
         match BlockTemplate::get_min(&self.db_conn) {
             Ok(Some(min_template)) => {
                 if let Ok(blocks) = Block::get_with_fee_no_diffs(&self.db_conn, min_template) {
@@ -1456,6 +1469,7 @@ impl<BC: BtcClient> ForkScanner<BC> {
     }
 
     fn process_stale_candidates(&self) {
+        info!("Processing stale candidates");
         // Find top 3.
         let candidates = match StaleCandidate::top_n(&self.db_conn, 3) {
             Ok(c) => c,
@@ -2195,6 +2209,10 @@ impl<BC: BtcClient> ForkScanner<BC> {
             }
         };
 
+        info!(
+            "There are {} headers only blocks to fetch",
+            headers_only_blocks.len()
+        );
         let mut gbfp_blocks = vec![];
         for mut block in headers_only_blocks.drain(..) {
             let originally_seen = block.first_seen_by;
