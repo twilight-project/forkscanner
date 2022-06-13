@@ -644,7 +644,7 @@ impl<BC: BtcClient> ScannerClient<BC> {
 
 /// The main forkscanner struct. This maintains a list of bitcoin nodes to connect to,
 /// and db connection to record chain info.
-pub struct ForkScanner<BC: BtcClient> {
+pub struct ForkScanner<BC: BtcClient + std::fmt::Debug> {
     node_list: Vec<Node>,
     clients: Vec<ScannerClient<BC>>,
     db_conn: PgConnection,
@@ -652,7 +652,7 @@ pub struct ForkScanner<BC: BtcClient> {
     command: Receiver<ScannerCommand>,
 }
 
-impl<BC: BtcClient> ForkScanner<BC> {
+impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
     pub fn new(
         db_conn: PgConnection,
     ) -> ForkScannerResult<(
@@ -671,6 +671,7 @@ impl<BC: BtcClient> ForkScanner<BC> {
                 Some(port) => Some(format!("http://{}:{}", node.rpc_host, port)),
                 None => None,
             };
+			info!("Connecting to bitcoin client: {}, Mirror: {:?}", host, mirror_host);
             let client = ScannerClient::new(node.id, host, mirror_host, auth)?;
             clients.push(client);
         }
@@ -1033,13 +1034,14 @@ impl<BC: BtcClient> ForkScanner<BC> {
         let mut changed = false;
         for (client, node) in self.clients.iter().zip(&self.node_list) {
             if let Ok(info) = client.client().get_blockchain_info() {
+			    info!("Got blockchain info");
                 if let Err(e) =
                     SoftForks::update_or_insert(&self.db_conn, client.node_id, info.softforks)
                 {
                     error!("Softfork update failed: {:?}", e);
                 }
             } else {
-                error!("Failed to fetch blockchain info!");
+                error!("Failed to fetch blockchain info from {:?}!", client.client());
             }
 
             self.fetch_block_templates(client.client(), node);
