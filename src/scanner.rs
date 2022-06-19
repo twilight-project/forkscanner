@@ -468,7 +468,7 @@ fn create_block_and_ancestors<BC: BtcClient>(
             let pool_name = if pool.is_none() {
                 let cbm = coinbase_message.clone().unwrap_or(b"NONE".to_vec());
                 let name = format!("{:X?}", cbm);
-                error!("Missing coinbase info! Your mining pool info may be out of date. Coinbase message is {:?}", name);
+                warn!("Missing coinbase info! Your mining pool info may be out of date. Coinbase message is {:?}", name);
                 name
             } else {
                 pool.unwrap().name
@@ -671,7 +671,10 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
                 Some(port) => Some(format!("http://{}:{}", node.rpc_host, port)),
                 None => None,
             };
-			info!("Connecting to bitcoin client: {}, Mirror: {:?}", host, mirror_host);
+            info!(
+                "Connecting to bitcoin client: {}, Mirror: {:?}",
+                host, mirror_host
+            );
             let client = ScannerClient::new(node.id, host, mirror_host, auth)?;
             clients.push(client);
         }
@@ -1034,14 +1037,17 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
         let mut changed = false;
         for (client, node) in self.clients.iter().zip(&self.node_list) {
             if let Ok(info) = client.client().get_blockchain_info() {
-			    info!("Got blockchain info");
+                info!("Got blockchain info");
                 if let Err(e) =
                     SoftForks::update_or_insert(&self.db_conn, client.node_id, info.softforks)
                 {
                     error!("Softfork update failed: {:?}", e);
                 }
             } else {
-                error!("Failed to fetch blockchain info from {:?}!", client.client());
+                error!(
+                    "Failed to fetch blockchain info from {:?}!",
+                    client.client()
+                );
             }
 
             self.fetch_block_templates(client.client(), node);

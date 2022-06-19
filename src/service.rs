@@ -98,6 +98,53 @@ struct ValidationCheck {
     stale_height: i64,
     height_difference: i64,
     stale_timestamp: DateTime<Utc>,
+    stale_branch_len: i64,
+    stale_branch_root: String,
+}
+
+impl ValidationCheck {
+    pub fn new_candidate(
+        conn: &Conn,
+        tip: &Chaintip,
+        candidate: &StaleCandidate,
+        candidate_hash: String,
+    ) -> Option<ValidationCheck> {
+        if tip.height <= candidate.height {
+            return None;
+        }
+
+        let mut block1 = Block::get(conn, &tip.block.to_string()).ok()?;
+
+        while block1.height > candidate.height {
+            block1 = block1.parent(conn).ok()?;
+        }
+
+        let (stale_branch_len, stale_branch_root) = if &block1.hash == &candidate_hash {
+            (0, candidate_hash.clone())
+        } else {
+            loop {
+                block1 = block1.parent(conn).ok()?;
+
+                let desc = block1.descendants(conn, None).ok()?;
+
+                let fork = desc.into_iter().find(|b| &b.hash == &candidate_hash);
+
+                if let Some(_) = fork {
+                    break (candidate.height - block1.height, block1.hash.clone());
+                }
+            }
+        };
+
+        Some(ValidationCheck {
+            tip: tip.block.clone(),
+            tip_height: tip.height,
+            height_difference: tip.height - candidate.height,
+            stale_height: candidate.height,
+            stale_timestamp: candidate.created_at,
+            stale_branch_len,
+            stale_branch_root,
+        })
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -176,12 +223,15 @@ fn validation_checks(conn: Conn, window: i64) -> Result<Value> {
                 StaleCandidate::list_ge(&conn, tip.height - window).unwrap_or_default();
             candidates
                 .into_iter()
-                .map(|candidate| ValidationCheck {
-                    tip: tip.block.clone(),
-                    tip_height: tip.height,
-                    height_difference: tip.height - candidate.height,
-                    stale_height: candidate.height,
-                    stale_timestamp: candidate.created_at,
+                .flat_map(|candidate| {
+                    let blocks = Block::get_at_height(&conn, candidate.height).unwrap_or_default();
+
+                    blocks
+                        .into_iter()
+                        .filter_map(|b| {
+                            ValidationCheck::new_candidate(&conn, &tip, &candidate, b.hash)
+                        })
+                        .collect::<Vec<ValidationCheck>>()
                 })
                 .collect::<Vec<ValidationCheck>>()
         })
