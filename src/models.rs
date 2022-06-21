@@ -1,15 +1,31 @@
-use bitcoincore_rpc::bitcoincore_rpc_json::GetBlockHeaderResult;
+use bigdecimal::BigDecimal;
+use bitcoincore_rpc::bitcoincore_rpc_json::{GetBlockHeaderResult, Softfork};
 use chrono::prelude::*;
 use diesel::prelude::*;
 use diesel::result::QueryResult;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
+use std::collections::HashMap;
 
 use crate::schema::{
-    blocks, chaintips, double_spent_by, invalid_blocks, nodes, peers, rbf_by, stale_candidate,
-    stale_candidate_children, transaction, valid_blocks,
+    block_templates, blocks, chaintips, double_spent_by, fee_rates, inflated_blocks,
+    invalid_blocks, nodes, peers, pool, rbf_by, softforks, stale_candidate,
+    stale_candidate_children, transaction, tx_outsets, valid_blocks,
 };
+use crate::MinerPoolInfo;
 
-#[derive(Clone, Deserialize, Serialize, Debug, AsChangeset, QueryableByName, Queryable, Insertable)]
+pub fn serde_bigdecimal<S>(decimal: &Option<BigDecimal>, s: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match *decimal {
+        Some(ref d) => s.serialize_some(&d.to_string()),
+        None => s.serialize_none(),
+    }
+}
+
+#[derive(
+    Clone, Deserialize, Serialize, Debug, AsChangeset, QueryableByName, Queryable, Insertable,
+)]
 #[table_name = "chaintips"]
 pub struct Chaintip {
     pub id: i64,
@@ -176,7 +192,319 @@ pub struct Height {
     pub height: i64,
 }
 
-#[derive(Serialize, AsChangeset, QueryableByName, Queryable, Insertable)]
+#[derive(Debug, AsChangeset, QueryableByName, Queryable, Insertable)]
+#[table_name = "pool"]
+pub struct Pool {
+    pub tag: String,
+    pub name: String,
+    pub url: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl Pool {
+    pub fn create_or_update_batch(
+        conn: &PgConnection,
+        pool_info: MinerPoolInfo,
+    ) -> QueryResult<usize> {
+        use crate::schema::pool::dsl::*;
+
+        let MinerPoolInfo { coinbase_tags, .. } = pool_info;
+        let mut pools = Vec::new();
+
+        for (key, value) in coinbase_tags.into_iter() {
+            pools.push(Pool {
+                tag: key,
+                name: value.name,
+                url: value.link,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            });
+        }
+        diesel::insert_into(pool)
+            .values(pools)
+            .on_conflict((tag, name, url))
+            .do_update()
+            .set(updated_at.eq(Utc::now()))
+            .execute(conn)
+    }
+
+    pub fn list(conn: &PgConnection) -> QueryResult<Vec<Pool>> {
+        use crate::schema::pool::dsl::*;
+        pool.load(conn)
+    }
+}
+
+#[derive(AsChangeset, QueryableByName, Queryable, Insertable)]
+#[table_name = "inflated_blocks"]
+pub struct InflatedBlock {
+    block_hash: String,
+    max_inflation: BigDecimal,
+    actual_inflation: BigDecimal,
+    notified_at: DateTime<Utc>,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+    node_id: i64,
+    dismissed_at: Option<DateTime<Utc>>,
+}
+
+impl InflatedBlock {
+    pub fn create(
+        conn: &PgConnection,
+        id: i64,
+        block: &Block,
+        max: BigDecimal,
+        actual: BigDecimal,
+    ) -> QueryResult<usize> {
+        use crate::schema::inflated_blocks::dsl::*;
+        let ib = InflatedBlock {
+            block_hash: block.hash.clone(),
+            max_inflation: max,
+            actual_inflation: actual,
+            notified_at: Utc::now(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            node_id: id,
+            dismissed_at: None,
+        };
+        diesel::insert_into(inflated_blocks)
+            .values(ib)
+            .execute(conn)
+    }
+}
+
+#[derive(Clone, AsChangeset, QueryableByName, Queryable, Insertable)]
+#[table_name = "fee_rates"]
+pub struct FeeRate {
+    pub parent_block_hash: String,
+    pub node_id: i64,
+    pub fee_rate: i32,
+    pub omitted: bool,
+}
+
+impl FeeRate {
+    pub fn list_by(conn: &PgConnection, parent: String, node: i64) -> QueryResult<Vec<FeeRate>> {
+        use crate::schema::fee_rates::dsl::*;
+
+        fee_rates
+            .filter(parent_block_hash.eq(parent).and(node_id.eq(node)))
+            .load(conn)
+    }
+
+    pub fn update(&self, conn: &PgConnection) -> QueryResult<usize> {
+        use crate::schema::fee_rates::dsl::*;
+        diesel::update(
+            fee_rates.filter(
+                parent_block_hash
+                    .eq(&self.parent_block_hash)
+                    .and(node_id.eq(self.node_id))
+                    .and(fee_rate.eq(self.fee_rate)),
+            ),
+        )
+        .set(self)
+        .execute(conn)
+    }
+}
+
+#[derive(Debug, AsChangeset, QueryableByName, Queryable, Insertable)]
+#[table_name = "block_templates"]
+pub struct BlockTemplate {
+    pub parent_block_hash: String,
+    pub node_id: i64,
+    pub fee_total: BigDecimal,
+    pub ts: DateTime<Utc>,
+    pub height: i64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub n_transactions: i32,
+    pub tx_ids: Vec<u8>,
+    pub lowest_fee_rate: i32,
+}
+
+impl BlockTemplate {
+    pub fn create(
+        conn: &PgConnection,
+        parent: String,
+        node: i64,
+        total: BigDecimal,
+        block_height: i64,
+        n_txs: i32,
+        txids: Vec<u8>,
+        rates: Vec<i32>,
+    ) -> QueryResult<usize> {
+        use crate::schema::block_templates::dsl as btd;
+        use crate::schema::fee_rates::dsl as frd;
+
+        let lowest = *rates.iter().min().expect("No transaction fees!");
+        let fee_rates: Vec<_> = rates
+            .into_iter()
+            .map(|rate| FeeRate {
+                parent_block_hash: parent.clone(),
+                node_id: node,
+                fee_rate: rate,
+                omitted: false,
+            })
+            .collect();
+
+        let tpl = BlockTemplate {
+            parent_block_hash: parent,
+            node_id: node,
+            fee_total: total,
+            ts: Utc::now(),
+            height: block_height,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            n_transactions: n_txs,
+            tx_ids: txids,
+            lowest_fee_rate: lowest,
+        };
+
+        diesel::insert_into(btd::block_templates)
+            .values(tpl)
+            .on_conflict_do_nothing()
+            .execute(conn)?;
+
+        diesel::insert_into(frd::fee_rates)
+            .values(fee_rates)
+            .on_conflict_do_nothing()
+            .execute(conn)
+    }
+
+    pub fn purge(conn: &PgConnection) -> QueryResult<usize> {
+        use crate::schema::block_templates::dsl::*;
+
+        diesel::delete(block_templates).execute(conn)
+    }
+
+    pub fn get_min(conn: &PgConnection) -> QueryResult<Option<i64>> {
+        use crate::schema::block_templates::dsl::*;
+        use diesel::dsl::min;
+
+        block_templates.select(min(height)).first(conn)
+    }
+
+    pub fn get_with_txs(conn: &PgConnection, block_height: i64) -> QueryResult<BlockTemplate> {
+        use crate::schema::block_templates::dsl::*;
+
+        block_templates.filter(height.eq(block_height)).first(conn)
+    }
+}
+
+#[derive(AsChangeset, QueryableByName, Queryable, Insertable)]
+#[table_name = "tx_outsets"]
+pub struct TxOutset {
+    pub block_hash: String,
+    pub node_id: i64,
+    pub txouts: i64,
+    pub total_amount: BigDecimal,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub inflated: bool,
+}
+
+impl TxOutset {
+    pub fn get(conn: &PgConnection, block: &String, node: i64) -> QueryResult<Option<TxOutset>> {
+        use crate::schema::tx_outsets::dsl::*;
+        let result = tx_outsets
+            .filter(block_hash.eq(block).and(node_id.eq(node)))
+            .get_result(conn);
+
+        match result {
+            Err(diesel::result::Error::NotFound) => Ok(None),
+            Ok(ans) => Ok(Some(ans)),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn create(
+        conn: &PgConnection,
+        tx_outs: u64,
+        amount: BigDecimal,
+        block: &String,
+        node: i64,
+    ) -> QueryResult<TxOutset> {
+        use crate::schema::tx_outsets::dsl::*;
+        let outset = TxOutset {
+            block_hash: block.clone(),
+            node_id: node,
+            txouts: tx_outs as i64,
+            total_amount: amount,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            // TODO: this
+            inflated: false,
+        };
+        diesel::insert_into(tx_outsets)
+            .values(outset)
+            .get_result(conn)
+    }
+
+    pub fn update(&self, conn: &PgConnection) -> QueryResult<usize> {
+        use crate::schema::tx_outsets::dsl::*;
+        diesel::update(
+            tx_outsets.filter(
+                block_hash
+                    .eq(&self.block_hash)
+                    .and(node_id.eq(self.node_id)),
+            ),
+        )
+        .set(self)
+        .execute(conn)
+    }
+}
+
+#[derive(Clone, AsChangeset, QueryableByName, Queryable, Insertable)]
+#[table_name = "softforks"]
+pub struct SoftForks {
+    pub node_id: i64,
+    pub fork_type: i32,
+    pub name: String,
+    pub bit: Option<i32>,
+    pub status: i32,
+    pub since: Option<i64>,
+    pub notified_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl SoftForks {
+    pub fn update_or_insert(
+        conn: &PgConnection,
+        node: i64,
+        forks: HashMap<String, Softfork>,
+    ) -> QueryResult<()> {
+        use crate::schema::softforks::dsl::*;
+
+        for (key, info) in forks.into_iter() {
+            let b = if let Some(b9) = info.bip9 {
+                b9.bit.map(|b| b as i32)
+            } else {
+                None
+            };
+
+            let sf = SoftForks {
+                node_id: node,
+                fork_type: info.type_ as i32,
+                name: key,
+                bit: b,
+                status: info.active as i32,
+                since: info.height.map(|k| k as i64),
+                notified_at: Utc::now(),
+                updated_at: Utc::now(),
+                created_at: Utc::now(),
+            };
+            diesel::insert_into(softforks)
+                .values(&sf)
+                .on_conflict((node_id, fork_type, name))
+                .do_update()
+                .set(&sf)
+                .execute(conn)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, AsChangeset, QueryableByName, Queryable, Insertable)]
 #[table_name = "blocks"]
 pub struct Block {
     pub hash: String,
@@ -186,9 +514,40 @@ pub struct Block {
     pub first_seen_by: i64,
     pub headers_only: bool,
     pub work: String,
+    pub txids: Option<Vec<u8>>,
+    pub txids_added: Option<Vec<u8>>,
+    pub txids_omitted: Option<Vec<u8>>,
+    pub pool_name: Option<String>,
+    #[serde(serialize_with = "serde_bigdecimal")]
+    pub template_txs_fee_diff: Option<BigDecimal>,
+    #[serde(serialize_with = "serde_bigdecimal")]
+    pub tx_omitted_fee_rates: Option<BigDecimal>,
+    #[serde(serialize_with = "serde_bigdecimal")]
+    pub lowest_template_fee_rate: Option<BigDecimal>,
+    #[serde(serialize_with = "serde_bigdecimal")]
+    pub total_fee: Option<BigDecimal>,
+    pub coinbase_message: Option<Vec<u8>>,
 }
 
 impl Block {
+    pub fn get_latest(conn: &PgConnection) -> QueryResult<Block> {
+        use crate::schema::blocks::dsl::*;
+        blocks.order_by(height.desc()).first(conn)
+    }
+
+    pub fn get_with_fee_no_diffs(conn: &PgConnection, min_height: i64) -> QueryResult<Vec<Block>> {
+        use crate::schema::blocks::dsl::*;
+
+        blocks
+            .filter(
+                height
+                    .gt(min_height)
+                    .and(template_txs_fee_diff.is_null())
+                    .and(total_fee.is_not_null()),
+            )
+            .load(conn)
+    }
+
     pub fn get(conn: &PgConnection, block_hash: &String) -> QueryResult<Block> {
         use crate::schema::blocks::dsl::*;
         blocks.find(block_hash).first(conn)
@@ -220,8 +579,11 @@ impl Block {
     pub fn find_stale_candidates(conn: &PgConnection, height: i64) -> QueryResult<Vec<Height>> {
         let raw_query = format!(
             "
-            SELECT height FROM blocks
+            SELECT height FROM blocks as b
+			LEFT JOIN invalid_blocks as ib
+			ON b.hash = ib.hash
             WHERE height > {}
+			AND ib.node IS NULL
             GROUP BY height
             HAVING count(height) > 1
             ORDER BY height ASC
@@ -346,6 +708,15 @@ impl Block {
                     headers_only,
                     first_seen_by,
                     work: hex::encode(&header.chainwork),
+                    template_txs_fee_diff: None,
+                    txids: None,
+                    txids_added: None,
+                    txids_omitted: None,
+                    pool_name: None,
+                    total_fee: None,
+                    coinbase_message: None,
+                    tx_omitted_fee_rates: None,
+                    lowest_template_fee_rate: None,
                 };
 
                 conn.transaction::<usize, diesel::result::Error, _>(|| {
@@ -386,8 +757,8 @@ impl Block {
 
         diesel::insert_into(valid_blocks)
             .values(block)
-			.on_conflict((hash, node))
-			.do_nothing()
+            .on_conflict((hash, node))
+            .do_nothing()
             .execute(conn)
     }
 
@@ -585,9 +956,15 @@ pub struct StaleCandidate {
     pub double_spent_in_one_branch_total: f64,
     pub rbf_total: f64,
     pub height_processed: Option<i64>,
+    pub created_at: DateTime<Utc>,
 }
 
 impl StaleCandidate {
+    pub fn list_ge(conn: &PgConnection, block_height: i64) -> QueryResult<Vec<StaleCandidate>> {
+        use crate::schema::stale_candidate::dsl::*;
+        stale_candidate.filter(height.ge(block_height)).load(conn)
+    }
+
     pub fn get(conn: &PgConnection, candidate: i64) -> QueryResult<StaleCandidate> {
         use crate::schema::stale_candidate::dsl::*;
         stale_candidate.find(candidate).first(conn)
@@ -660,6 +1037,7 @@ impl StaleCandidate {
             double_spent_in_one_branch_total: 0.,
             rbf_total: 0.,
             height_processed: None,
+            created_at: Utc::now(),
         };
 
         diesel::insert_into(stale_candidate)
@@ -676,7 +1054,7 @@ impl StaleCandidate {
     }
 }
 
-#[derive(QueryableByName, Queryable, Insertable)]
+#[derive(AsChangeset, QueryableByName, Queryable, Insertable)]
 #[table_name = "nodes"]
 pub struct Node {
     pub id: i64,
@@ -687,6 +1065,8 @@ pub struct Node {
     pub rpc_user: String,
     pub rpc_pass: String,
     pub unreachable_since: Option<DateTime<Utc>>,
+    pub last_polled: Option<DateTime<Utc>>,
+    pub initial_block_download: bool,
 }
 
 impl Node {
@@ -703,6 +1083,26 @@ impl Node {
     pub fn remove(conn: &PgConnection, node_id: i64) -> QueryResult<usize> {
         use crate::schema::nodes::dsl::*;
         diesel::delete(nodes).filter(id.eq(node_id)).execute(conn)
+    }
+
+    pub fn update(&self, conn: &PgConnection) -> QueryResult<usize> {
+        use crate::schema::nodes::dsl::*;
+        diesel::update(nodes.filter(id.eq(self.id)))
+            .set(self)
+            .execute(conn)
+    }
+
+    pub fn get_active_reachable(conn: &PgConnection) -> QueryResult<Vec<Node>> {
+        use crate::schema::nodes::dsl::*;
+        nodes
+            .filter(
+                mirror_rpc_port.is_not_null().and(
+                    initial_block_download
+                        .eq(false)
+                        .and(unreachable_since.is_null()),
+                ),
+            )
+            .load(conn)
     }
 
     pub fn insert(
