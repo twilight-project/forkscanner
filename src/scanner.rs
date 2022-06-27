@@ -2210,6 +2210,7 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
 
         let mut headers_only_blocks = match Block::headers_only(&self.db_conn, tip_height - 40_000)
         {
+            Ok(blocks) if blocks.len() == 0 => return,
             Ok(blocks) => blocks,
             Err(e) => {
                 error!("Header query failed {:?}", e);
@@ -2315,6 +2316,69 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
                 }
             }
             gbfp_blocks.push(block);
+        }
+
+        let client = self
+            .clients
+            .iter()
+            .filter(|c| c.mirror().is_some())
+            .next()
+            .unwrap();
+        let mirror = client.mirror().as_ref().unwrap();
+
+        let mut found_block = false;
+        for mut block in gbfp_blocks.into_iter() {
+            let hash = btc::BlockHash::from_str(&block.hash).unwrap();
+            match mirror.get_block_hex(&hash) {
+                Ok(block_hex) => {
+                    found_block = true;
+                    match mirror.get_block_header_info(&hash) {
+                        Ok(info) => {
+                            block.headers_only = false;
+                            block.work = hex::encode(info.chainwork);
+                            if let Err(e) = block.update(&self.db_conn) {
+                                error!("Could not clear headers flag {:?}", e);
+                            }
+                        }
+                        Err(e) => {
+                            error!("Error fetching block info! {:?}", e);
+                        }
+                    };
+
+                    match self
+                        .clients
+                        .iter()
+                        .filter(|c| c.node_id == block.first_seen_by)
+                        .next()
+                    {
+                        Some(client) => {
+                            if let Err(e) = client.client().submit_block(block_hex, &hash) {
+                                error!("Could not submit block to client! {:?}", e);
+                                continue;
+                            }
+                        }
+                        None => {
+                            error!("Could not find client that saw this block!");
+                            continue;
+                        }
+                    }
+                }
+                _ => continue,
+            }
+        }
+
+        if !found_block {
+            // disconnect all peers
+            match mirror.get_peer_info() {
+                Ok(peers) => {
+                    for peer in peers {
+                        let _ = mirror.disconnect_node(peer.id);
+                    }
+                }
+                Err(e) => {
+                    error!("No peers: {e:?}");
+                }
+            }
         }
     }
 }
