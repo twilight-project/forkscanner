@@ -1048,6 +1048,7 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
                     "Failed to fetch blockchain info from {:?}!",
                     client.client()
                 );
+				continue;
             }
 
             self.fetch_block_templates(client.client(), node);
