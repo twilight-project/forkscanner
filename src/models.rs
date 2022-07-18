@@ -2,13 +2,14 @@ use bigdecimal::BigDecimal;
 use bitcoincore_rpc::bitcoincore_rpc_json::{GetBlockHeaderResult, Softfork};
 use chrono::prelude::*;
 use diesel::prelude::*;
+use diesel::sql_types;
 use diesel::result::QueryResult;
 use serde::{Deserialize, Serialize, Serializer};
 use std::collections::HashMap;
 
 use crate::schema::{
     block_templates, blocks, chaintips, double_spent_by, fee_rates, inflated_blocks,
-    invalid_blocks, nodes, peers, pool, rbf_by, softforks, stale_candidate,
+    invalid_blocks, lags, nodes, peers, pool, rbf_by, softforks, stale_candidate,
     stale_candidate_children, transaction, tx_outsets, valid_blocks,
 };
 use crate::MinerPoolInfo;
@@ -753,6 +754,7 @@ impl Block {
         let block = ValidBlock {
             hash: block_hash.to_string(),
             node: node_id,
+			created_at: Some(Utc::now()),
         };
 
         diesel::insert_into(valid_blocks)
@@ -808,6 +810,7 @@ impl Block {
         let block = InvalidBlock {
             hash: block_hash.to_string(),
             node: node_id,
+			created_at: Some(Utc::now()),
         };
 
         diesel::insert_into(invalid_blocks)
@@ -1145,6 +1148,40 @@ impl Peer {}
 pub struct InvalidBlock {
     pub hash: String,
     pub node: i64,
+    pub created_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Serialize, QueryableByName)]
+pub struct ConflictingBlock {
+    #[sql_type = "sql_types::Text"]
+    pub hash: String,
+    #[sql_type = "sql_types::Array<sql_types::BigInt>"]
+	pub valid_by: Vec<i64>,
+    #[sql_type = "sql_types::Array<sql_types::BigInt>"]
+	pub invalid_by: Vec<i64>,
+}
+
+impl InvalidBlock {
+    pub fn get_recent_conflicts(conn: &PgConnection) -> QueryResult<Vec<ConflictingBlock>> {
+	    let raw_query = format!(
+            "
+			SELECT hash, array_agg(distinct valid_by) as valid_by, array_agg(distinct invalid_by) as invalid_by
+			FROM (
+				SELECT
+					ivb.hash as hash,
+					vb.node as valid_by,
+					ivb.node as invalid_by
+				FROM valid_blocks as vb
+				INNER JOIN invalid_blocks as ivb
+				ON vb.hash = ivb.hash
+				WHERE ivb.created_at > now() - interval '15 minutes'
+			) q
+			GROUP BY hash
+        ",
+        );
+
+        diesel::sql_query(raw_query).load(conn)
+    }
 }
 
 #[derive(QueryableByName, Queryable, Insertable)]
@@ -1152,4 +1189,46 @@ pub struct InvalidBlock {
 pub struct ValidBlock {
     pub hash: String,
     pub node: i64,
+    pub created_at: Option<DateTime<Utc>>,
+}
+
+
+#[derive(Clone, Serialize, QueryableByName, Queryable, Insertable)]
+#[table_name = "lags"]
+pub struct Lags {
+	pub node_id: i64,
+    pub created_at: DateTime<Utc>,
+    pub deleted_at: Option<DateTime<Utc>>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl Lags {
+    pub fn purge(conn: &PgConnection) -> QueryResult<usize> {
+        use crate::schema::lags::dsl::*;
+        diesel::delete(lags)
+            .execute(conn)
+    }
+
+    pub fn insert(
+        conn: &PgConnection,
+        id: i64,
+    ) -> QueryResult<usize> {
+        use crate::schema::lags::dsl::*;
+
+		let lag = Lags {
+		    node_id: id,
+			created_at: Utc::now(),
+			deleted_at: None,
+			updated_at: Utc::now(),
+		};
+
+        diesel::insert_into(lags)
+            .values(lag)
+            .execute(conn)
+    }
+
+	pub fn list(conn: &PgConnection) -> QueryResult<Vec<Lags>> {
+        use crate::schema::lags::dsl::*;
+        lags.load(conn)
+	}
 }

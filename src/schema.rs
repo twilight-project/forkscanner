@@ -80,6 +80,16 @@ diesel::table! {
     invalid_blocks (hash, node) {
         hash -> Varchar,
         node -> Int8,
+        created_at -> Nullable<Timestamptz>,
+    }
+}
+
+diesel::table! {
+    lags (node_id, created_at, updated_at) {
+        node_id -> Int8,
+        created_at -> Timestamptz,
+        deleted_at -> Nullable<Timestamptz>,
+        updated_at -> Timestamptz,
     }
 }
 
@@ -186,10 +196,12 @@ diesel::table! {
     valid_blocks (hash, node) {
         hash -> Varchar,
         node -> Int8,
+        created_at -> Nullable<Timestamptz>,
     }
 }
 
 diesel::joinable!(inflated_blocks -> blocks (block_hash));
+diesel::joinable!(lags -> nodes (node_id));
 diesel::joinable!(peers -> nodes (node_id));
 diesel::joinable!(softforks -> nodes (node_id));
 diesel::joinable!(stale_candidate_children -> stale_candidate (candidate_height));
@@ -204,6 +216,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     fee_rates,
     inflated_blocks,
     invalid_blocks,
+    lags,
     nodes,
     peers,
     pool,

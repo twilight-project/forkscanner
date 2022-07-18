@@ -59,6 +59,8 @@ Example usage of these endpoints can be found in `./scripts/subscribe-test`:
 
 - `validation_checks`: subscribe to this to get difference info between active tip and stale blocks.
 - `subscribe_forks`: subscribe to this to get notifications of a new fork.
+- `invalid_block_checks`: subscribe to this to get notifications of invalid blocks.
+- `lagging_nodes_checks`: subscribe to this to get notifications of lagging nodes.
 
 
 ### POST examples:

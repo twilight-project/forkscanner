@@ -1,5 +1,5 @@
 use crate::{
-    serde_bigdecimal, Block, Chaintip, Node, ScannerCommand, ScannerMessage, StaleCandidate,
+    serde_bigdecimal, Block, ConflictingBlock, Chaintip, Lags, Node, ScannerCommand, ScannerMessage, StaleCandidate,
     Transaction,
 };
 use bigdecimal::BigDecimal;
@@ -516,6 +516,79 @@ fn handle_validation_subscribe(
     });
 }
 
+// Notify of lagging nodes
+fn handle_lagging_nodes_subscribe(
+    exit: Arc<AtomicBool>,
+    receiver: Receiver<ScannerMessage>,
+    sink: Sink,
+) {
+    info!("New subscription");
+    let send_update = move |lags: Vec<Lags>, sink: &Sink| -> std::result::Result<(), WsError> {
+	    let resp = lags.into_iter().map(|conf| serde_json::to_value(conf).expect("Could not serialize lagging node")).collect();
+		Ok(sink.notify(Params::Array(resp))?)
+    };
+
+    thread::spawn(move || {
+        loop {
+            if exit.load(Ordering::SeqCst) {
+                break;
+            }
+
+            match receiver.recv_timeout(time::Duration::from_millis(5000)) {
+				Ok(ScannerMessage::LaggingNodes(lags)) => {
+                    if let Err(e) = send_update(lags, &sink) {
+                        error!("Error sending lagging nodes to client {:?}", e);
+                    }
+                }
+                Ok(_) => {}
+                Err(RecvTimeoutError::Timeout) => {
+                    info!("No lagging node updates");
+                }
+                Err(e) => {
+                    error!("Error! {:?}", e);
+                }
+            }
+        }
+    });
+}
+
+
+// invalid block endpoint subscription handler
+fn handle_invalid_block_subscribe(
+    exit: Arc<AtomicBool>,
+    receiver: Receiver<ScannerMessage>,
+    sink: Sink,
+) {
+    info!("New subscription");
+    let send_update = move |blocks: Vec<ConflictingBlock>, sink: &Sink| -> std::result::Result<(), WsError> {
+	    let resp = blocks.into_iter().map(|conf| serde_json::to_value(conf).expect("Could not serialize conflicting block")).collect();
+		Ok(sink.notify(Params::Array(resp))?)
+    };
+
+    thread::spawn(move || {
+        loop {
+            if exit.load(Ordering::SeqCst) {
+                break;
+            }
+
+            match receiver.recv_timeout(time::Duration::from_millis(5000)) {
+				Ok(ScannerMessage::NewBlockConflicts(conflicts)) => {
+                    if let Err(e) = send_update(conflicts, &sink) {
+                        error!("Error sending block conflicts to client {:?}", e);
+                    }
+                }
+                Ok(_) => {}
+                Err(RecvTimeoutError::Timeout) => {
+                    info!("No block conflict updates");
+                }
+                Err(e) => {
+                    error!("Error! {:?}", e);
+                }
+            }
+        }
+    });
+}
+
 // handles subscriptions for chaintip updates
 fn handle_subscribe(
     exit: Arc<AtomicBool>,
@@ -641,6 +714,8 @@ pub fn run_server(
         HashMap::<&str, Vec<Sender<ScannerMessage>>>::default(),
     ));
     let subscriptions2 = subscriptions.clone();
+    let subscriptions3 = subscriptions.clone();
+    let subscriptions4 = subscriptions.clone();
     // listener thread for notifications from forkscanner
     let t2 = thread::spawn(move || loop {
         match receiver.recv() {
@@ -652,6 +727,22 @@ pub fn run_server(
                     });
                 }
             }
+			Ok(ScannerMessage::LaggingNodes(lags)) => {
+                debug!("New lagging nodes updates");
+                if let Some(subs) = subscriptions2.lock().expect("Lock poisoned").get_mut("lagging_nodes") {
+				    subs.retain(|sub| {
+                        sub.send(ScannerMessage::LaggingNodes(lags.clone())).is_ok()
+                    });
+                }
+			}
+            Ok(ScannerMessage::NewBlockConflicts(conflicts)) => {
+                debug!("New block conflict updates");
+                if let Some(subs) = subscriptions2.lock().expect("Lock poisoned").get_mut("invalid_block_checks") {
+				    subs.retain(|sub| {
+                        sub.send(ScannerMessage::NewBlockConflicts(conflicts.clone())).is_ok()
+                    });
+                }
+			}
             Ok(ScannerMessage::TipUpdated(invalidated_hashes)) => {
                 debug!("New chaintip updates");
                 if let Some(subs) = subscriptions2.lock().expect("Lock poisoned").get_mut("forks") {
@@ -706,6 +797,10 @@ pub fn run_server(
         let killer_clone1 = killers.clone();
         let killer_clone2 = killers.clone();
         let killer_clone3 = killers.clone();
+        let killer_clone4 = killers.clone();
+        let killer_clone5 = killers.clone();
+        let killer_clone6 = killers.clone();
+        let killer_clone7 = killers.clone();
         let pool3 = pool2.clone();
         let subscriptions2 = subscriptions.clone();
         // ws subscription endpoint for fork notifications
@@ -783,7 +878,7 @@ pub fn run_server(
                     let kill_switch = Arc::new(AtomicBool::new(false));
                     let sub_id = SubscriptionId::Number(rng.gen());
                     let sink = subscriber.assign_id(sub_id.clone()).unwrap();
-                    killers
+                    killer_clone3
                         .lock()
                         .expect("Lock poisoned")
                         .insert(sub_id, kill_switch.clone());
@@ -808,13 +903,121 @@ pub fn run_server(
             (
                 "unsubscribe_validation_checks",
                 move |id: SubscriptionId, _| {
-                    if let Some(arc) = killer_clone3.lock().expect("Lock poisoned").remove(&id) {
+                    if let Some(arc) = killer_clone4.lock().expect("Lock poisoned").remove(&id) {
                         arc.store(true, Ordering::SeqCst);
                     }
                     Box::pin(futures::future::ok(Value::Bool(true)))
                 },
             ),
         );
+
+
+        io.add_subscription(
+            "invalid_block_checks",
+            (
+                "invalid_block_checks",
+                move |params: Params, _, subscriber: Subscriber| {
+                    info!("Subscribe to invalid block checks");
+                    let mut rng = rand::rngs::OsRng::default();
+
+                    if params != Params::None {
+                        subscriber
+                            .reject(Error {
+                                code: ErrorCode::ParseError,
+                                message: "Invalid parameters. Subscription rejected.".into(),
+                                data: None,
+                            })
+                            .unwrap();
+                        return;
+                    }
+
+                    let kill_switch = Arc::new(AtomicBool::new(false));
+                    let sub_id = SubscriptionId::Number(rng.gen());
+                    let sink = subscriber.assign_id(sub_id.clone()).unwrap();
+                    killers
+                        .lock()
+                        .expect("Lock poisoned")
+                        .insert(sub_id, kill_switch.clone());
+                    let (notify_tx, notify_rx) = unbounded();
+                    {
+                        let mut sub_lock = subscriptions3.lock().expect("Lock poisoned");
+                        sub_lock
+                            .entry("invalid_block_checks")
+                            .or_insert(vec![])
+                            .push(notify_tx);
+                    }
+
+                    handle_invalid_block_subscribe(
+                        kill_switch,
+                        notify_rx,
+                        sink,
+                    )
+                },
+            ),
+            (
+                "unsubscribe_invalid_block_checks",
+                move |id: SubscriptionId, _| {
+                    if let Some(arc) = killer_clone5.lock().expect("Lock poisoned").remove(&id) {
+                        arc.store(true, Ordering::SeqCst);
+                    }
+                    Box::pin(futures::future::ok(Value::Bool(true)))
+                },
+            ),
+        );
+
+        io.add_subscription(
+            "lagging_nodes_checks",
+            (
+                "lagging_nodes_checks",
+                move |params: Params, _, subscriber: Subscriber| {
+                    info!("Subscribe to lagging nodes checks");
+                    let mut rng = rand::rngs::OsRng::default();
+
+                    if params != Params::None {
+                        subscriber
+                            .reject(Error {
+                                code: ErrorCode::ParseError,
+                                message: "Invalid parameters. Subscription rejected.".into(),
+                                data: None,
+                            })
+                            .unwrap();
+                        return;
+                    }
+
+                    let kill_switch = Arc::new(AtomicBool::new(false));
+                    let sub_id = SubscriptionId::Number(rng.gen());
+                    let sink = subscriber.assign_id(sub_id.clone()).unwrap();
+                    killer_clone6
+                        .lock()
+                        .expect("Lock poisoned")
+                        .insert(sub_id, kill_switch.clone());
+                    let (notify_tx, notify_rx) = unbounded();
+                    {
+                        let mut sub_lock = subscriptions4.lock().expect("Lock poisoned");
+                        sub_lock
+                            .entry("lagging_nodes")
+                            .or_insert(vec![])
+                            .push(notify_tx);
+                    }
+
+                    handle_lagging_nodes_subscribe(
+                        kill_switch,
+                        notify_rx,
+                        sink,
+                    )
+                },
+            ),
+            (
+                "unsubscribe_lagging_nodes_checks",
+                move |id: SubscriptionId, _| {
+                    if let Some(arc) = killer_clone7.lock().expect("Lock poisoned").remove(&id) {
+                        arc.store(true, Ordering::SeqCst);
+                    }
+                    Box::pin(futures::future::ok(Value::Bool(true)))
+                },
+            ),
+        );
+
         info!("Coming up on {} {}", listen, subs);
         let server = wss::ServerBuilder::with_meta_extractor(io, session_meta)
             .start(&SocketAddr::from((listen.parse::<IpAddr>().unwrap(), subs)))

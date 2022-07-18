@@ -19,6 +19,20 @@ ws.addEventListener('open', () => {
     method: "validation_checks",
     params: null,
   }));
+
+  ws.send(JSON.stringify({
+    jsonrpc: "2.0",
+    id: "invalid_block_checks",
+    method: "invalid_block_checks",
+    params: null,
+  }));
+
+  ws.send(JSON.stringify({
+    jsonrpc: "2.0",
+    id: "lagging_nodes_checks",
+    method: "lagging_nodes_checks",
+    params: null,
+  }));
 });
 
 
@@ -48,9 +62,13 @@ ws.addEventListener('message', (message) => {
       subscriptions[obj.id] = obj.result;
   } else {
       if (obj.method == "forks") {
-          console.log(`Got forks method: ${obj.params}`);
+          console.log(`Got forks method: ${JSON.stringify(obj.params)}`);
       } else if (obj.method == "validation_checks") {
-          console.log(`Got checks method: ${obj.params}`);
+          console.log(`Got checks method: ${JSON.stringify(obj.params)}`);
+      } else if (obj.method == "invalid_block_checks") {
+          console.log(`Got invalid block checks method: ${JSON.stringify(obj.params)}`);
+      } else if (obj.method == "lagging_nodes_checks") {
+          console.log(`Got lagging node checks method: ${JSON.stringify(obj.params)}`);
       }
   }
 });
