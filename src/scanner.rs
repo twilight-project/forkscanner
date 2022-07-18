@@ -1,7 +1,6 @@
 use crate::{
-    Block, BlockTemplate, Chaintip, FeeRate, InvalidBlock, InflatedBlock,
-	ConflictingBlock, Lags, Node, Pool, SoftForks, StaleCandidate,
-    StaleCandidateChildren, Transaction, TxOutset,
+    Block, BlockTemplate, Chaintip, ConflictingBlock, FeeRate, InflatedBlock, InvalidBlock, Lags,
+    Node, Pool, SoftForks, StaleCandidate, StaleCandidateChildren, Transaction, TxOutset,
 };
 use bigdecimal::{BigDecimal, FromPrimitive};
 use bitcoin::{consensus::encode::serialize_hex, util::amount::Amount};
@@ -63,7 +62,7 @@ pub struct MinerPoolInfo {
 pub enum ScannerMessage {
     LaggingNodes(Vec<Lags>),
     NewChaintip,
-	NewBlockConflicts(Vec<ConflictingBlock>),
+    NewBlockConflicts(Vec<ConflictingBlock>),
     AllChaintips(Vec<Chaintip>),
     StaleCandidateUpdate,
     TipUpdateFailed(String),
@@ -953,51 +952,50 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
         Ok(())
     }
 
+    fn lag_checks(&self) -> Vec<Lags> {
+        if let Err(e) = Lags::purge(&self.db_conn) {
+            error!("Purge lag tables failed {:?}", e);
+        }
 
-	fn lag_checks(&self) -> Vec<Lags> {
-		if let Err(e) = Lags::purge(&self.db_conn) {
-		    error!("Purge lag tables failed {:?}", e);
-		}
+        match Chaintip::list_active(&self.db_conn) {
+            Ok(tips) => {
+                let max_height = tips.iter().map(|t| t.height).max().unwrap();
+                let blocks: Vec<_> = tips
+                    .iter()
+                    .filter_map(|t| match Block::get(&self.db_conn, &t.block) {
+                        Ok(b) => Some(b),
+                        Err(e) => {
+                            error!("Database error checking block work: {:?}", e);
+                            None
+                        }
+                    })
+                    .collect();
+                let max_work = blocks.iter().map(|b| b.work.clone()).max().unwrap();
 
-		match Chaintip::list_active(&self.db_conn) {
-		    Ok(tips) => {
-			    let max_height = tips.iter().map(|t| t.height).max().unwrap();
-				let blocks: Vec<_> = tips.iter().filter_map(|t| {
-				    match Block::get(&self.db_conn, &t.block) {
-					    Ok(b) => Some(b),
-						Err(e) => {
-						    error!("Database error checking block work: {:?}", e);
-						    None
-						}
-					}
-				})
-				.collect();
-				let max_work = blocks.iter().map(|b| b.work.clone()).max().unwrap();
+                for tip in tips {
+                    let block = blocks.iter().find(|b| b.hash == tip.block).unwrap();
 
-				for tip in tips {
-				    let block = blocks.iter().find(|b| b.hash == tip.block).unwrap();
+                    // If it's 2 blocks behind or work is less, consider it lagging
+                    if tip.height < max_height - 1 || block.work < max_work {
+                        if let Err(e) = Lags::insert(&self.db_conn, tip.node) {
+                            error!("Node lag update failed: {:?}", e);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Lag checks failed {:?}", e);
+            }
+        }
 
-				    // If it's 2 blocks behind or work is less, consider it lagging
-				    if tip.height < max_height - 1 || block.work < max_work {
-					   if let Err(e) = Lags::insert(&self.db_conn, tip.node) {
-					       error!("Node lag update failed: {:?}", e);
-					   }
-				   }
-				}
-			}
-			Err(e) => {
-			    error!("Lag checks failed {:?}", e);
-			}
-		}
-
-		match Lags::list(&self.db_conn) {
-		    Ok(lags) => lags,
-			Err(e) => {
-			    error!("Error fetching lagging nodes: {:?}", e);
-				vec![]
-			}
-		}
-	}
+        match Lags::list(&self.db_conn) {
+            Ok(lags) => lags,
+            Err(e) => {
+                error!("Error fetching lagging nodes: {:?}", e);
+                vec![]
+            }
+        }
+    }
 
     // We initialized with get_best_block_hash, now we just poll continually
     // for new blocks, and fetch ancestors up to MAX_BLOCK_HEIGHT postgres
@@ -1097,7 +1095,7 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
                     "Failed to fetch blockchain info from {:?}!",
                     client.client()
                 );
-				continue;
+                continue;
             }
 
             self.fetch_block_templates(client.client(), node);
@@ -1112,13 +1110,15 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
             };
         }
 
-		// We have up to date chaintips, check for lags
-		let lags = self.lag_checks();
+        // We have up to date chaintips, check for lags
+        let lags = self.lag_checks();
 
-		if lags.len() > 0 {
-		    info!("We have {} lagging nodes", lags.len());
-			self.notify_tx.send(ScannerMessage::LaggingNodes(lags)).expect("Channel closed");
-		}
+        if lags.len() > 0 {
+            info!("We have {} lagging nodes", lags.len());
+            self.notify_tx
+                .send(ScannerMessage::LaggingNodes(lags))
+                .expect("Channel closed");
+        }
 
         // update the API server of chaintip updates
         if changed {
@@ -1128,17 +1128,17 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
                 .expect("Channel closed");
         }
 
-		match InvalidBlock::get_recent_conflicts(&self.db_conn) {
-		    Ok(conflicts) if conflicts.len() > 0 => {
-				self.notify_tx
-					.send(ScannerMessage::NewBlockConflicts(conflicts))
-					.expect("Channel closed");
-			}
-			Ok(_) => {}
-			Err(e) => {
-			    error!("Error querying database for block conflicts! {:?}", e);
-			}
-		}
+        match InvalidBlock::get_recent_conflicts(&self.db_conn) {
+            Ok(conflicts) if conflicts.len() > 0 => {
+                self.notify_tx
+                    .send(ScannerMessage::NewBlockConflicts(conflicts))
+                    .expect("Channel closed");
+            }
+            Ok(_) => {}
+            Err(e) => {
+                error!("Error querying database for block conflicts! {:?}", e);
+            }
+        }
 
         // get min height block template, and blocks with no fee diffs yet.
         info!("Fecthing block templates");

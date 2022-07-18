@@ -1,6 +1,6 @@
 use crate::{
-    serde_bigdecimal, Block, ConflictingBlock, Chaintip, Lags, Node, ScannerCommand, ScannerMessage, StaleCandidate,
-    Transaction,
+    serde_bigdecimal, Block, Chaintip, ConflictingBlock, Lags, Node, ScannerCommand,
+    ScannerMessage, StaleCandidate, Transaction,
 };
 use bigdecimal::BigDecimal;
 use bitcoincore_rpc::{Auth, Client, RpcApi};
@@ -524,34 +524,34 @@ fn handle_lagging_nodes_subscribe(
 ) {
     info!("New subscription");
     let send_update = move |lags: Vec<Lags>, sink: &Sink| -> std::result::Result<(), WsError> {
-	    let resp = lags.into_iter().map(|conf| serde_json::to_value(conf).expect("Could not serialize lagging node")).collect();
-		Ok(sink.notify(Params::Array(resp))?)
+        let resp = lags
+            .into_iter()
+            .map(|conf| serde_json::to_value(conf).expect("Could not serialize lagging node"))
+            .collect();
+        Ok(sink.notify(Params::Array(resp))?)
     };
 
-    thread::spawn(move || {
-        loop {
-            if exit.load(Ordering::SeqCst) {
-                break;
-            }
+    thread::spawn(move || loop {
+        if exit.load(Ordering::SeqCst) {
+            break;
+        }
 
-            match receiver.recv_timeout(time::Duration::from_millis(5000)) {
-				Ok(ScannerMessage::LaggingNodes(lags)) => {
-                    if let Err(e) = send_update(lags, &sink) {
-                        error!("Error sending lagging nodes to client {:?}", e);
-                    }
+        match receiver.recv_timeout(time::Duration::from_millis(5000)) {
+            Ok(ScannerMessage::LaggingNodes(lags)) => {
+                if let Err(e) = send_update(lags, &sink) {
+                    error!("Error sending lagging nodes to client {:?}", e);
                 }
-                Ok(_) => {}
-                Err(RecvTimeoutError::Timeout) => {
-                    info!("No lagging node updates");
-                }
-                Err(e) => {
-                    error!("Error! {:?}", e);
-                }
+            }
+            Ok(_) => {}
+            Err(RecvTimeoutError::Timeout) => {
+                info!("No lagging node updates");
+            }
+            Err(e) => {
+                error!("Error! {:?}", e);
             }
         }
     });
 }
-
 
 // invalid block endpoint subscription handler
 fn handle_invalid_block_subscribe(
@@ -560,30 +560,33 @@ fn handle_invalid_block_subscribe(
     sink: Sink,
 ) {
     info!("New subscription");
-    let send_update = move |blocks: Vec<ConflictingBlock>, sink: &Sink| -> std::result::Result<(), WsError> {
-	    let resp = blocks.into_iter().map(|conf| serde_json::to_value(conf).expect("Could not serialize conflicting block")).collect();
-		Ok(sink.notify(Params::Array(resp))?)
+    let send_update = move |blocks: Vec<ConflictingBlock>,
+                            sink: &Sink|
+          -> std::result::Result<(), WsError> {
+        let resp = blocks
+            .into_iter()
+            .map(|conf| serde_json::to_value(conf).expect("Could not serialize conflicting block"))
+            .collect();
+        Ok(sink.notify(Params::Array(resp))?)
     };
 
-    thread::spawn(move || {
-        loop {
-            if exit.load(Ordering::SeqCst) {
-                break;
-            }
+    thread::spawn(move || loop {
+        if exit.load(Ordering::SeqCst) {
+            break;
+        }
 
-            match receiver.recv_timeout(time::Duration::from_millis(5000)) {
-				Ok(ScannerMessage::NewBlockConflicts(conflicts)) => {
-                    if let Err(e) = send_update(conflicts, &sink) {
-                        error!("Error sending block conflicts to client {:?}", e);
-                    }
+        match receiver.recv_timeout(time::Duration::from_millis(5000)) {
+            Ok(ScannerMessage::NewBlockConflicts(conflicts)) => {
+                if let Err(e) = send_update(conflicts, &sink) {
+                    error!("Error sending block conflicts to client {:?}", e);
                 }
-                Ok(_) => {}
-                Err(RecvTimeoutError::Timeout) => {
-                    info!("No block conflict updates");
-                }
-                Err(e) => {
-                    error!("Error! {:?}", e);
-                }
+            }
+            Ok(_) => {}
+            Err(RecvTimeoutError::Timeout) => {
+                info!("No block conflict updates");
+            }
+            Err(e) => {
+                error!("Error! {:?}", e);
             }
         }
     });
@@ -601,7 +604,10 @@ fn handle_subscribe(
     fn send_update(pool: &ManagedPool, sink: &Sink) -> std::result::Result<(), WsError> {
         let conn = pool.get()?;
         let values = Chaintip::list(&conn)?;
-		let tips: Vec<_> = values.into_iter().map(|tip| serde_json::to_value(tip).expect("JSON serde failed")).collect();
+        let tips: Vec<_> = values
+            .into_iter()
+            .map(|tip| serde_json::to_value(tip).expect("JSON serde failed"))
+            .collect();
 
         Ok(sink.notify(Params::Array(tips))?)
     }
@@ -721,41 +727,60 @@ pub fn run_server(
         match receiver.recv() {
             Ok(ScannerMessage::NewChaintip) => {
                 debug!("New chaintip updates");
-                if let Some(subs) = subscriptions2.lock().expect("Lock poisoned").get_mut("forks") {
-				    subs.retain(|sub| {
-                        sub.send(ScannerMessage::NewChaintip).is_ok()
+                if let Some(subs) = subscriptions2
+                    .lock()
+                    .expect("Lock poisoned")
+                    .get_mut("forks")
+                {
+                    subs.retain(|sub| sub.send(ScannerMessage::NewChaintip).is_ok());
+                }
+            }
+            Ok(ScannerMessage::LaggingNodes(lags)) => {
+                debug!("New lagging nodes updates");
+                if let Some(subs) = subscriptions2
+                    .lock()
+                    .expect("Lock poisoned")
+                    .get_mut("lagging_nodes")
+                {
+                    subs.retain(|sub| sub.send(ScannerMessage::LaggingNodes(lags.clone())).is_ok());
+                }
+            }
+            Ok(ScannerMessage::NewBlockConflicts(conflicts)) => {
+                debug!("New block conflict updates");
+                if let Some(subs) = subscriptions2
+                    .lock()
+                    .expect("Lock poisoned")
+                    .get_mut("invalid_block_checks")
+                {
+                    subs.retain(|sub| {
+                        sub.send(ScannerMessage::NewBlockConflicts(conflicts.clone()))
+                            .is_ok()
                     });
                 }
             }
-			Ok(ScannerMessage::LaggingNodes(lags)) => {
-                debug!("New lagging nodes updates");
-                if let Some(subs) = subscriptions2.lock().expect("Lock poisoned").get_mut("lagging_nodes") {
-				    subs.retain(|sub| {
-                        sub.send(ScannerMessage::LaggingNodes(lags.clone())).is_ok()
-                    });
-                }
-			}
-            Ok(ScannerMessage::NewBlockConflicts(conflicts)) => {
-                debug!("New block conflict updates");
-                if let Some(subs) = subscriptions2.lock().expect("Lock poisoned").get_mut("invalid_block_checks") {
-				    subs.retain(|sub| {
-                        sub.send(ScannerMessage::NewBlockConflicts(conflicts.clone())).is_ok()
-                    });
-                }
-			}
             Ok(ScannerMessage::TipUpdated(invalidated_hashes)) => {
                 debug!("New chaintip updates");
-                if let Some(subs) = subscriptions2.lock().expect("Lock poisoned").get_mut("forks") {
-				    subs.retain(|sub| {
-                        sub.send(ScannerMessage::TipUpdated(invalidated_hashes.clone())).is_ok()
+                if let Some(subs) = subscriptions2
+                    .lock()
+                    .expect("Lock poisoned")
+                    .get_mut("forks")
+                {
+                    subs.retain(|sub| {
+                        sub.send(ScannerMessage::TipUpdated(invalidated_hashes.clone()))
+                            .is_ok()
                     });
                 }
             }
             Ok(ScannerMessage::TipUpdateFailed(err)) => {
                 debug!("New chaintip updates");
-                if let Some(subs) = subscriptions2.lock().expect("Lock poisoned").get_mut("forks") {
-				    subs.retain(|sub| {
-                        sub.send(ScannerMessage::TipUpdateFailed(err.clone())).is_ok()
+                if let Some(subs) = subscriptions2
+                    .lock()
+                    .expect("Lock poisoned")
+                    .get_mut("forks")
+                {
+                    subs.retain(|sub| {
+                        sub.send(ScannerMessage::TipUpdateFailed(err.clone()))
+                            .is_ok()
                     });
                 }
             }
@@ -770,9 +795,7 @@ pub fn run_server(
                         "New stale candidates: updating {} subscriptions",
                         subs.len()
                     );
-					subs.retain(|sub| {
-                        sub.send(ScannerMessage::StaleCandidateUpdate).is_ok()
-                    });
+                    subs.retain(|sub| sub.send(ScannerMessage::StaleCandidateUpdate).is_ok());
                 }
             }
             Ok(ScannerMessage::AllChaintips(mut t)) => {
@@ -911,7 +934,6 @@ pub fn run_server(
             ),
         );
 
-
         io.add_subscription(
             "invalid_block_checks",
             (
@@ -947,11 +969,7 @@ pub fn run_server(
                             .push(notify_tx);
                     }
 
-                    handle_invalid_block_subscribe(
-                        kill_switch,
-                        notify_rx,
-                        sink,
-                    )
+                    handle_invalid_block_subscribe(kill_switch, notify_rx, sink)
                 },
             ),
             (
@@ -1000,11 +1018,7 @@ pub fn run_server(
                             .push(notify_tx);
                     }
 
-                    handle_lagging_nodes_subscribe(
-                        kill_switch,
-                        notify_rx,
-                        sink,
-                    )
+                    handle_lagging_nodes_subscribe(kill_switch, notify_rx, sink)
                 },
             ),
             (

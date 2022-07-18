@@ -2,8 +2,8 @@ use bigdecimal::BigDecimal;
 use bitcoincore_rpc::bitcoincore_rpc_json::{GetBlockHeaderResult, Softfork};
 use chrono::prelude::*;
 use diesel::prelude::*;
-use diesel::sql_types;
 use diesel::result::QueryResult;
+use diesel::sql_types;
 use serde::{Deserialize, Serialize, Serializer};
 use std::collections::HashMap;
 
@@ -754,7 +754,7 @@ impl Block {
         let block = ValidBlock {
             hash: block_hash.to_string(),
             node: node_id,
-			created_at: Some(Utc::now()),
+            created_at: Some(Utc::now()),
         };
 
         diesel::insert_into(valid_blocks)
@@ -810,7 +810,7 @@ impl Block {
         let block = InvalidBlock {
             hash: block_hash.to_string(),
             node: node_id,
-			created_at: Some(Utc::now()),
+            created_at: Some(Utc::now()),
         };
 
         diesel::insert_into(invalid_blocks)
@@ -1156,14 +1156,14 @@ pub struct ConflictingBlock {
     #[sql_type = "sql_types::Text"]
     pub hash: String,
     #[sql_type = "sql_types::Array<sql_types::BigInt>"]
-	pub valid_by: Vec<i64>,
+    pub valid_by: Vec<i64>,
     #[sql_type = "sql_types::Array<sql_types::BigInt>"]
-	pub invalid_by: Vec<i64>,
+    pub invalid_by: Vec<i64>,
 }
 
 impl InvalidBlock {
     pub fn get_recent_conflicts(conn: &PgConnection) -> QueryResult<Vec<ConflictingBlock>> {
-	    let raw_query = format!(
+        let raw_query = format!(
             "
 			SELECT hash, array_agg(distinct valid_by) as valid_by, array_agg(distinct invalid_by) as invalid_by
 			FROM (
@@ -1192,11 +1192,10 @@ pub struct ValidBlock {
     pub created_at: Option<DateTime<Utc>>,
 }
 
-
 #[derive(Clone, Serialize, QueryableByName, Queryable, Insertable)]
 #[table_name = "lags"]
 pub struct Lags {
-	pub node_id: i64,
+    pub node_id: i64,
     pub created_at: DateTime<Utc>,
     pub deleted_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
@@ -1205,30 +1204,24 @@ pub struct Lags {
 impl Lags {
     pub fn purge(conn: &PgConnection) -> QueryResult<usize> {
         use crate::schema::lags::dsl::*;
-        diesel::delete(lags)
-            .execute(conn)
+        diesel::delete(lags).execute(conn)
     }
 
-    pub fn insert(
-        conn: &PgConnection,
-        id: i64,
-    ) -> QueryResult<usize> {
+    pub fn insert(conn: &PgConnection, id: i64) -> QueryResult<usize> {
         use crate::schema::lags::dsl::*;
 
-		let lag = Lags {
-		    node_id: id,
-			created_at: Utc::now(),
-			deleted_at: None,
-			updated_at: Utc::now(),
-		};
+        let lag = Lags {
+            node_id: id,
+            created_at: Utc::now(),
+            deleted_at: None,
+            updated_at: Utc::now(),
+        };
 
-        diesel::insert_into(lags)
-            .values(lag)
-            .execute(conn)
+        diesel::insert_into(lags).values(lag).execute(conn)
     }
 
-	pub fn list(conn: &PgConnection) -> QueryResult<Vec<Lags>> {
+    pub fn list(conn: &PgConnection) -> QueryResult<Vec<Lags>> {
         use crate::schema::lags::dsl::*;
         lags.load(conn)
-	}
+    }
 }
