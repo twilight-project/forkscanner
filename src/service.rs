@@ -1,6 +1,6 @@
 use crate::{
     serde_bigdecimal, Block, Chaintip, ConflictingBlock, Lags, Node, ScannerCommand,
-    ScannerMessage, StaleCandidate, Transaction,
+    ScannerMessage, StaleCandidate, Transaction, Watched,
 };
 use bigdecimal::BigDecimal;
 use bitcoincore_rpc::{Auth, Client, RpcApi};
@@ -74,6 +74,13 @@ struct NodeArgs {
     mirror_rpc_port: Option<i32>,
     user: String,
     pass: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct WatchAddress {
+    watch: Vec<String>,
+    watch_until: DateTime<Utc>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -516,6 +523,51 @@ fn handle_validation_subscribe(
     });
 }
 
+// Notify of watched address activity
+fn handle_watched_addresses(
+    exit: Arc<AtomicBool>,
+    receiver: Receiver<ScannerMessage>,
+    watch: Vec<String>,
+    watch_until: DateTime<Utc>,
+    pool: ManagedPool,
+    sink: Sink,
+) {
+    let conn = pool.get().expect("Connection pool failure");
+
+    Watched::insert(&conn, watch, watch_until).expect("Could not insert watchlist!");
+
+    info!("New address activity");
+    let send_update =
+        move |transactions: Vec<Transaction>, sink: &Sink| -> std::result::Result<(), WsError> {
+            let resp = transactions
+                .into_iter()
+                .map(|tx| serde_json::to_value(tx).expect("Could not serialize transaction"))
+                .collect();
+            Ok(sink.notify(Params::Array(resp))?)
+        };
+
+    thread::spawn(move || loop {
+        if exit.load(Ordering::SeqCst) {
+            break;
+        }
+
+        match receiver.recv_timeout(time::Duration::from_millis(5000)) {
+            Ok(ScannerMessage::WatchedAddress(transactions)) => {
+                if let Err(e) = send_update(transactions, &sink) {
+                    error!("Error sending watched activity to client {:?}", e);
+                }
+            }
+            Ok(_) => {}
+            Err(RecvTimeoutError::Timeout) => {
+                info!("No lagging node updates");
+            }
+            Err(e) => {
+                error!("Error! {:?}", e);
+            }
+        }
+    });
+}
+
 // Notify of lagging nodes
 fn handle_lagging_nodes_subscribe(
     exit: Arc<AtomicBool>,
@@ -722,6 +774,7 @@ pub fn run_server(
     let subscriptions2 = subscriptions.clone();
     let subscriptions3 = subscriptions.clone();
     let subscriptions4 = subscriptions.clone();
+    let subscriptions5 = subscriptions.clone();
     // listener thread for notifications from forkscanner
     let t2 = thread::spawn(move || loop {
         match receiver.recv() {
@@ -784,6 +837,23 @@ pub fn run_server(
                     });
                 }
             }
+            Ok(ScannerMessage::WatchedAddress(txs)) => {
+                debug!("New watched address activity");
+                if let Some(subs) = subscriptions2
+                    .lock()
+                    .expect("Lock poisoned")
+                    .get_mut("watched_addresses")
+                {
+                    debug!(
+                        "New watched address activity: updating {} subscriptions",
+                        subs.len()
+                    );
+                    subs.retain(|sub| {
+                        sub.send(ScannerMessage::WatchedAddress(txs.clone()))
+                            .is_ok()
+                    });
+                }
+            }
             Ok(ScannerMessage::StaleCandidateUpdate) => {
                 debug!("New stale candidate updates");
                 if let Some(subs) = subscriptions2
@@ -824,7 +894,10 @@ pub fn run_server(
         let killer_clone5 = killers.clone();
         let killer_clone6 = killers.clone();
         let killer_clone7 = killers.clone();
+        let killer_clone8 = killers.clone();
+        let killer_clone9 = killers.clone();
         let pool3 = pool2.clone();
+        let pool4 = pool2.clone();
         let subscriptions2 = subscriptions.clone();
         // ws subscription endpoint for fork notifications
         io.add_subscription(
@@ -1025,6 +1098,65 @@ pub fn run_server(
                 "unsubscribe_lagging_nodes_checks",
                 move |id: SubscriptionId, _| {
                     if let Some(arc) = killer_clone7.lock().expect("Lock poisoned").remove(&id) {
+                        arc.store(true, Ordering::SeqCst);
+                    }
+                    Box::pin(futures::future::ok(Value::Bool(true)))
+                },
+            ),
+        );
+
+        io.add_subscription(
+            "watched_address_checks",
+            (
+                "watched_address_checks",
+                move |params: Params, _, subscriber: Subscriber| {
+                    info!("Subscribe to watched address checks");
+                    let mut rng = rand::rngs::OsRng::default();
+
+                    let WatchAddress { watch, watch_until } = if let Ok(parm) = params.parse() {
+                        parm
+                    } else {
+                        subscriber
+                            .reject(Error {
+                                code: ErrorCode::ParseError,
+                                message: "Invalid parameters. Expected list of addresses to watch."
+                                    .into(),
+                                data: None,
+                            })
+                            .unwrap();
+                        return;
+                    };
+
+                    let kill_switch = Arc::new(AtomicBool::new(false));
+                    let sub_id = SubscriptionId::Number(rng.gen());
+                    let sink = subscriber.assign_id(sub_id.clone()).unwrap();
+                    killer_clone8
+                        .lock()
+                        .expect("Lock poisoned")
+                        .insert(sub_id, kill_switch.clone());
+                    let (notify_tx, notify_rx) = unbounded();
+                    {
+                        let mut sub_lock = subscriptions5.lock().expect("Lock poisoned");
+                        sub_lock
+                            .entry("watched_addresses")
+                            .or_insert(vec![])
+                            .push(notify_tx);
+                    }
+
+                    handle_watched_addresses(
+                        kill_switch,
+                        notify_rx,
+                        watch,
+                        watch_until,
+                        pool4.clone(),
+                        sink,
+                    )
+                },
+            ),
+            (
+                "unsubscribe_watched_address_checks",
+                move |id: SubscriptionId, _| {
+                    if let Some(arc) = killer_clone9.lock().expect("Lock poisoned").remove(&id) {
                         arc.store(true, Ordering::SeqCst);
                     }
                     Box::pin(futures::future::ok(Value::Bool(true)))

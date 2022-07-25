@@ -1,9 +1,11 @@
 use crate::{
     Block, BlockTemplate, Chaintip, ConflictingBlock, FeeRate, InflatedBlock, InvalidBlock, Lags,
-    Node, Pool, SoftForks, StaleCandidate, StaleCandidateChildren, Transaction, TxOutset,
+    Node, Pool, SoftForks, StaleCandidate, StaleCandidateChildren, Transaction, TxOutset, Watched,
 };
 use bigdecimal::{BigDecimal, FromPrimitive};
-use bitcoin::{consensus::encode::serialize_hex, util::amount::Amount};
+use bitcoin::{
+    consensus::encode::serialize_hex, util::amount::Amount, Address, Network, PublicKey,
+};
 use bitcoin_hashes::{sha256d, Hash};
 use bitcoincore_rpc::bitcoin as btc;
 use bitcoincore_rpc::bitcoincore_rpc_json::{
@@ -67,6 +69,7 @@ pub enum ScannerMessage {
     StaleCandidateUpdate,
     TipUpdateFailed(String),
     TipUpdated(Vec<String>),
+    WatchedAddress(Vec<Transaction>),
 }
 
 /// Command types from api to forkscanner.
@@ -801,6 +804,10 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
                     changed |= rows > 0;
                 }
             }
+
+            if let Ok(block) = Block::get(&self.db_conn, &hash) {
+                self.fetch_transactions(&block);
+            }
         }
         Ok(changed)
     }
@@ -950,6 +957,23 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
             }
         }
         Ok(())
+    }
+
+    // get raw transaction hex for each watched address tx
+    fn watched_address_checks(&self) -> Vec<Transaction> {
+        // Clear expired watch entries
+        if let Err(e) = Watched::clear(&self.db_conn) {
+            error!("Watchlist query error {:?}", e);
+            return vec![];
+        }
+
+        match Watched::fetch(&self.db_conn) {
+            Ok(transactions) => transactions,
+            Err(e) => {
+                error!("An error occured fetching watch list {:?})", e);
+                vec![]
+            }
+        }
     }
 
     fn lag_checks(&self) -> Vec<Lags> {
@@ -1117,6 +1141,16 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
             info!("We have {} lagging nodes", lags.len());
             self.notify_tx
                 .send(ScannerMessage::LaggingNodes(lags))
+                .expect("Channel closed");
+        }
+
+        // Check watched addresses
+        let addresses = self.watched_address_checks();
+
+        if addresses.len() > 0 {
+            info!("We have {} watched address activity", addresses.len());
+            self.notify_tx
+                .send(ScannerMessage::WatchedAddress(addresses))
                 .expect("Channel closed");
         }
 
@@ -2012,9 +2046,29 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
         };
 
         for (idx, tx) in block_info.tx.iter().enumerate() {
+            let vinput = &tx.vin.iter().next();
+            let address = match &vinput.unwrap().script_sig {
+                Some(sig) => {
+                    let pubkey_hex = sig.asm.split(" ").last().unwrap();
+                    match PublicKey::from_str(&pubkey_hex) {
+                        Ok(addr) => {
+                            let address = Address::p2pkh(&addr, Network::Bitcoin);
+                            format!("{}", address)
+                        }
+
+                        Err(e) => {
+                            error!("Invalid bitcoin address in transaction!");
+                            "".into()
+                        }
+                    }
+                }
+                None => "".into(),
+            };
+
             let value = tx.vout.iter().fold(0., |a, amt| a + amt.value);
             if let Err(e) = Transaction::create(
                 &self.db_conn,
+                address,
                 block.hash.to_string(),
                 idx,
                 &tx.txid,

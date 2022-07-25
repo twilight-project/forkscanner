@@ -177,6 +177,7 @@ diesel::table! {
         is_coinbase -> Bool,
         hex -> Varchar,
         amount -> Float8,
+        address -> Varchar,
     }
 }
 
@@ -197,6 +198,14 @@ diesel::table! {
         hash -> Varchar,
         node -> Int8,
         created_at -> Nullable<Timestamptz>,
+    }
+}
+
+diesel::table! {
+    watched (address) {
+        address -> Varchar,
+        created_at -> Timestamptz,
+        watch_until -> Timestamptz,
     }
 }
 
@@ -227,4 +236,5 @@ diesel::allow_tables_to_appear_in_same_query!(
     transaction,
     tx_outsets,
     valid_blocks,
+    watched,
 );

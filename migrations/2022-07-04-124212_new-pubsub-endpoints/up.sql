@@ -1,4 +1,11 @@
 -- Your SQL goes here
+CREATE TABLE watched (
+    address varchar not null,
+	created_at timestamp with time zone not null,
+	watch_until timestamp with time zone not null,
+	PRIMARY KEY(address)
+);
+
 CREATE TABLE lags (
     node_id bigint not null,
 	created_at timestamp with time zone not null,
@@ -16,3 +23,6 @@ ADD column created_at timestamp with time zone;
 
 ALTER TABLE valid_blocks
 ADD column created_at timestamp with time zone;
+
+ALTER TABLE transaction
+ADD column address varchar not null;
