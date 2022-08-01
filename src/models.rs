@@ -70,6 +70,15 @@ impl Chaintip {
             .load(conn)
     }
 
+    pub fn list_non_lagging(conn: &PgConnection) -> QueryResult<Vec<Chaintip>> {
+        use crate::schema::chaintips::dsl::*;
+        use crate::schema::lags::dsl as ldsl;
+
+        let laggers: Vec<i64> = ldsl::lags.select(ldsl::node_id).load::<i64>(conn)?;
+
+        chaintips.filter(node.ne_all(laggers)).load(conn)
+    }
+
     /// List all active tips.
     pub fn list_active(conn: &PgConnection) -> QueryResult<Vec<Chaintip>> {
         use crate::schema::chaintips::dsl::*;

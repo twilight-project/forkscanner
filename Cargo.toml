@@ -11,6 +11,7 @@ bitcoin = "0.27"
 bitcoin_hashes = "0.10"
 bitcoincore-rpc = "0.14"
 chrono = { version = "0.4", features = ["serde"] }
+counter = "0.5"
 crossbeam = "0.8"
 diesel = { version = "1.4", features = ["chrono", "numeric", "postgres"] }
 dotenv = "0.15"

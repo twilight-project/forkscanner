@@ -3,9 +3,7 @@ use crate::{
     Node, Pool, SoftForks, StaleCandidate, StaleCandidateChildren, Transaction, TxOutset, Watched,
 };
 use bigdecimal::{BigDecimal, FromPrimitive};
-use bitcoin::{
-    consensus::encode::serialize_hex, util::amount::Amount, Address, Network, PublicKey,
-};
+use bitcoin::{consensus::encode::serialize_hex, util::amount::Amount};
 use bitcoin_hashes::{sha256d, Hash};
 use bitcoincore_rpc::bitcoin as btc;
 use bitcoincore_rpc::bitcoincore_rpc_json::{
@@ -1258,11 +1256,21 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
             }
         };
 
-        match Chaintip::list(&self.db_conn) {
+        match Chaintip::list_non_lagging(&self.db_conn) {
             Ok(tips) => {
-                self.notify_tx
-                    .send(ScannerMessage::AllChaintips(tips))
-                    .expect("Channel closed");
+                // Get the most frequent tip
+                let counts = tips
+                    .iter()
+                    .map(|tip| tip.block.clone())
+                    .collect::<counter::Counter<_>>();
+
+                if let Some((top, _)) = counts.most_common().into_iter().next() {
+                    let tip = tips.into_iter().find(|item| item.block == top).unwrap();
+
+                    self.notify_tx
+                        .send(ScannerMessage::AllChaintips(vec![tip]))
+                        .expect("Channel closed");
+                }
             }
             Err(e) => error!("Database error: {:?}", e),
         }
@@ -2046,23 +2054,13 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
         };
 
         for (idx, tx) in block_info.tx.iter().enumerate() {
-            let vinput = &tx.vin.iter().next();
-            let address = match &vinput.unwrap().script_sig {
-                Some(sig) => {
-                    let pubkey_hex = sig.asm.split(" ").last().unwrap();
-                    match PublicKey::from_str(&pubkey_hex) {
-                        Ok(addr) => {
-                            let address = Address::p2pkh(&addr, Network::Bitcoin);
-                            format!("{}", address)
-                        }
-
-                        Err(e) => {
-                            error!("Invalid bitcoin address in transaction!");
-                            "".into()
-                        }
-                    }
+            let vout = &tx.vout.iter().next().unwrap();
+            let address = match &vout.script_pub_key.addresses {
+                Some(addrs) => addrs.iter().next().unwrap().clone(),
+                None => {
+                    error!("No address in transaction!");
+                    return;
                 }
-                None => "".into(),
             };
 
             let value = tx.vout.iter().fold(0., |a, amt| a + amt.value);
