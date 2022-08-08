@@ -25,4 +25,5 @@ ALTER TABLE valid_blocks
 ADD column created_at timestamp with time zone;
 
 ALTER TABLE transaction
-ADD column address varchar not null;
+ADD COLUMN address varchar,
+ADD COLUMN swept bool;

@@ -2054,19 +2054,27 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
         };
 
         for (idx, tx) in block_info.tx.iter().enumerate() {
+		    let inputs = self.get_input_addrs(tx, node);
+
             let vout = &tx.vout.iter().next().unwrap();
-            let address = match &vout.script_pub_key.addresses {
-                Some(addrs) => addrs.iter().next().unwrap().clone(),
+            let (swept, address) = match &vout.script_pub_key.addresses {
+                Some(addrs) => {
+				    let address = addrs.iter().next().unwrap().clone();
+					let swept = !inputs.contains(&btc::Address::from_str(&address).unwrap());
+					(swept, address)
+				}
                 None => {
                     error!("No address in transaction!");
-                    return;
+					(false, format!("NO_ADDRESS"))
                 }
             };
+
 
             let value = tx.vout.iter().fold(0., |a, amt| a + amt.value);
             if let Err(e) = Transaction::create(
                 &self.db_conn,
                 address,
+				swept,
                 block.hash.to_string(),
                 idx,
                 &tx.txid,
@@ -2077,6 +2085,33 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
             }
         }
     }
+
+	fn get_input_addrs(&self, tx: &JsonTransaction, node: &ScannerClient<BC>) -> HashSet<btc::Address> {
+		// find the input amount for the tx
+		let mut input_amounts = HashSet::default();
+
+		for txin in tx.vin.iter() {
+			if let Some(txid) = &txin.txid {
+				let txid = btc::Txid::from_str(&txid).unwrap();
+				match node.client().get_raw_transaction_info(&txid, None) {
+					Ok(tx) => {
+						for vout in tx.vout.iter() {
+						    if let Some(addrs) = &vout.script_pub_key.addresses {
+								input_amounts.extend(addrs.iter().cloned());
+							}
+						}
+					}
+					Err(_) => {
+						error!("Could not fetch transaction info! {:?}", txid);
+						continue;
+					}
+				}
+			}
+		}
+
+		input_amounts
+	}
+
 
     // Rollback checks. Here we are looking to use the mirror node to try to set a 'valid-headers'
     // chaintip as the active one by invalidating the currently active chaintip. We briefly turn

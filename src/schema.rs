@@ -177,7 +177,8 @@ diesel::table! {
         is_coinbase -> Bool,
         hex -> Varchar,
         amount -> Float8,
-        address -> Varchar,
+        address -> Nullable<Varchar>,
+        swept -> Nullable<Bool>,
     }
 }
 

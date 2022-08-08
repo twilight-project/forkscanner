@@ -842,13 +842,15 @@ pub struct Transaction {
     pub is_coinbase: bool,
     pub hex: String,
     pub amount: f64,
-    pub address: String,
+    pub address: Option<String>,
+	pub swept: Option<bool>,
 }
 
 impl Transaction {
     pub fn create(
         conn: &PgConnection,
         addr: String,
+		sweep: bool,
         block: String,
         idx: usize,
         tx_id: &String,
@@ -858,12 +860,13 @@ impl Transaction {
         use crate::schema::transaction::dsl::*;
 
         let tx = Transaction {
-            address: addr,
+            address: Some(addr),
             block_id: block,
             is_coinbase: idx == 0,
             txid: tx_id.clone(),
             hex: tx_hex.clone(),
             amount: tx_amount,
+			swept: Some(sweep),
         };
 
         diesel::insert_into(transaction)
