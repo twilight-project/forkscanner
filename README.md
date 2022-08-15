@@ -52,6 +52,10 @@ This needs to be run on a node with bitcoin running.
 
 - `tx_is_active`: params: { id: string }
   Query whether transaction is in active branch.
+
+- `get_peers`: params: { "id": 8 }
+   Query a nodes active peer list.
+
 ```
 
 ### WS notification endpoints
@@ -157,3 +161,69 @@ POST
 ```
 
 Response is a block similar to `get_block` response.
+
+`add_node`:
+
+POST
+```json
+  {"name": "node_name", "rpc_host": "hostname", "rpc_port": 1234, "mirror_rpc_port": null, "user": "username", "pass": "pass", "archive": false}
+```
+
+Response:
+```json
+{
+  "jsonrpc": "2.0",
+  "result": [ "id": 14 ],
+  "id": 1
+}
+```
+
+`remove_node`:
+
+POST
+```json
+  { "id": 14 }
+```
+
+Response:
+```json
+{
+  "jsonrpc": "2.0",
+  "result": [ "OK" ],
+  "id": 1
+}
+```
+
+`tx_is_active`:
+
+POST
+```json
+  { "id": "tx_hash" }
+```
+
+Response:
+```json
+{
+  "jsonrpc": "2.0",
+  "result": [ true ],
+  "id": 1
+}
+```
+
+`get_peers`:
+
+POST
+```json
+  { "id": 8 }
+```
+
+Response:
+```json
+{
+  "jsonrpc": "2.0",
+  "result": [
+      { "id": "node_id", "address": "127.0.0.1" },
+  ],
+  "id": 1
+}
+```

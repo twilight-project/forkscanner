@@ -1,6 +1,7 @@
 use crate::{
     Block, BlockTemplate, Chaintip, ConflictingBlock, FeeRate, InflatedBlock, InvalidBlock, Lags,
-    Node, Pool, SoftForks, StaleCandidate, StaleCandidateChildren, Transaction, TxOutset, Watched,
+    NewPeer, Node, Peer, Pool, SoftForks, StaleCandidate, StaleCandidateChildren, Transaction,
+    TxOutset, Watched,
 };
 use bigdecimal::{BigDecimal, FromPrimitive};
 use bitcoin::{consensus::encode::serialize_hex, util::amount::Amount};
@@ -32,6 +33,8 @@ use std::{
 };
 use thiserror::Error;
 
+const NULL_DATA_INDEX: usize = 1;
+const SCRIPT_HASH_INDEX: usize = 1;
 const MAX_ANCESTRY_DEPTH: usize = 100;
 const MAX_BLOCK_DEPTH: i64 = 10;
 const BLOCK_NOT_FOUND: i32 = -5;
@@ -649,6 +652,7 @@ impl<BC: BtcClient> ScannerClient<BC> {
 /// and db connection to record chain info.
 pub struct ForkScanner<BC: BtcClient + std::fmt::Debug> {
     node_list: Vec<Node>,
+    archive_node: ScannerClient<BC>,
     clients: Vec<ScannerClient<BC>>,
     db_conn: PgConnection,
     notify_tx: Sender<ScannerMessage>,
@@ -666,10 +670,13 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
         let node_list = Node::list(&db_conn)?;
 
         let mut clients = Vec::new();
+        let mut archive_node = None;
+        let mut found_archive = false;
 
         for node in &node_list {
             let host = format!("http://{}:{}", node.rpc_host, node.rpc_port);
             let auth = Auth::UserPass(node.rpc_user.clone(), node.rpc_pass.clone());
+
             let mirror_host = match node.mirror_rpc_port {
                 Some(port) => Some(format!("http://{}:{}", node.rpc_host, port)),
                 None => None,
@@ -678,6 +685,16 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
                 "Connecting to bitcoin client: {}, Mirror: {:?}",
                 host, mirror_host
             );
+
+            if archive_node.is_none() {
+                let client = ScannerClient::new(node.id, host.clone(), None, auth.clone())?;
+                archive_node = Some(client);
+            } else if node.archive {
+                let client = ScannerClient::new(node.id, host.clone(), None, auth.clone())?;
+                archive_node = Some(client);
+                found_archive = true;
+            }
+
             let client = ScannerClient::new(node.id, host, mirror_host, auth)?;
             clients.push(client);
         }
@@ -685,8 +702,13 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
         let (notify_tx, notify_rx) = unbounded();
         let (cmd_tx, cmd_rx) = unbounded();
 
+        if !found_archive {
+            warn!("No archive node was found, using first node as fallback!");
+        }
+
         Ok((
             ForkScanner {
+                archive_node: archive_node.unwrap(),
                 node_list,
                 clients,
                 db_conn,
@@ -1105,6 +1127,24 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
 
         let mut changed = false;
         for (client, node) in self.clients.iter().zip(&self.node_list) {
+            if let Ok(peers) = client.client().get_peer_info() {
+                let peers = peers
+                    .into_iter()
+                    .map(|p| NewPeer {
+                        node_id: node.id,
+                        peer_id: p.id as i64,
+                        address: p.addr,
+                        version: p.version as i64,
+                    })
+                    .collect();
+
+                if let Err(e) = Peer::update_peers(&self.db_conn, node.id, peers) {
+                    error!("Peer list update failed! {:?}", e);
+                }
+            } else {
+                error!("RPC get peers failed!");
+            }
+
             if let Ok(info) = client.client().get_blockchain_info() {
                 info!("Got blockchain info");
                 if let Err(e) =
@@ -2054,27 +2094,72 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
         };
 
         for (idx, tx) in block_info.tx.iter().enumerate() {
-		    let inputs = self.get_input_addrs(tx, node);
+            let inputs = self.get_input_addrs(tx);
+            let mut swept = false;
+            let mut address = String::from("NO_ADDRESS");
 
-            let vout = &tx.vout.iter().next().unwrap();
-            let (swept, address) = match &vout.script_pub_key.addresses {
-                Some(addrs) => {
-				    let address = addrs.iter().next().unwrap().clone();
-					let swept = !inputs.contains(&btc::Address::from_str(&address).unwrap());
-					(swept, address)
-				}
-                None => {
-                    error!("No address in transaction!");
-					(false, format!("NO_ADDRESS"))
+            for vout in &tx.vout {
+                match vout.script_pub_key.r#type.as_str() {
+                    "nulldata" => {
+                        address = vout
+                            .script_pub_key
+                            .asm
+                            .split(' ')
+                            .nth(NULL_DATA_INDEX)
+                            .unwrap_or("NO_ADDRESS")
+                            .into();
+                        debug!("Hashes cannot be converted to addresses, skipping")
+                    }
+                    "scripthash" => {
+                        address = vout
+                            .script_pub_key
+                            .asm
+                            .split(' ')
+                            .nth(SCRIPT_HASH_INDEX)
+                            .unwrap_or("NO_ADDRESS")
+                            .into();
+                        debug!("Hashes cannot be converted to addresses, skipping")
+                    }
+                    "witness_v1_taproot" | "witness_v0_keyhash" | "witness_v0_scripthash" => {
+                        address = vout
+                            .script_pub_key
+                            .asm
+                            .split(' ')
+                            .last()
+                            .unwrap_or("NO_ADDRESS")
+                            .into();
+                        debug!("Address hashes cannot be converted to addresses, skipping")
+                    }
+                    "pubkeyhash" => {
+                        match &vout.script_pub_key.addresses {
+                            Some(addrs) => {
+                                address = addrs.iter().next().unwrap().clone();
+                                swept |=
+                                    !inputs.contains(&btc::Address::from_str(&address).unwrap());
+                            }
+                            None => {
+                                address = vout
+                                    .script_pub_key
+                                    .asm
+                                    .split(' ')
+                                    .nth(2)
+                                    .unwrap_or("NO_ADDRESS")
+                                    .into();
+                                debug!("No address in transaction! {:?}", vout);
+                            }
+                        };
+                    }
+                    o => {
+                        error!("No handler for output type: {} {:?}", o, vout)
+                    }
                 }
-            };
-
+            }
 
             let value = tx.vout.iter().fold(0., |a, amt| a + amt.value);
             if let Err(e) = Transaction::create(
                 &self.db_conn,
                 address,
-				swept,
+                swept,
                 block.hash.to_string(),
                 idx,
                 &tx.txid,
@@ -2086,32 +2171,36 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
         }
     }
 
-	fn get_input_addrs(&self, tx: &JsonTransaction, node: &ScannerClient<BC>) -> HashSet<btc::Address> {
-		// find the input amount for the tx
-		let mut input_amounts = HashSet::default();
+    fn get_input_addrs(&self, tx: &JsonTransaction) -> HashSet<btc::Address> {
+        // find the input amount for the tx
+        let mut input_amounts = HashSet::default();
 
-		for txin in tx.vin.iter() {
-			if let Some(txid) = &txin.txid {
-				let txid = btc::Txid::from_str(&txid).unwrap();
-				match node.client().get_raw_transaction_info(&txid, None) {
-					Ok(tx) => {
-						for vout in tx.vout.iter() {
-						    if let Some(addrs) = &vout.script_pub_key.addresses {
-								input_amounts.extend(addrs.iter().cloned());
-							}
-						}
-					}
-					Err(_) => {
-						error!("Could not fetch transaction info! {:?}", txid);
-						continue;
-					}
-				}
-			}
-		}
+        for txin in tx.vin.iter() {
+            if let Some(txid) = &txin.txid {
+                let txid = btc::Txid::from_str(&txid).unwrap();
+                match self
+                    .archive_node
+                    .client()
+                    .get_raw_transaction_info(&txid, None)
+                {
+                    Ok(tx) => {
+                        for vout in tx.vout.iter() {
+                            if let Some(addrs) = &vout.script_pub_key.addresses {
+                                input_amounts.extend(addrs.iter().cloned());
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // This is very noisy when you don't have an archive node.
+                        debug!("Could not fetch transaction info! {:?}", txid);
+                        continue;
+                    }
+                }
+            }
+        }
 
-		input_amounts
-	}
-
+        input_amounts
+    }
 
     // Rollback checks. Here we are looking to use the mirror node to try to set a 'valid-headers'
     // chaintip as the active one by invalidating the currently active chaintip. We briefly turn

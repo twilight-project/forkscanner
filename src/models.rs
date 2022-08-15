@@ -843,14 +843,14 @@ pub struct Transaction {
     pub hex: String,
     pub amount: f64,
     pub address: Option<String>,
-	pub swept: Option<bool>,
+    pub swept: Option<bool>,
 }
 
 impl Transaction {
     pub fn create(
         conn: &PgConnection,
         addr: String,
-		sweep: bool,
+        sweep: bool,
         block: String,
         idx: usize,
         tx_id: &String,
@@ -866,7 +866,7 @@ impl Transaction {
             txid: tx_id.clone(),
             hex: tx_hex.clone(),
             amount: tx_amount,
-			swept: Some(sweep),
+            swept: Some(sweep),
         };
 
         diesel::insert_into(transaction)
@@ -1084,6 +1084,7 @@ pub struct Node {
     pub unreachable_since: Option<DateTime<Utc>>,
     pub last_polled: Option<DateTime<Utc>>,
     pub initial_block_download: bool,
+    pub archive: bool,
 }
 
 impl Node {
@@ -1130,6 +1131,7 @@ impl Node {
         mirror: Option<i32>,
         user: String,
         pass: String,
+        archiver: bool,
     ) -> QueryResult<Node> {
         use crate::schema::nodes::dsl::*;
         diesel::insert_into(nodes)
@@ -1140,12 +1142,22 @@ impl Node {
                 mirror_rpc_port.eq(mirror),
                 rpc_user.eq(user),
                 rpc_pass.eq(pass),
+                archive.eq(archiver),
             ))
             .get_result(conn)
     }
 }
 
-#[derive(QueryableByName, Queryable, Insertable)]
+#[derive(Serialize, QueryableByName, Queryable, Insertable)]
+#[table_name = "peers"]
+pub struct NewPeer {
+    pub node_id: i64,
+    pub peer_id: i64,
+    pub address: String,
+    pub version: i64,
+}
+
+#[derive(Serialize, QueryableByName, Queryable, Insertable)]
 #[table_name = "peers"]
 pub struct Peer {
     pub id: i64,
@@ -1155,7 +1167,29 @@ pub struct Peer {
     pub version: i64,
 }
 
-impl Peer {}
+impl Peer {
+    pub fn update_peers(
+        conn: &PgConnection,
+        n_id: i64,
+        peer_list: Vec<NewPeer>,
+    ) -> QueryResult<usize> {
+        use crate::schema::peers::dsl::*;
+
+        diesel::delete(peers)
+            .filter(node_id.eq(n_id))
+            .execute(conn)?;
+
+        diesel::insert_into(peers)
+            .values(peer_list)
+            .on_conflict_do_nothing()
+            .execute(conn)
+    }
+
+    pub fn list(conn: &PgConnection, n_id: i64) -> QueryResult<Vec<Peer>> {
+        use crate::schema::peers::dsl::*;
+        peers.filter(node_id.eq(n_id)).load(conn)
+    }
+}
 
 #[derive(QueryableByName, Queryable, Insertable)]
 #[table_name = "invalid_blocks"]

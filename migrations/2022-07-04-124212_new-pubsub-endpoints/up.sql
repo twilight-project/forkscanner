@@ -27,3 +27,6 @@ ADD column created_at timestamp with time zone;
 ALTER TABLE transaction
 ADD COLUMN address varchar,
 ADD COLUMN swept bool;
+
+ALTER TABLE nodes
+ADD COLUMN archive boolean NOT NULL DEFAULT FALSE;

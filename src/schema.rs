@@ -105,6 +105,7 @@ diesel::table! {
         unreachable_since -> Nullable<Timestamptz>,
         last_polled -> Nullable<Timestamptz>,
         initial_block_download -> Bool,
+        archive -> Bool,
     }
 }
 

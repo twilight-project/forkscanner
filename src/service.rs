@@ -1,5 +1,5 @@
 use crate::{
-    serde_bigdecimal, Block, Chaintip, ConflictingBlock, Lags, Node, ScannerCommand,
+    serde_bigdecimal, Block, Chaintip, ConflictingBlock, Lags, Node, Peer, ScannerCommand,
     ScannerMessage, StaleCandidate, Transaction, Watched,
 };
 use bigdecimal::BigDecimal;
@@ -74,6 +74,7 @@ struct NodeArgs {
     mirror_rpc_port: Option<i32>,
     user: String,
     pass: String,
+    archive: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -278,6 +279,23 @@ fn tx_is_active(conn: Conn, params: Params) -> Result<Value> {
     }
 }
 
+// get peer list for a node
+fn get_peers(conn: Conn, params: Params) -> Result<Value> {
+    match params.parse::<NodeId>() {
+        Ok(id) => match Peer::list(&conn, id.id) {
+            Ok(peers) => match serde_json::to_value(peers) {
+                Ok(value) => Ok(value),
+                Err(_) => Err(JsonRpcError::internal_error()),
+            },
+            Err(_) => Err(JsonRpcError::internal_error()),
+        },
+        Err(args) => {
+            let err = JsonRpcError::invalid_params(format!("Invalid parameters, {:?}", args));
+            Err(err)
+        }
+    }
+}
+
 // updated chaintip to the provided block
 fn set_tip(conn: Conn, cmd: Sender<ScannerCommand>, params: Params) -> Result<Value> {
     match params.parse::<SetTipQuery>() {
@@ -418,6 +436,7 @@ fn add_node(conn: Conn, params: Params) -> Result<Value> {
                 args.mirror_rpc_port,
                 args.user,
                 args.pass,
+                args.archive,
             ) {
                 Ok(n.id.into())
             } else {
@@ -759,6 +778,12 @@ pub fn run_server(
         io.add_sync_method("tx_is_active", move |params: Params| {
             let conn = p.get().unwrap();
             tx_is_active(conn, params)
+        });
+
+        let p = pool.clone();
+        io.add_sync_method("get_peers", move |params: Params| {
+            let conn = p.get().unwrap();
+            get_peers(conn, params)
         });
 
         let server = hts::ServerBuilder::new(io)
