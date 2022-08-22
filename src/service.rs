@@ -1,8 +1,10 @@
 use crate::{
-    serde_bigdecimal, Block, Chaintip, ConflictingBlock, Lags, Node, Peer, ScannerCommand,
-    ScannerMessage, StaleCandidate, Transaction, Watched,
+    scanner::BtcClient, serde_bigdecimal, Block, Chaintip, ConflictingBlock, Lags, Node, Peer,
+    ScannerCommand, ScannerMessage, StaleCandidate, Transaction, Watched,
 };
 use bigdecimal::BigDecimal;
+use bitcoin::consensus::encode::serialize_hex;
+use bitcoincore_rpc::bitcoin::Block as BitcoinBlock;
 use bitcoincore_rpc::{Auth, Client, RpcApi};
 use chrono::prelude::*;
 use crossbeam::channel::{unbounded, Receiver, RecvTimeoutError, Sender};
@@ -44,6 +46,13 @@ pub enum WsError {
     SinkError(#[from] futures::channel::mpsc::TrySendError<std::string::String>),
 }
 
+// https://docs.rs/bitcoin/0.27.1/bitcoin/blockdata/block/struct.Block.html
+#[derive(Debug, Deserialize)]
+struct BlockUpload {
+    node_id: i64,
+    block: BitcoinBlock,
+}
+
 #[derive(Debug, Deserialize)]
 struct NodeId {
     id: i64,
@@ -74,6 +83,7 @@ struct NodeArgs {
     mirror_rpc_port: Option<i32>,
     user: String,
     pass: String,
+    mirror_host: Option<String>,
     archive: bool,
 }
 
@@ -245,7 +255,7 @@ fn validation_checks(conn: Conn, window: i64) -> Result<Value> {
         })
         .collect();
 
-    debug!("{} stale candidates in window {}", checks.len(), window);
+    info!("{} stale candidates in window {}", checks.len(), window);
     match serde_json::to_value(checks) {
         Ok(t) => Ok(t),
         Err(_) => Err(JsonRpcError::internal_error()),
@@ -272,6 +282,43 @@ fn tx_is_active(conn: Conn, params: Params) -> Result<Value> {
                 Err(_) => Err(JsonRpcError::internal_error()),
             }
         }
+        Err(args) => {
+            let err = JsonRpcError::invalid_params(format!("Invalid parameters, {:?}", args));
+            Err(err)
+        }
+    }
+}
+
+// upload block to a node
+fn submit_block(conn: Conn, params: Params) -> Result<Value> {
+    match params.parse::<BlockUpload>() {
+        Ok(upload) => match Node::get(&conn, upload.node_id) {
+            Ok(node) => {
+                let auth = Auth::UserPass(node.rpc_user.clone(), node.rpc_pass.clone());
+
+                if let Ok(client) = Client::new(&node.rpc_host, auth) {
+                    let hash = upload.block.block_hash();
+                    let block_hex = serialize_hex(&upload.block);
+
+                    match client.submit_block(block_hex, &hash) {
+                        Ok(_) => Ok("OK".into()),
+                        Err(e) => {
+                            let errmsg = format!("Call to submit block failed. {:?}", e);
+                            return Err(JsonRpcError::invalid_params(errmsg));
+                        }
+                    }
+                } else {
+                    let err = JsonRpcError::invalid_params(format!(
+                        "Failed to establish a node connection."
+                    ));
+                    return Err(err);
+                }
+            }
+            Err(e) => {
+                let err = JsonRpcError::invalid_params(format!("Node not found, {:?}", e));
+                Err(err)
+            }
+        },
         Err(args) => {
             let err = JsonRpcError::invalid_params(format!("Invalid parameters, {:?}", args));
             Err(err)
@@ -436,6 +483,7 @@ fn add_node(conn: Conn, params: Params) -> Result<Value> {
                 args.mirror_rpc_port,
                 args.user,
                 args.pass,
+                args.mirror_host,
                 args.archive,
             ) {
                 Ok(n.id.into())
@@ -468,19 +516,22 @@ fn remove_node(conn: Conn, params: Params) -> Result<Value> {
 }
 
 // fetch currently active chaintips
-fn get_tips(params: Params, tips: Vec<Chaintip>) -> Result<Value> {
+fn get_tips(params: Params, conn: Conn) -> Result<Value> {
     match params.parse::<TipArgs>() {
         Ok(t) => {
             let chaintips = if t.active_only {
-                tips.iter()
-                    .filter(|t| t.status == "active")
-                    .cloned()
-                    .collect::<Vec<Chaintip>>()
+                Chaintip::list_active(&conn)
             } else {
-                tips.to_vec()
+                Chaintip::list(&conn)
             };
 
-            match serde_json::to_value(chaintips) {
+            if let Err(e) = chaintips {
+                let err =
+                    JsonRpcError::invalid_params(format!("Couldn't fetch chaintips, {:?}", e));
+                return Err(err);
+            }
+
+            match serde_json::to_value(chaintips.unwrap()) {
                 Ok(t) => Ok(t),
                 Err(_) => Err(JsonRpcError::internal_error()),
             }
@@ -667,14 +718,16 @@ fn handle_invalid_block_subscribe(
 fn handle_subscribe(
     exit: Arc<AtomicBool>,
     receiver: Receiver<ScannerMessage>,
-    pool: ManagedPool,
+    tips: Arc<RwLock<Vec<Chaintip>>>,
     _: Params,
     sink: Sink,
 ) {
     info!("New subscription");
-    fn send_update(pool: &ManagedPool, sink: &Sink) -> std::result::Result<(), WsError> {
-        let conn = pool.get()?;
-        let values = Chaintip::list(&conn)?;
+    fn send_update(
+        tips: &Arc<RwLock<Vec<Chaintip>>>,
+        sink: &Sink,
+    ) -> std::result::Result<(), WsError> {
+        let values = tips.read().expect("Lock poisoned").clone();
         let tips: Vec<_> = values
             .into_iter()
             .map(|tip| serde_json::to_value(tip).expect("JSON serde failed"))
@@ -684,7 +737,7 @@ fn handle_subscribe(
     }
 
     thread::spawn(move || {
-        if let Err(e) = send_update(&pool, &sink) {
+        if let Err(e) = send_update(&tips, &sink) {
             error!("Error sending chaintips to initialize client {:?}", e);
         }
 
@@ -695,7 +748,7 @@ fn handle_subscribe(
 
             match receiver.recv_timeout(time::Duration::from_millis(5000)) {
                 Ok(ScannerMessage::NewChaintip) => {
-                    if let Err(e) = send_update(&pool, &sink) {
+                    if let Err(e) = send_update(&tips, &sink) {
                         error!("Error sending chaintips to client {:?}", e);
                     }
                 }
@@ -738,8 +791,10 @@ pub fn run_server(
     // set up some rpc endpoints
     let t1 = thread::spawn(move || {
         let mut io = IoHandler::new();
+        let p = pool.clone();
         io.add_sync_method("get_tips", move |params: Params| {
-            get_tips(params, tips1.read().expect("RwLock failed").clone())
+            let conn = p.get().unwrap();
+            get_tips(params, conn)
         });
 
         let p = pool.clone();
@@ -784,6 +839,12 @@ pub fn run_server(
         io.add_sync_method("get_peers", move |params: Params| {
             let conn = p.get().unwrap();
             get_peers(conn, params)
+        });
+
+        let p = pool.clone();
+        io.add_sync_method("submit_block", move |params: Params| {
+            let conn = p.get().unwrap();
+            submit_block(conn, params)
         });
 
         let server = hts::ServerBuilder::new(io)
@@ -896,6 +957,13 @@ pub fn run_server(
             Ok(ScannerMessage::AllChaintips(mut t)) => {
                 debug!("New chaintips {:?}", t);
                 std::mem::swap(&mut t, &mut tips.write().expect("Lock poisoned"));
+                if let Some(subs) = subscriptions2
+                    .lock()
+                    .expect("Lock poisoned")
+                    .get_mut("forks")
+                {
+                    subs.retain(|sub| sub.send(ScannerMessage::NewChaintip).is_ok());
+                }
             }
             Err(e) => {
                 error!("Channel broke {:?}", e);
@@ -956,7 +1024,7 @@ pub fn run_server(
                         sub_lock.entry("forks").or_insert(vec![]).push(notify_tx);
                     }
 
-                    handle_subscribe(kill_switch, notify_rx, pool2.clone(), params, sink)
+                    handle_subscribe(kill_switch, notify_rx, tips1.clone(), params, sink)
                 },
             ),
             ("unsubscribe_forks", move |id: SubscriptionId, _| {

@@ -47,6 +47,9 @@ This needs to be run on a node with bitcoin running.
 - `get_block`: params { hash: string } OR { height: int } 
   Get a block by hash or height.
 
+- `submit_block`: params { block: block_json, node: int }
+  Upload a block to the given node.
+
 - `get_block_from_peer`: params { node_id: int, hash: string, peer_id: int } 
   Fetch a block from a specified node.
 
@@ -223,6 +226,49 @@ Response:
   "jsonrpc": "2.0",
   "result": [
       { "id": "node_id", "address": "127.0.0.1" },
+  ],
+  "id": 1
+}
+```
+
+`submit_block`:
+
+POST
+```json
+  { 
+    node_id: 15,
+    block: {
+      "coinbase_message": [ 123, 45, 67 ],
+      "connected": true,
+      "first_seen_by": 13,
+      "hash": "00000000000000000006ead1cff09f279f7beb31a7290c2a603b0776d98dc334",
+      "headers_only": false,
+      "height": 733430,
+      "lowest_template_fee_rate": null,
+      "parent_hash": "000000000000000000082af6a6db0e71d72f25dcfb513aeda1a1cb4044253030",
+      "pool_name": "Foundry USA",
+      "template_txs_fee_diff": null,
+      "total_fee": "0.09797872",
+      "tx_omitted_fee_rates": null,
+      "txids": [
+        "d6187e533fffece5c502e8a05242dba6e94a7eb9cdde241250f3ed16c31242eb",
+        "b76c3a88d50ff3b8a03fc623098f86d6872b3748d6cce956138fef8fa6f6c412",
+        "...snip..."
+      ],
+      "txids_added": null,
+      "txids_omitted": null,
+      "work": "00000000000000000000000000000000000000002ca1bca6e028e261a6019f07"
+    }
+  }
+````
+
+
+Response:
+```json
+{
+  "jsonrpc": "2.0",
+  "result": [
+    "OK"
   ],
   "id": 1
 }

@@ -105,6 +105,9 @@ diesel::table! {
         unreachable_since -> Nullable<Timestamptz>,
         last_polled -> Nullable<Timestamptz>,
         initial_block_download -> Bool,
+        mirror_host -> Nullable<Varchar>,
+        mirror_last_polled -> Nullable<Timestamptz>,
+        mirror_unreachable_since -> Nullable<Int8>,
         archive -> Bool,
     }
 }

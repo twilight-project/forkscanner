@@ -911,6 +911,12 @@ impl Transaction {
             .collect();
         Ok(descendants)
     }
+
+    pub fn block_processed(conn: &PgConnection, hash: &String) -> QueryResult<bool> {
+        use crate::schema::transaction::dsl::*;
+        let result: Vec<Transaction> = transaction.filter(block_id.eq(hash)).load(conn)?;
+        Ok(result.len() > 0)
+    }
 }
 
 #[derive(AsChangeset, QueryableByName, Queryable, Insertable)]
@@ -1084,10 +1090,18 @@ pub struct Node {
     pub unreachable_since: Option<DateTime<Utc>>,
     pub last_polled: Option<DateTime<Utc>>,
     pub initial_block_download: bool,
+    pub mirror_host: Option<String>,
+    pub mirror_last_polled: Option<DateTime<Utc>>,
+    pub mirror_unreachable_since: Option<i64>,
     pub archive: bool,
 }
 
 impl Node {
+    pub fn get(conn: &PgConnection, node_id: i64) -> QueryResult<Node> {
+        use crate::schema::nodes::dsl::*;
+        nodes.filter(id.eq(node_id)).get_result(conn)
+    }
+
     pub fn list(conn: &PgConnection) -> QueryResult<Vec<Node>> {
         nodes::dsl::nodes.load(conn)
     }
@@ -1117,7 +1131,7 @@ impl Node {
                 mirror_rpc_port.is_not_null().and(
                     initial_block_download
                         .eq(false)
-                        .and(unreachable_since.is_null()),
+                        .and(mirror_unreachable_since.is_null()),
                 ),
             )
             .load(conn)
@@ -1131,6 +1145,7 @@ impl Node {
         mirror: Option<i32>,
         user: String,
         pass: String,
+        mirror_hostname: Option<String>,
         archiver: bool,
     ) -> QueryResult<Node> {
         use crate::schema::nodes::dsl::*;
@@ -1142,6 +1157,7 @@ impl Node {
                 mirror_rpc_port.eq(mirror),
                 rpc_user.eq(user),
                 rpc_pass.eq(pass),
+                mirror_host.eq(mirror_hostname),
                 archive.eq(archiver),
             ))
             .get_result(conn)

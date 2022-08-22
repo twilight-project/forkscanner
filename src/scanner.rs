@@ -678,7 +678,10 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
             let auth = Auth::UserPass(node.rpc_user.clone(), node.rpc_pass.clone());
 
             let mirror_host = match node.mirror_rpc_port {
-                Some(port) => Some(format!("http://{}:{}", node.rpc_host, port)),
+                Some(port) => {
+                    let hostname = node.mirror_host.as_ref().unwrap_or(&node.rpc_host).clone();
+                    Some(format!("http://{}:{}", hostname, port))
+                }
                 None => None,
             };
             info!(
@@ -1368,11 +1371,11 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
 
         info!("Checking mirror node reachability");
         for mut mirror in mirrors {
-            if let Some(_ts) = mirror.unreachable_since {
-                let last_poll = mirror.last_polled.expect("No last_polled");
+            if let Some(_ts) = mirror.mirror_unreachable_since {
+                let last_poll = mirror.mirror_last_polled.expect("No last_polled");
                 let elapsed = Utc::now().signed_duration_since(last_poll);
                 if elapsed.num_minutes() > REACHABLE_CHECK_INTERVAL {
-                    mirror.last_polled = Some(Utc::now());
+                    mirror.mirror_last_polled = Some(Utc::now());
                     let node = self
                         .clients
                         .iter()
@@ -1385,8 +1388,8 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
                     match node.get_blockchain_info() {
                         Ok(info) => {
                             mirror.initial_block_download = info.initial_block_download;
-                            mirror.unreachable_since = None;
-                            mirror.last_polled = None;
+                            mirror.mirror_unreachable_since = None;
+                            mirror.mirror_last_polled = None;
                         }
                         Err(e) => debug!("Could not reach mirror on reachable check {e:?}"),
                     }
@@ -2078,6 +2081,12 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
 
     // get transactions for a block and save info to database.
     fn fetch_transactions(&self, block: &Block) {
+        let processed = Transaction::block_processed(&self.db_conn, &block.hash);
+
+        if processed.is_err() || processed.unwrap() {
+            return;
+        }
+
         let node = self
             .clients
             .iter()
@@ -2093,8 +2102,9 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
             }
         };
 
+        info!("Fetching transactions for {}", block.hash);
         for (idx, tx) in block_info.tx.iter().enumerate() {
-            let inputs = self.get_input_addrs(tx);
+            let inputs = self.get_input_addrs(idx, tx);
             let mut swept = false;
             let mut address = String::from("NO_ADDRESS");
 
@@ -2171,10 +2181,11 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
         }
     }
 
-    fn get_input_addrs(&self, tx: &JsonTransaction) -> HashSet<btc::Address> {
+    fn get_input_addrs(&self, idx: usize, tx: &JsonTransaction) -> HashSet<btc::Address> {
         // find the input amount for the tx
         let mut input_amounts = HashSet::default();
 
+        info!("Fetching input tx info for txindex {}", idx);
         for txin in tx.vin.iter() {
             if let Some(txid) = &txin.txid {
                 let txid = btc::Txid::from_str(&txid).unwrap();

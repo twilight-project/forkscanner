@@ -29,4 +29,7 @@ ADD COLUMN address varchar,
 ADD COLUMN swept bool;
 
 ALTER TABLE nodes
+ADD COLUMN mirror_host varchar DEFAULT NULL, 
+ADD COLUMN mirror_last_polled timestamp with time zone DEFAULT NULL,
+ADD COLUMN mirror_unreachable_since bigint DEFAULT NULL,
 ADD COLUMN archive boolean NOT NULL DEFAULT FALSE;
