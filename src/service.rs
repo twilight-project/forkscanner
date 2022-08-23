@@ -646,29 +646,20 @@ pub fn run_server(
         match receiver.recv() {
             Ok(ScannerMessage::NewChaintip) => {
                 debug!("New chaintip updates");
-                if let Some(subs) = subscriptions2.lock().expect("Lock poisoned").get("forks") {
-                    for sub in subs {
-                        sub.send(ScannerMessage::NewChaintip)
-                            .expect("Channel broke");
-                    }
+                if let Some(subs) = subscriptions2.lock().expect("Lock poisoned").get_mut("forks") {
+				    subs.retain(|sub| sub.send(ScannerMessage::NewChaintip).is_ok());
                 }
             }
             Ok(ScannerMessage::TipUpdated(invalidated_hashes)) => {
                 debug!("New chaintip updates");
-                if let Some(subs) = subscriptions2.lock().expect("Lock poisoned").get("forks") {
-                    for sub in subs {
-                        sub.send(ScannerMessage::TipUpdated(invalidated_hashes.clone()))
-                            .expect("Channel broke");
-                    }
+                if let Some(subs) = subscriptions2.lock().expect("Lock poisoned").get_mut("forks") {
+					subs.retain(|sub| sub.send(ScannerMessage::TipUpdated(invalidated_hashes.clone())).is_ok());
                 }
             }
             Ok(ScannerMessage::TipUpdateFailed(err)) => {
                 debug!("New chaintip updates");
-                if let Some(subs) = subscriptions2.lock().expect("Lock poisoned").get("forks") {
-                    for sub in subs {
-                        sub.send(ScannerMessage::TipUpdateFailed(err.clone()))
-                            .expect("Channel broke");
-                    }
+                if let Some(subs) = subscriptions2.lock().expect("Lock poisoned").get_mut("forks") {
+				    subs.retain(|sub| sub.send(ScannerMessage::TipUpdateFailed(err.clone())).is_ok());
                 }
             }
             Ok(ScannerMessage::StaleCandidateUpdate) => {
@@ -676,16 +667,13 @@ pub fn run_server(
                 if let Some(subs) = subscriptions2
                     .lock()
                     .expect("Lock poisoned")
-                    .get("validation_checks")
+                    .get_mut("validation_checks")
                 {
                     debug!(
                         "New stale candidates: updating {} subscriptions",
                         subs.len()
                     );
-                    for sub in subs {
-                        sub.send(ScannerMessage::StaleCandidateUpdate)
-                            .expect("Channel broke");
-                    }
+					subs.retain(|sub| sub.send(ScannerMessage::StaleCandidateUpdate).is_ok());
                 }
             }
             Ok(ScannerMessage::AllChaintips(mut t)) => {

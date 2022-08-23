@@ -853,7 +853,7 @@ impl Transaction {
 
         diesel::insert_into(transaction)
             .values(tx)
-            .on_conflict(txid)
+            .on_conflict((block_id, txid))
             .do_nothing()
             .execute(conn)
     }
