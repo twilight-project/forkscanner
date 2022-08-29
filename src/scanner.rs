@@ -6,6 +6,7 @@ use crate::{
 use bigdecimal::{BigDecimal, FromPrimitive};
 use bitcoin::{consensus::encode::serialize_hex, util::amount::Amount};
 use bitcoin_hashes::{sha256d, Hash};
+use bitcoin_hashes::hex::ToHex;
 use bitcoincore_rpc::bitcoin as btc;
 use bitcoincore_rpc::bitcoincore_rpc_json::{
     GetBlockHeaderResult, GetBlockResult, GetBlockTemplateCapabilities, GetBlockTemplateModes,
@@ -33,8 +34,7 @@ use std::{
 };
 use thiserror::Error;
 
-const NULL_DATA_INDEX: usize = 1;
-const SCRIPT_HASH_INDEX: usize = 1;
+
 const MAX_ANCESTRY_DEPTH: usize = 100;
 const MAX_BLOCK_DEPTH: i64 = 10;
 const BLOCK_NOT_FOUND: i32 = -5;
@@ -229,6 +229,7 @@ pub trait BtcClient: Sized {
         &self,
         hash: &btc::BlockHash,
     ) -> Result<GetBlockHeaderResult, bitcoincore_rpc::Error>;
+    fn get_block(&self, hash: &btc::BlockHash) -> Result<btc::Block, bitcoincore_rpc::Error>;
     fn get_block_hex(&self, hash: &btc::BlockHash) -> Result<String, bitcoincore_rpc::Error>;
     fn get_peer_info(&self) -> Result<Vec<PeerInfo>, bitcoincore_rpc::Error>;
     fn get_raw_transaction_info<'a>(
@@ -324,6 +325,10 @@ impl BtcClient for Client {
     ) -> Result<GetBlockHeaderResult, bitcoincore_rpc::Error> {
         RpcApi::get_block_header_info(self, hash)
     }
+
+    fn get_block(&self, hash: &btc::BlockHash) -> Result<btc::Block, bitcoincore_rpc::Error> {
+        RpcApi::get_block(self, hash)
+	}
 
     fn get_block_hex(&self, hash: &btc::BlockHash) -> Result<String, bitcoincore_rpc::Error> {
         RpcApi::get_block_hex(self, hash)
@@ -2094,7 +2099,8 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
             .unwrap()
             .clone();
 
-        let block_info = match node.client().get_block_verbose(block.hash.clone()) {
+		let hash = btc::BlockHash::from_str(&block.hash).unwrap();
+        let block_info = match node.client().get_block(&hash) {
             Ok(bi) => bi,
             Err(e) => {
                 error!("RPC call failed {:?}", e);
@@ -2102,79 +2108,27 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
             }
         };
 
-        info!("Fetching transactions for {}", block.hash);
-        for (idx, tx) in block_info.tx.iter().enumerate() {
-            let inputs = self.get_input_addrs(idx, tx);
-            let mut swept = false;
-            let mut address = String::from("NO_ADDRESS");
 
-            for vout in &tx.vout {
-                match vout.script_pub_key.r#type.as_str() {
-                    "nulldata" => {
-                        address = vout
-                            .script_pub_key
-                            .asm
-                            .split(' ')
-                            .nth(NULL_DATA_INDEX)
-                            .unwrap_or("NO_ADDRESS")
-                            .into();
-                        debug!("Hashes cannot be converted to addresses, skipping")
-                    }
-                    "scripthash" => {
-                        address = vout
-                            .script_pub_key
-                            .asm
-                            .split(' ')
-                            .nth(SCRIPT_HASH_INDEX)
-                            .unwrap_or("NO_ADDRESS")
-                            .into();
-                        debug!("Hashes cannot be converted to addresses, skipping")
-                    }
-                    "witness_v1_taproot" | "witness_v0_keyhash" | "witness_v0_scripthash" => {
-                        address = vout
-                            .script_pub_key
-                            .asm
-                            .split(' ')
-                            .last()
-                            .unwrap_or("NO_ADDRESS")
-                            .into();
-                        debug!("Address hashes cannot be converted to addresses, skipping")
-                    }
-                    "pubkeyhash" => {
-                        match &vout.script_pub_key.addresses {
-                            Some(addrs) => {
-                                address = addrs.iter().next().unwrap().clone();
-                                swept |=
-                                    !inputs.contains(&btc::Address::from_str(&address).unwrap());
-                            }
-                            None => {
-                                address = vout
-                                    .script_pub_key
-                                    .asm
-                                    .split(' ')
-                                    .nth(2)
-                                    .unwrap_or("NO_ADDRESS")
-                                    .into();
-                                debug!("No address in transaction! {:?}", vout);
-                            }
-                        };
-                    }
-                    o => {
-                        error!("No handler for output type: {} {:?}", o, vout)
-                    }
-                }
+        info!("Fetching transactions for {}", block.hash);
+        for (idx, tx) in block_info.txdata.iter().enumerate() {
+		    let mut address = String::from("NO_ADDRESS");
+			let hex = serialize_hex(tx);
+
+            for vout in &tx.output {
+			    let spk = &vout.script_pubkey;
+				address = spk.script_hash().to_string();
             }
 
-            let value = tx.vout.iter().fold(0., |a, amt| a + amt.value);
+            let value = tx.output.iter().fold(0, |a, amt| a + amt.value);
             if let Err(e) = Transaction::create(
                 &self.db_conn,
                 address,
-                swept,
+                false,
                 block.hash.to_string(),
                 idx,
-                &tx.txid,
-                &tx.hex,
-                value,
+                &tx.txid().to_hex(),
+                &hex,
+                value as f64,
             ) {
                 error!("Could not insert transaction {:?}", e);
             }
