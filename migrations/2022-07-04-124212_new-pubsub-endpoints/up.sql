@@ -6,6 +6,13 @@ CREATE TABLE watched (
 	PRIMARY KEY(address)
 );
 
+CREATE TABLE transaction_addresses (
+    hash varchar not null,
+	txid varchar not null,
+	address varchar not null,
+	PRIMARY KEY(hash, txid, address)
+);
+
 CREATE TABLE lags (
     node_id bigint not null,
 	created_at timestamp with time zone not null,
@@ -25,7 +32,6 @@ ALTER TABLE valid_blocks
 ADD column created_at timestamp with time zone;
 
 ALTER TABLE transaction
-ADD COLUMN address varchar,
 ADD COLUMN swept bool;
 
 ALTER TABLE nodes

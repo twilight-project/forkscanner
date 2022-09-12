@@ -714,6 +714,68 @@ fn handle_invalid_block_subscribe(
     });
 }
 
+fn handle_subscribe_forks(
+    exit: Arc<AtomicBool>,
+    pool: ManagedPool,
+    receiver: Receiver<ScannerMessage>,
+    _: Params,
+    sink: Sink,
+) {
+    info!("New subscription");
+    fn send_update(tips: Vec<Chaintip>, sink: &Sink) -> std::result::Result<(), WsError> {
+        let tips: Vec<_> = tips
+            .into_iter()
+            .map(|tip| serde_json::to_value(tip).expect("JSON serde failed"))
+            .collect();
+
+        Ok(sink.notify(Params::Array(tips))?)
+    }
+
+    thread::spawn(move || {
+        let conn = pool.get().expect("Could not get pooled connection!");
+        match Chaintip::list_active(&conn) {
+            Ok(tips) => {
+                if let Err(e) = send_update(tips, &sink) {
+                    error!("Error sending chaintips to initialize client {:?}", e);
+                }
+            }
+            Err(e) => {
+                error!("Database error {:?}", e);
+            }
+        }
+
+        loop {
+            if exit.load(Ordering::SeqCst) {
+                break;
+            }
+
+            match receiver.recv_timeout(time::Duration::from_millis(5000)) {
+                Ok(ScannerMessage::NewChaintip) => {
+                    let conn = pool.get().expect("Could not get pooled connection!");
+                    let tips = match Chaintip::list_active(&conn) {
+                        Ok(tips) => tips,
+                        Err(e) => {
+                            error!("Database error {:?}", e);
+                            continue;
+                        }
+                    };
+
+                    if let Err(e) = send_update(tips, &sink) {
+                        error!("Error sending chaintips to client {:?}", e);
+                    }
+                }
+                Ok(_) => {}
+                Err(RecvTimeoutError::Timeout) => {
+                    info!("No chaintip updates");
+                }
+                Err(e) => {
+                    error!("Error! {:?}", e);
+                }
+            }
+        }
+    });
+}
+
 // handles subscriptions for chaintip updates
 fn handle_subscribe(
     exit: Arc<AtomicBool>,
@@ -869,7 +931,7 @@ pub fn run_server(
                 if let Some(subs) = subscriptions2
                     .lock()
                     .expect("Lock poisoned")
-                    .get_mut("forks")
+                    .get_mut("active_fork")
                 {
                     subs.retain(|sub| sub.send(ScannerMessage::NewChaintip).is_ok());
                 }
@@ -902,7 +964,7 @@ pub fn run_server(
                 if let Some(subs) = subscriptions2
                     .lock()
                     .expect("Lock poisoned")
-                    .get_mut("forks")
+                    .get_mut("active_fork")
                 {
                     subs.retain(|sub| {
                         sub.send(ScannerMessage::TipUpdated(invalidated_hashes.clone()))
@@ -915,7 +977,7 @@ pub fn run_server(
                 if let Some(subs) = subscriptions2
                     .lock()
                     .expect("Lock poisoned")
-                    .get_mut("forks")
+                    .get_mut("active_fork")
                 {
                     subs.retain(|sub| {
                         sub.send(ScannerMessage::TipUpdateFailed(err.clone()))
@@ -960,7 +1022,7 @@ pub fn run_server(
                 if let Some(subs) = subscriptions2
                     .lock()
                     .expect("Lock poisoned")
-                    .get_mut("forks")
+                    .get_mut("active_fork")
                 {
                     subs.retain(|sub| sub.send(ScannerMessage::NewChaintip).is_ok());
                 }
@@ -989,16 +1051,20 @@ pub fn run_server(
         let killer_clone7 = killers.clone();
         let killer_clone8 = killers.clone();
         let killer_clone9 = killers.clone();
+        let killer_clone10 = killers.clone();
+        let killer_clone11 = killers.clone();
         let pool3 = pool2.clone();
         let pool4 = pool2.clone();
+        let pool5 = pool2.clone();
         let subscriptions2 = subscriptions.clone();
+        let subscriptions6 = subscriptions.clone();
         // ws subscription endpoint for fork notifications
         io.add_subscription(
-            "forks",
+            "active_fork",
             (
-                "subscribe_forks",
+                "subscribe_active_fork",
                 move |params: Params, _, subscriber: Subscriber| {
-                    info!("Subscribe to forks");
+                    info!("Subscribe to active fork");
                     let mut rng = rand::rngs::OsRng::default();
                     if params != Params::None {
                         subscriber
@@ -1021,13 +1087,16 @@ pub fn run_server(
                     let (notify_tx, notify_rx) = unbounded();
                     {
                         let mut sub_lock = subscriptions.lock().expect("Lock poisoned");
-                        sub_lock.entry("forks").or_insert(vec![]).push(notify_tx);
+                        sub_lock
+                            .entry("active_fork")
+                            .or_insert(vec![])
+                            .push(notify_tx);
                     }
 
                     handle_subscribe(kill_switch, notify_rx, tips1.clone(), params, sink)
                 },
             ),
-            ("unsubscribe_forks", move |id: SubscriptionId, _| {
+            ("unsubscribe_active_fork", move |id: SubscriptionId, _| {
                 if let Some(arc) = killer_clone2.lock().expect("Lock poisoned").remove(&id) {
                     arc.store(true, Ordering::SeqCst);
                 }
@@ -1035,6 +1104,48 @@ pub fn run_server(
             }),
         );
 
+        // ws subscription endpoint for fork notifications
+        io.add_subscription(
+            "forks",
+            (
+                "subscribe_forks",
+                move |params: Params, _, subscriber: Subscriber| {
+                    info!("Subscribe to forks");
+                    let mut rng = rand::rngs::OsRng::default();
+                    if params != Params::None {
+                        subscriber
+                            .reject(Error {
+                                code: ErrorCode::ParseError,
+                                message: "Invalid parameters. Subscription rejected.".into(),
+                                data: None,
+                            })
+                            .unwrap();
+                        return;
+                    }
+
+                    let kill_switch = Arc::new(AtomicBool::new(false));
+                    let sub_id = SubscriptionId::Number(rng.gen());
+                    let sink = subscriber.assign_id(sub_id.clone()).unwrap();
+                    killer_clone10
+                        .lock()
+                        .expect("Lock poisoned")
+                        .insert(sub_id, kill_switch.clone());
+                    let (notify_tx, notify_rx) = unbounded();
+                    {
+                        let mut sub_lock = subscriptions6.lock().expect("Lock poisoned");
+                        sub_lock.entry("forks").or_insert(vec![]).push(notify_tx);
+                    }
+
+                    handle_subscribe_forks(kill_switch, pool5.clone(), notify_rx, params, sink)
+                },
+            ),
+            ("unsubscribe_forks", move |id: SubscriptionId, _| {
+                if let Some(arc) = killer_clone11.lock().expect("Lock poisoned").remove(&id) {
+                    arc.store(true, Ordering::SeqCst);
+                }
+                Box::pin(futures::future::ok(Value::Bool(true)))
+            }),
+        );
         // subscription endpoint for giving diff between tip height and stale block heights
         io.add_subscription(
             "validation_checks",

@@ -1,12 +1,12 @@
 use crate::{
     Block, BlockTemplate, Chaintip, ConflictingBlock, FeeRate, InflatedBlock, InvalidBlock, Lags,
     NewPeer, Node, Peer, Pool, SoftForks, StaleCandidate, StaleCandidateChildren, Transaction,
-    TxOutset, Watched,
+    TransactionAddress, TxOutset, Watched,
 };
 use bigdecimal::{BigDecimal, FromPrimitive};
 use bitcoin::{consensus::encode::serialize_hex, util::amount::Amount};
-use bitcoin_hashes::{sha256d, Hash};
 use bitcoin_hashes::hex::ToHex;
+use bitcoin_hashes::{sha256d, Hash};
 use bitcoincore_rpc::bitcoin as btc;
 use bitcoincore_rpc::bitcoincore_rpc_json::{
     GetBlockHeaderResult, GetBlockResult, GetBlockTemplateCapabilities, GetBlockTemplateModes,
@@ -33,7 +33,6 @@ use std::{
     str::FromStr,
 };
 use thiserror::Error;
-
 
 const MAX_ANCESTRY_DEPTH: usize = 100;
 const MAX_BLOCK_DEPTH: i64 = 10;
@@ -328,7 +327,7 @@ impl BtcClient for Client {
 
     fn get_block(&self, hash: &btc::BlockHash) -> Result<btc::Block, bitcoincore_rpc::Error> {
         RpcApi::get_block(self, hash)
-	}
+    }
 
     fn get_block_hex(&self, hash: &btc::BlockHash) -> Result<String, bitcoincore_rpc::Error> {
         RpcApi::get_block_hex(self, hash)
@@ -2092,14 +2091,9 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
             return;
         }
 
-        let node = self
-            .clients
-            .iter()
-            .find(|c| c.node_id == block.first_seen_by)
-            .unwrap()
-            .clone();
+        let node = self.clients.iter().next().unwrap().clone();
 
-		let hash = btc::BlockHash::from_str(&block.hash).unwrap();
+        let hash = btc::BlockHash::from_str(&block.hash).unwrap();
         let block_info = match node.client().get_block(&hash) {
             Ok(bi) => bi,
             Err(e) => {
@@ -2108,21 +2102,20 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
             }
         };
 
-
+        let mut tx_addrs = Vec::new();
         info!("Fetching transactions for {}", block.hash);
         for (idx, tx) in block_info.txdata.iter().enumerate() {
-		    let mut address = String::from("NO_ADDRESS");
-			let hex = serialize_hex(tx);
+            let hex = serialize_hex(tx);
 
             for vout in &tx.output {
-			    let spk = &vout.script_pubkey;
-				address = spk.script_hash().to_string();
+                let spk = &vout.script_pubkey;
+                let address = spk.script_hash().to_string();
+                tx_addrs.push((block.hash.clone(), tx.txid().to_hex(), address));
             }
 
             let value = tx.output.iter().fold(0, |a, amt| a + amt.value);
             if let Err(e) = Transaction::create(
                 &self.db_conn,
-                address,
                 false,
                 block.hash.to_string(),
                 idx,
@@ -2132,6 +2125,10 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
             ) {
                 error!("Could not insert transaction {:?}", e);
             }
+        }
+
+        if let Err(e) = TransactionAddress::insert(&self.db_conn, tx_addrs) {
+            error!("Database update failed: {:?}", e);
         }
     }
 
@@ -2458,15 +2455,15 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
 
                 if raw_block.is_some() {
                     let b = raw_block.clone().unwrap();
-                    let node = self
-                        .clients
-                        .iter()
-                        .find(|c| c.node_id == originally_seen)
-                        .unwrap();
+                    let node = self.clients.iter().find(|c| c.node_id == originally_seen);
 
-                    if let Err(e) = node.client().submit_block(b, &hash) {
-                        error!("Could not submit block {:?}", e);
-                        continue;
+                    if let Some(node) = node {
+                        if let Err(e) = node.client().submit_block(b, &hash) {
+                            error!("Could not submit block {:?}", e);
+                            continue;
+                        }
+                    } else {
+                        warn!("Originally seen node not found!");
                     }
                 }
             }
@@ -2489,22 +2486,23 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
                     if code == BLOCK_NOT_FOUND =>
                 {
                     debug!("Header not found");
-                    let node = self
-                        .clients
-                        .iter()
-                        .find(|c| c.node_id == originally_seen)
-                        .unwrap();
-                    let header = match node.client().get_block_header(&hash) {
-                        Ok(block_header) => serialize_hex(&block_header),
-                        Err(e) => {
-                            error!("Could not fetch header from originally seen {:?}", e);
+                    let node = self.clients.iter().find(|c| c.node_id == originally_seen);
+
+                    if let Some(node) = node {
+                        let header = match node.client().get_block_header(&hash) {
+                            Ok(block_header) => serialize_hex(&block_header),
+                            Err(e) => {
+                                error!("Could not fetch header from originally seen {:?}", e);
+                                continue;
+                            }
+                        };
+
+                        if let Err(e) = mirror.submit_header(header) {
+                            error!("Could not submit block {:?}", e);
                             continue;
                         }
-                    };
-
-                    if let Err(e) = mirror.submit_header(header) {
-                        error!("Could not submit block {:?}", e);
-                        continue;
+                    } else {
+                        warn!("Originally seen node not found!");
                     }
                 }
                 Err(e) => {
@@ -2529,12 +2527,14 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
             gbfp_blocks.push(block);
         }
 
-        let client = self
-            .clients
-            .iter()
-            .filter(|c| c.mirror().is_some())
-            .next()
-            .unwrap();
+        let client = self.clients.iter().filter(|c| c.mirror().is_some()).next();
+
+        if client.is_none() {
+            error!("No mirror nodes!");
+            return;
+        }
+
+        let client = client.unwrap();
         let mirror = client.mirror().as_ref().unwrap();
 
         let mut found_block = false;

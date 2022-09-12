@@ -10,7 +10,8 @@ use std::collections::HashMap;
 use crate::schema::{
     block_templates, blocks, chaintips, double_spent_by, fee_rates, inflated_blocks,
     invalid_blocks, lags, nodes, peers, pool, rbf_by, softforks, stale_candidate,
-    stale_candidate_children, transaction, tx_outsets, valid_blocks, watched,
+    stale_candidate_children, transaction, transaction_addresses, tx_outsets, valid_blocks,
+    watched,
 };
 use crate::MinerPoolInfo;
 
@@ -200,6 +201,33 @@ impl Chaintip {
 #[table_name = "blocks"]
 pub struct Height {
     pub height: i64,
+}
+
+#[derive(Debug, AsChangeset, QueryableByName, Queryable, Insertable)]
+#[table_name = "transaction_addresses"]
+pub struct TransactionAddress {
+    pub hash: String,
+    pub txid: String,
+    pub address: String,
+}
+
+impl TransactionAddress {
+    pub fn insert(conn: &PgConnection, data: Vec<(String, String, String)>) -> QueryResult<usize> {
+        use crate::schema::transaction_addresses::dsl::*;
+        let tx_addrs: Vec<_> = data
+            .into_iter()
+            .map(|(tx_hash, id, tx_address)| TransactionAddress {
+                hash: tx_hash,
+                txid: id,
+                address: tx_address,
+            })
+            .collect();
+
+        diesel::insert_into(transaction_addresses)
+            .values(&tx_addrs)
+            .on_conflict_do_nothing()
+            .execute(conn)
+    }
 }
 
 #[derive(Debug, AsChangeset, QueryableByName, Queryable, Insertable)]
@@ -842,14 +870,12 @@ pub struct Transaction {
     pub is_coinbase: bool,
     pub hex: String,
     pub amount: f64,
-    pub address: Option<String>,
     pub swept: Option<bool>,
 }
 
 impl Transaction {
     pub fn create(
         conn: &PgConnection,
-        addr: String,
         sweep: bool,
         block: String,
         idx: usize,
@@ -860,7 +886,6 @@ impl Transaction {
         use crate::schema::transaction::dsl::*;
 
         let tx = Transaction {
-            address: Some(addr),
             block_id: block,
             is_coinbase: idx == 0,
             txid: tx_id.clone(),
@@ -1298,14 +1323,31 @@ impl Watched {
 
     pub fn fetch(conn: &PgConnection) -> QueryResult<Vec<Transaction>> {
         use crate::schema::transaction::dsl as tdsl;
+        use crate::schema::transaction_addresses::dsl as tadsl;
         use crate::schema::watched::dsl as wdsl;
         use diesel::dsl::any;
 
         let watched: Vec<_> = wdsl::watched.load(conn)?;
         let watched: Vec<_> = watched.into_iter().map(|w: Watched| w.address).collect();
 
+        let transactions: Vec<(String, String, String)> = tadsl::transaction_addresses
+            .filter(tadsl::address.eq(any(watched)))
+            .load(conn)?;
+
+        let mut block_ids = Vec::new();
+        let mut tx_ids = Vec::new();
+
+        for (h, id, _) in transactions.into_iter() {
+            block_ids.push(h);
+            tx_ids.push(id);
+        }
+
         let transactions: Vec<_> = tdsl::transaction
-            .filter(tdsl::address.eq(any(watched)))
+            .filter(
+                tdsl::block_id
+                    .eq_any(block_ids)
+                    .and(tdsl::txid.eq_any(tx_ids)),
+            )
             .load(conn)?;
 
         Ok(transactions)

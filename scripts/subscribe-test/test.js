@@ -8,6 +8,13 @@ ws.addEventListener('open', () => {
 
   ws.send(JSON.stringify({
     jsonrpc: "2.0",
+    id: "active_fork",
+    method: "subscribe_active_fork",
+    params: null,
+  }));
+
+  ws.send(JSON.stringify({
+    jsonrpc: "2.0",
     id: "forks",
     method: "subscribe_forks",
     params: null,
@@ -63,6 +70,8 @@ ws.addEventListener('message', (message) => {
   } else {
       if (obj.method == "forks") {
           console.log(`Got forks method: ${JSON.stringify(obj.params)}`);
+      } else if (obj.method == "active_fork") {
+          console.log(`Got active fork method: ${JSON.stringify(obj.params)}`);
       } else if (obj.method == "validation_checks") {
           console.log(`Got checks method: ${JSON.stringify(obj.params)}`);
       } else if (obj.method == "invalid_block_checks") {

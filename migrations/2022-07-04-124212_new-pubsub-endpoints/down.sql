@@ -1,10 +1,10 @@
 -- This file should undo anything in `up.sql`
 DROP TABLE lags;
 DROP TABLE watched;
+DROP TABLE transaction_addresses;
 
 ALTER TABLE transaction
-DROP COLUMN swept,
-DROP COLUMN address;
+DROP COLUMN swept;
 
 ALTER TABLE invalid_blocks
 DROP COLUMN created_at;

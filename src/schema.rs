@@ -181,8 +181,15 @@ diesel::table! {
         is_coinbase -> Bool,
         hex -> Varchar,
         amount -> Float8,
-        address -> Nullable<Varchar>,
         swept -> Nullable<Bool>,
+    }
+}
+
+diesel::table! {
+    transaction_addresses (hash, txid, address) {
+        hash -> Varchar,
+        txid -> Varchar,
+        address -> Varchar,
     }
 }
 
@@ -239,6 +246,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     stale_candidate,
     stale_candidate_children,
     transaction,
+    transaction_addresses,
     tx_outsets,
     valid_blocks,
     watched,
