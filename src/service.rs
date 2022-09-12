@@ -935,6 +935,13 @@ pub fn run_server(
                 {
                     subs.retain(|sub| sub.send(ScannerMessage::NewChaintip).is_ok());
                 }
+                if let Some(subs) = subscriptions2
+                    .lock()
+                    .expect("Lock poisoned")
+                    .get_mut("forks")
+                {
+                    subs.retain(|sub| sub.send(ScannerMessage::NewChaintip).is_ok());
+                }
             }
             Ok(ScannerMessage::LaggingNodes(lags)) => {
                 debug!("New lagging nodes updates");
