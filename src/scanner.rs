@@ -1417,7 +1417,7 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
         mirrors.par_iter().for_each(|mirror| {
             let host = format!(
                 "http://{}:{}",
-                mirror.rpc_host,
+                mirror.mirror_host.as_ref().unwrap_or(&mirror.rpc_host).to_string(),
                 mirror.mirror_rpc_port.expect("No mirror port")
             );
             let auth = Auth::UserPass(mirror.rpc_user.clone(), mirror.rpc_pass.clone());

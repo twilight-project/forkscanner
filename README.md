@@ -38,6 +38,9 @@ This needs to be run on a node with bitcoin running.
 - `get_tips`: params { active_only: bool }
   Fetch the list of current chaintips, if active_only is set it will be only the active tips.
 
+- `get_nodes`: params None
+  Fetch the list of current nodes the forkscanner is monitoring.
+
 - `add_node`: params { name: string, rpc_host: string, rpc_port: int, mirror_rpc_port: int, user: string, pass: string }
   Add a node to forkscanner's list of nodes to query.
 
@@ -71,6 +74,39 @@ Example usage of these endpoints can be found in `./scripts/subscribe-test`:
 
 
 ### POST examples:
+`get_nodes`:
+
+POST 
+```json
+    {"method": "get_nodes", "jsonrpc": "2.0", "id": 1}
+```
+
+Response:
+```json
+{
+  "jsonrpc": "2.0",
+  "result": [
+    {
+      "archive": false,
+      "id": 14,
+      "initial_block_download": true,
+      "last_polled": null,
+      "mirror_host": null,
+      "mirror_last_polled": null,
+      "mirror_rpc_port": null,
+      "mirror_unreachable_since": null,
+      "node": "remote",
+      "rpc_host": "127.0.0.1",
+      "rpc_pass": "xxx",
+      "rpc_port": 8332,
+      "rpc_user": "bitcoin",
+      "unreachable_since": null
+    }
+  ],
+  "id": 1
+}
+```
+
 `get_tips`:
 
 POST 

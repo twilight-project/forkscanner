@@ -498,6 +498,28 @@ fn add_node(conn: Conn, params: Params) -> Result<Value> {
     }
 }
 
+// get nodes from database
+fn get_nodes(conn: Conn, params: Params) -> Result<Value> {
+	if params != Params::None {
+		let err = JsonRpcError::invalid_params(format!("Unexpected parameters to get_nodes."));
+		Err(err)
+	} else {
+		if let Ok(nodes) = Node::list(&conn) {
+		    let nodes: Vec<_> = nodes.into_iter().map(|mut n| {
+			    n.rpc_pass = "xxx".to_string();
+				n
+			}).collect();
+
+		    match serde_json::to_value(&nodes) {
+			    Ok(n) => Ok(n),
+				Err(_) => Err(JsonRpcError::internal_error()),
+			}
+		} else {
+			Err(JsonRpcError::internal_error())
+		}
+	}
+}
+
 // remove node from database
 fn remove_node(conn: Conn, params: Params) -> Result<Value> {
     match params.parse::<NodeId>() {
@@ -869,6 +891,12 @@ pub fn run_server(
         io.add_sync_method("remove_node", move |params: Params| {
             let conn = p.get().unwrap();
             remove_node(conn, params)
+        });
+
+        let p = pool.clone();
+        io.add_sync_method("get_nodes", move |params: Params| {
+            let conn = p.get().unwrap();
+            get_nodes(conn, params)
         });
 
         let p = pool.clone();

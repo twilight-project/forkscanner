@@ -1102,7 +1102,7 @@ impl StaleCandidate {
     }
 }
 
-#[derive(AsChangeset, QueryableByName, Queryable, Insertable)]
+#[derive(AsChangeset, QueryableByName, Queryable, Insertable, Serialize)]
 #[table_name = "nodes"]
 pub struct Node {
     pub id: i64,
