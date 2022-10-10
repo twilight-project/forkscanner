@@ -4,11 +4,13 @@ As the name suggests Forkscanner is responsible to scan the bitcoin chain contin
 
 Apart from monitoring forks, forkscanner also checks for any potential double spends in the chain and keeps track of inflation. there is also an address watcher incorporated in the forkscanner, which keeps an eye out for the addresses we want to monitor and notifies when there is an inflow or outflow of funds from any of addresses under watch.
 
+Please go through the DB schema [here](https://github.com/twilight-project/forkscanner/blob/spec-fixes/spec/db_schema.md). as this tool relies heavily on SQL DB.
+
 ## Requirements:
 
 - The system will run and maintain at least 3 BTC nodes with different versions.
 - One of these 3 nodes will also have a mirror node.
-- A SQL DB shall be maintained (Schema diagram shared with this document).
+- A Postgres DB shall be maintained (Schema diagram shared with this document).
 - An API to add and retrieve data (details below)
 - System shall have a service for bootstrapping. (Details below)
 - System will have a service for fork validation. (Explained below)
@@ -17,18 +19,43 @@ Apart from monitoring forks, forkscanner also checks for any potential double sp
 
 ## API Spec
 
-Following API endpoints are needed.
+Forkscanner exposes a variety of API endpoint to allow other application to make use of its features. these API endpoints consist of JSON-RPC as well as Web Socket endpoint which follow a pub/sub apprach, examples can be found in the readme file
 
-- An API end point to add/delete/update new nodes info in the DB.^
-- An API end point to get a list of blocks from DB, or get by hash or height.^
-- An API endpoint to get the latest chain tip form DB.^
+### RPC endpoints
+- `get_tips`: params { active_only: bool }
+  Fetch the list of current chaintips, if active_only is set it will be only the active tips.
 
-Data must be passed as request body not as query string. The data to be sent in the API request
-is the same as the Node and block struct shared above.
+- `add_node`: params { name: string, rpc_host: string, rpc_port: int, mirror_rpc_port: int, user: string, pass: string }
+  Add a node to forkscanner's list of nodes to query.
 
-**Auth**
-Node API endpoint needs authentication. For that we can either decide to create and maintain a
-user table or just use a JWT token. That is on the developer to decide
+- `remove_node`: { id: int }
+  Removes a node from forkscanner's list.
+
+- `get_block`: params { hash: string } OR { height: int } 
+  Get a block by hash or height.
+
+- `get_block_from_peer`: params { node_id: int, hash: string, peer_id: int } 
+  Fetch a block from a specified node.
+
+- `tx_is_active`: params: { id: string }
+  Query whether transaction is in active branch.
+
+### pub/sub endpoints
+
+- active_fork
+returns a single true active chaintip
+
+- forks
+returns active chaintip for each node
+
+- validation_checks
+returns the stale candidates and the height difference between active tip and the candidate
+
+- invalid_block_checks
+returns any new invalid block
+
+- lagging_nodes_checks
+returns a lagging nodes.
 
 ##                                                             Fork Detection
 
