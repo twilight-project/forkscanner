@@ -16,6 +16,10 @@ struct Opt {
     /// Set ws port
     #[structopt(short = "w", long = "ws", default_value = "8340")]
     ws: u16,
+
+    /// Enable address watcher
+    #[structopt(short = "a", long = "watch-addresses")]
+    watch_addresses: bool,
 }
 
 fn main() {
@@ -25,8 +29,9 @@ fn main() {
     let db_conn = PgConnection::establish(&db_url).expect("Connection failed");
     let opt = Opt::from_args();
 
-    let (scanner, receiver, command) =
+    let (mut scanner, receiver, command) =
         ForkScanner::<Client>::new(db_conn).expect("Launching forkscanner failed");
+	scanner.enable_address_watcher(opt.watch_addresses);
     let duration = std::time::Duration::from_millis(10_000);
 
     let _handle = std::thread::spawn(move || loop {

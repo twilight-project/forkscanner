@@ -1,8 +1,10 @@
 use crate::{
-    serde_bigdecimal, Block, Chaintip, Node, ScannerCommand, ScannerMessage, StaleCandidate,
-    Transaction,
+    scanner::BtcClient, serde_bigdecimal, Block, Chaintip, ConflictingBlock, Lags, Node, Peer,
+    ScannerCommand, ScannerMessage, StaleCandidate, Transaction, Watched,
 };
 use bigdecimal::BigDecimal;
+use bitcoin::consensus::encode::serialize_hex;
+use bitcoincore_rpc::bitcoin::Block as BitcoinBlock;
 use bitcoincore_rpc::{Auth, Client, RpcApi};
 use chrono::prelude::*;
 use crossbeam::channel::{unbounded, Receiver, RecvTimeoutError, Sender};
@@ -44,6 +46,13 @@ pub enum WsError {
     SinkError(#[from] futures::channel::mpsc::TrySendError<std::string::String>),
 }
 
+// https://docs.rs/bitcoin/0.27.1/bitcoin/blockdata/block/struct.Block.html
+#[derive(Debug, Deserialize)]
+struct BlockUpload {
+    node_id: i64,
+    block: BitcoinBlock,
+}
+
 #[derive(Debug, Deserialize)]
 struct NodeId {
     id: i64,
@@ -74,6 +83,21 @@ struct NodeArgs {
     mirror_rpc_port: Option<i32>,
     user: String,
     pass: String,
+    mirror_host: Option<String>,
+    archive: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct WatchedAddressUpdate {
+    remove: Vec<String>,
+	add: Vec<(String, DateTime<Utc>)>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct WatchAddress {
+    watch: Vec<String>,
+    watch_until: DateTime<Utc>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -237,7 +261,7 @@ fn validation_checks(conn: Conn, window: i64) -> Result<Value> {
         })
         .collect();
 
-    debug!("{} stale candidates in window {}", checks.len(), window);
+    info!("{} stale candidates in window {}", checks.len(), window);
     match serde_json::to_value(checks) {
         Ok(t) => Ok(t),
         Err(_) => Err(JsonRpcError::internal_error()),
@@ -264,6 +288,82 @@ fn tx_is_active(conn: Conn, params: Params) -> Result<Value> {
                 Err(_) => Err(JsonRpcError::internal_error()),
             }
         }
+        Err(args) => {
+            let err = JsonRpcError::invalid_params(format!("Invalid parameters, {:?}", args));
+            Err(err)
+        }
+    }
+}
+
+// update watched addresses
+fn update_watched_addresses(conn: Conn, params: Params) -> Result<Value> {
+    match params.parse::<WatchedAddressUpdate>() {
+	    Ok(updates) => {
+		    let WatchedAddressUpdate { remove, add } = updates;
+
+		    if let Err(_) = Watched::remove(&conn, remove) {
+                return Err(JsonRpcError::internal_error());
+			};
+
+            if let Err(_) = Watched::insert(&conn, add) {
+                return Err(JsonRpcError::internal_error());
+			}
+
+		    Ok("OK".into())
+		}
+        Err(args) => {
+            let err = JsonRpcError::invalid_params(format!("Invalid parameters, {:?}", args));
+            Err(err)
+        }
+	}
+}
+
+fn submit_block(conn: Conn, params: Params) -> Result<Value> {
+    match params.parse::<BlockUpload>() {
+        Ok(upload) => match Node::get(&conn, upload.node_id) {
+            Ok(node) => {
+                let auth = Auth::UserPass(node.rpc_user.clone(), node.rpc_pass.clone());
+
+                if let Ok(client) = Client::new(&node.rpc_host, auth) {
+                    let hash = upload.block.block_hash();
+                    let block_hex = serialize_hex(&upload.block);
+
+                    match client.submit_block(block_hex, &hash) {
+                        Ok(_) => Ok("OK".into()),
+                        Err(e) => {
+                            let errmsg = format!("Call to submit block failed. {:?}", e);
+                            return Err(JsonRpcError::invalid_params(errmsg));
+                        }
+                    }
+                } else {
+                    let err = JsonRpcError::invalid_params(format!(
+                        "Failed to establish a node connection."
+                    ));
+                    return Err(err);
+                }
+            }
+            Err(e) => {
+                let err = JsonRpcError::invalid_params(format!("Node not found, {:?}", e));
+                Err(err)
+            }
+        },
+        Err(args) => {
+            let err = JsonRpcError::invalid_params(format!("Invalid parameters, {:?}", args));
+            Err(err)
+        }
+    }
+}
+
+// get peer list for a node
+fn get_peers(conn: Conn, params: Params) -> Result<Value> {
+    match params.parse::<NodeId>() {
+        Ok(id) => match Peer::list(&conn, id.id) {
+            Ok(peers) => match serde_json::to_value(peers) {
+                Ok(value) => Ok(value),
+                Err(_) => Err(JsonRpcError::internal_error()),
+            },
+            Err(_) => Err(JsonRpcError::internal_error()),
+        },
         Err(args) => {
             let err = JsonRpcError::invalid_params(format!("Invalid parameters, {:?}", args));
             Err(err)
@@ -411,6 +511,8 @@ fn add_node(conn: Conn, params: Params) -> Result<Value> {
                 args.mirror_rpc_port,
                 args.user,
                 args.pass,
+                args.mirror_host,
+                args.archive,
             ) {
                 Ok(n.id.into())
             } else {
@@ -442,19 +544,22 @@ fn remove_node(conn: Conn, params: Params) -> Result<Value> {
 }
 
 // fetch currently active chaintips
-fn get_tips(params: Params, tips: Vec<Chaintip>) -> Result<Value> {
+fn get_tips(params: Params, conn: Conn) -> Result<Value> {
     match params.parse::<TipArgs>() {
         Ok(t) => {
             let chaintips = if t.active_only {
-                tips.iter()
-                    .filter(|t| t.status == "active")
-                    .cloned()
-                    .collect::<Vec<Chaintip>>()
+                Chaintip::list_active(&conn)
             } else {
-                tips.to_vec()
+                Chaintip::list(&conn)
             };
 
-            match serde_json::to_value(chaintips) {
+            if let Err(e) = chaintips {
+                let err =
+                    JsonRpcError::invalid_params(format!("Couldn't fetch chaintips, {:?}", e));
+                return Err(err);
+            }
+
+            match serde_json::to_value(chaintips.unwrap()) {
                 Ok(t) => Ok(t),
                 Err(_) => Err(JsonRpcError::internal_error()),
             }
@@ -516,25 +621,214 @@ fn handle_validation_subscribe(
     });
 }
 
-// handles subscriptions for chaintip updates
-fn handle_subscribe(
+// Notify of watched address activity
+fn handle_watched_addresses(
     exit: Arc<AtomicBool>,
     receiver: Receiver<ScannerMessage>,
+    watch: Vec<String>,
+    watch_until: DateTime<Utc>,
     pool: ManagedPool,
+    sink: Sink,
+) {
+    let conn = pool.get().expect("Connection pool failure");
+
+    let watches: Vec<_> = watch.into_iter().map(|w| (w, watch_until.clone())).collect();
+    Watched::insert(&conn, watches).expect("Could not insert watchlist!");
+
+    info!("New address activity");
+    let send_update =
+        move |transactions: Vec<Transaction>, sink: &Sink| -> std::result::Result<(), WsError> {
+            let resp = transactions
+                .into_iter()
+                .map(|tx| serde_json::to_value(tx).expect("Could not serialize transaction"))
+                .collect();
+            Ok(sink.notify(Params::Array(resp))?)
+        };
+
+    thread::spawn(move || loop {
+        if exit.load(Ordering::SeqCst) {
+            break;
+        }
+
+        match receiver.recv_timeout(time::Duration::from_millis(5000)) {
+            Ok(ScannerMessage::WatchedAddress(transactions)) => {
+                if let Err(e) = send_update(transactions, &sink) {
+                    error!("Error sending watched activity to client {:?}", e);
+                }
+            }
+            Ok(_) => {}
+            Err(RecvTimeoutError::Timeout) => {
+                info!("No lagging node updates");
+            }
+            Err(e) => {
+                error!("Error! {:?}", e);
+            }
+        }
+    });
+}
+
+// Notify of lagging nodes
+fn handle_lagging_nodes_subscribe(
+    exit: Arc<AtomicBool>,
+    receiver: Receiver<ScannerMessage>,
+    sink: Sink,
+) {
+    info!("New subscription");
+    let send_update = move |lags: Vec<Lags>, sink: &Sink| -> std::result::Result<(), WsError> {
+        let resp = lags
+            .into_iter()
+            .map(|conf| serde_json::to_value(conf).expect("Could not serialize lagging node"))
+            .collect();
+        Ok(sink.notify(Params::Array(resp))?)
+    };
+
+    thread::spawn(move || loop {
+        if exit.load(Ordering::SeqCst) {
+            break;
+        }
+
+        match receiver.recv_timeout(time::Duration::from_millis(5000)) {
+            Ok(ScannerMessage::LaggingNodes(lags)) => {
+                if let Err(e) = send_update(lags, &sink) {
+                    error!("Error sending lagging nodes to client {:?}", e);
+                }
+            }
+            Ok(_) => {}
+            Err(RecvTimeoutError::Timeout) => {
+                info!("No lagging node updates");
+            }
+            Err(e) => {
+                error!("Error! {:?}", e);
+            }
+        }
+    });
+}
+
+// invalid block endpoint subscription handler
+fn handle_invalid_block_subscribe(
+    exit: Arc<AtomicBool>,
+    receiver: Receiver<ScannerMessage>,
+    sink: Sink,
+) {
+    info!("New subscription");
+    let send_update = move |blocks: Vec<ConflictingBlock>,
+                            sink: &Sink|
+          -> std::result::Result<(), WsError> {
+        let resp = blocks
+            .into_iter()
+            .map(|conf| serde_json::to_value(conf).expect("Could not serialize conflicting block"))
+            .collect();
+        Ok(sink.notify(Params::Array(resp))?)
+    };
+
+    thread::spawn(move || loop {
+        if exit.load(Ordering::SeqCst) {
+            break;
+        }
+
+        match receiver.recv_timeout(time::Duration::from_millis(5000)) {
+            Ok(ScannerMessage::NewBlockConflicts(conflicts)) => {
+                if let Err(e) = send_update(conflicts, &sink) {
+                    error!("Error sending block conflicts to client {:?}", e);
+                }
+            }
+            Ok(_) => {}
+            Err(RecvTimeoutError::Timeout) => {
+                info!("No block conflict updates");
+            }
+            Err(e) => {
+                error!("Error! {:?}", e);
+            }
+        }
+    });
+}
+
+fn handle_subscribe_forks(
+    exit: Arc<AtomicBool>,
+    pool: ManagedPool,
+    receiver: Receiver<ScannerMessage>,
     _: Params,
     sink: Sink,
 ) {
     info!("New subscription");
-    fn send_update(pool: &ManagedPool, sink: &Sink) -> std::result::Result<(), WsError> {
-        let conn = pool.get()?;
-        let values = Chaintip::list(&conn)?;
-        let tips = serde_json::to_value(values)?;
+    fn send_update(tips: Vec<Chaintip>, sink: &Sink) -> std::result::Result<(), WsError> {
+        let tips: Vec<_> = tips
+            .into_iter()
+            .map(|tip| serde_json::to_value(tip).expect("JSON serde failed"))
+            .collect();
 
-        Ok(sink.notify(Params::Array(vec![tips]))?)
+        Ok(sink.notify(Params::Array(tips))?)
     }
 
     thread::spawn(move || {
-        if let Err(e) = send_update(&pool, &sink) {
+        let conn = pool.get().expect("Could not get pooled connection!");
+        match Chaintip::list_active(&conn) {
+            Ok(tips) => {
+                if let Err(e) = send_update(tips, &sink) {
+                    error!("Error sending chaintips to initialize client {:?}", e);
+                }
+            }
+            Err(e) => {
+                error!("Database error {:?}", e);
+            }
+        }
+
+        loop {
+            if exit.load(Ordering::SeqCst) {
+                break;
+            }
+
+            match receiver.recv_timeout(time::Duration::from_millis(5000)) {
+                Ok(ScannerMessage::NewChaintip) => {
+                    let conn = pool.get().expect("Could not get pooled connection!");
+                    let tips = match Chaintip::list_active(&conn) {
+                        Ok(tips) => tips,
+                        Err(e) => {
+                            error!("Database error {:?}", e);
+                            continue;
+                        }
+                    };
+
+                    if let Err(e) = send_update(tips, &sink) {
+                        error!("Error sending chaintips to client {:?}", e);
+                    }
+                }
+                Ok(_) => {}
+                Err(RecvTimeoutError::Timeout) => {
+                    info!("No chaintip updates");
+                }
+                Err(e) => {
+                    error!("Error! {:?}", e);
+                }
+            }
+        }
+    });
+}
+
+// handles subscriptions for chaintip updates
+fn handle_subscribe(
+    exit: Arc<AtomicBool>,
+    receiver: Receiver<ScannerMessage>,
+    tips: Arc<RwLock<Vec<Chaintip>>>,
+    _: Params,
+    sink: Sink,
+) {
+    info!("New subscription");
+    fn send_update(
+        tips: &Arc<RwLock<Vec<Chaintip>>>,
+        sink: &Sink,
+    ) -> std::result::Result<(), WsError> {
+        let values = tips.read().expect("Lock poisoned").clone();
+        let tips: Vec<_> = values
+            .into_iter()
+            .map(|tip| serde_json::to_value(tip).expect("JSON serde failed"))
+            .collect();
+
+        Ok(sink.notify(Params::Array(tips))?)
+    }
+
+    thread::spawn(move || {
+        if let Err(e) = send_update(&tips, &sink) {
             error!("Error sending chaintips to initialize client {:?}", e);
         }
 
@@ -545,7 +839,7 @@ fn handle_subscribe(
 
             match receiver.recv_timeout(time::Duration::from_millis(5000)) {
                 Ok(ScannerMessage::NewChaintip) => {
-                    if let Err(e) = send_update(&pool, &sink) {
+                    if let Err(e) = send_update(&tips, &sink) {
                         error!("Error sending chaintips to client {:?}", e);
                     }
                 }
@@ -588,8 +882,10 @@ pub fn run_server(
     // set up some rpc endpoints
     let t1 = thread::spawn(move || {
         let mut io = IoHandler::new();
+        let p = pool.clone();
         io.add_sync_method("get_tips", move |params: Params| {
-            get_tips(params, tips1.read().expect("RwLock failed").clone())
+            let conn = p.get().unwrap();
+            get_tips(params, conn)
         });
 
         let p = pool.clone();
@@ -630,6 +926,24 @@ pub fn run_server(
             tx_is_active(conn, params)
         });
 
+        let p = pool.clone();
+        io.add_sync_method("get_peers", move |params: Params| {
+            let conn = p.get().unwrap();
+            get_peers(conn, params)
+        });
+
+        let p = pool.clone();
+        io.add_sync_method("submit_block", move |params: Params| {
+            let conn = p.get().unwrap();
+            submit_block(conn, params)
+        });
+
+        let p = pool.clone();
+        io.add_sync_method("update_watched_addresses", move |params: Params| {
+            let conn = p.get().unwrap();
+            update_watched_addresses(conn, params)
+        });
+
         let server = hts::ServerBuilder::new(io)
             .start_http(&SocketAddr::from((l1.parse::<IpAddr>().unwrap(), rpc)))
             .expect("Failed to start RPC server");
@@ -641,25 +955,93 @@ pub fn run_server(
         HashMap::<&str, Vec<Sender<ScannerMessage>>>::default(),
     ));
     let subscriptions2 = subscriptions.clone();
+    let subscriptions3 = subscriptions.clone();
+    let subscriptions4 = subscriptions.clone();
+    let subscriptions5 = subscriptions.clone();
     // listener thread for notifications from forkscanner
     let t2 = thread::spawn(move || loop {
         match receiver.recv() {
             Ok(ScannerMessage::NewChaintip) => {
                 debug!("New chaintip updates");
-                if let Some(subs) = subscriptions2.lock().expect("Lock poisoned").get_mut("forks") {
-				    subs.retain(|sub| sub.send(ScannerMessage::NewChaintip).is_ok());
+                if let Some(subs) = subscriptions2
+                    .lock()
+                    .expect("Lock poisoned")
+                    .get_mut("active_fork")
+                {
+                    subs.retain(|sub| sub.send(ScannerMessage::NewChaintip).is_ok());
+                }
+                if let Some(subs) = subscriptions2
+                    .lock()
+                    .expect("Lock poisoned")
+                    .get_mut("forks")
+                {
+                    subs.retain(|sub| sub.send(ScannerMessage::NewChaintip).is_ok());
+                }
+            }
+            Ok(ScannerMessage::LaggingNodes(lags)) => {
+                debug!("New lagging nodes updates");
+                if let Some(subs) = subscriptions2
+                    .lock()
+                    .expect("Lock poisoned")
+                    .get_mut("lagging_nodes")
+                {
+                    subs.retain(|sub| sub.send(ScannerMessage::LaggingNodes(lags.clone())).is_ok());
+                }
+            }
+            Ok(ScannerMessage::NewBlockConflicts(conflicts)) => {
+                debug!("New block conflict updates");
+                if let Some(subs) = subscriptions2
+                    .lock()
+                    .expect("Lock poisoned")
+                    .get_mut("invalid_block_checks")
+                {
+                    subs.retain(|sub| {
+                        sub.send(ScannerMessage::NewBlockConflicts(conflicts.clone()))
+                            .is_ok()
+                    });
                 }
             }
             Ok(ScannerMessage::TipUpdated(invalidated_hashes)) => {
                 debug!("New chaintip updates");
-                if let Some(subs) = subscriptions2.lock().expect("Lock poisoned").get_mut("forks") {
-					subs.retain(|sub| sub.send(ScannerMessage::TipUpdated(invalidated_hashes.clone())).is_ok());
+                if let Some(subs) = subscriptions2
+                    .lock()
+                    .expect("Lock poisoned")
+                    .get_mut("active_fork")
+                {
+                    subs.retain(|sub| {
+                        sub.send(ScannerMessage::TipUpdated(invalidated_hashes.clone()))
+                            .is_ok()
+                    });
                 }
             }
             Ok(ScannerMessage::TipUpdateFailed(err)) => {
                 debug!("New chaintip updates");
-                if let Some(subs) = subscriptions2.lock().expect("Lock poisoned").get_mut("forks") {
-				    subs.retain(|sub| sub.send(ScannerMessage::TipUpdateFailed(err.clone())).is_ok());
+                if let Some(subs) = subscriptions2
+                    .lock()
+                    .expect("Lock poisoned")
+                    .get_mut("active_fork")
+                {
+                    subs.retain(|sub| {
+                        sub.send(ScannerMessage::TipUpdateFailed(err.clone()))
+                            .is_ok()
+                    });
+                }
+            }
+            Ok(ScannerMessage::WatchedAddress(txs)) => {
+                debug!("New watched address activity");
+                if let Some(subs) = subscriptions2
+                    .lock()
+                    .expect("Lock poisoned")
+                    .get_mut("watched_addresses")
+                {
+                    debug!(
+                        "New watched address activity: updating {} subscriptions",
+                        subs.len()
+                    );
+                    subs.retain(|sub| {
+                        sub.send(ScannerMessage::WatchedAddress(txs.clone()))
+                            .is_ok()
+                    });
                 }
             }
             Ok(ScannerMessage::StaleCandidateUpdate) => {
@@ -679,6 +1061,13 @@ pub fn run_server(
             Ok(ScannerMessage::AllChaintips(mut t)) => {
                 debug!("New chaintips {:?}", t);
                 std::mem::swap(&mut t, &mut tips.write().expect("Lock poisoned"));
+                if let Some(subs) = subscriptions2
+                    .lock()
+                    .expect("Lock poisoned")
+                    .get_mut("active_fork")
+                {
+                    subs.retain(|sub| sub.send(ScannerMessage::NewChaintip).is_ok());
+                }
             }
             Err(e) => {
                 error!("Channel broke {:?}", e);
@@ -698,15 +1087,26 @@ pub fn run_server(
         let killer_clone1 = killers.clone();
         let killer_clone2 = killers.clone();
         let killer_clone3 = killers.clone();
+        let killer_clone4 = killers.clone();
+        let killer_clone5 = killers.clone();
+        let killer_clone6 = killers.clone();
+        let killer_clone7 = killers.clone();
+        let killer_clone8 = killers.clone();
+        let killer_clone9 = killers.clone();
+        let killer_clone10 = killers.clone();
+        let killer_clone11 = killers.clone();
         let pool3 = pool2.clone();
+        let pool4 = pool2.clone();
+        let pool5 = pool2.clone();
         let subscriptions2 = subscriptions.clone();
+        let subscriptions6 = subscriptions.clone();
         // ws subscription endpoint for fork notifications
         io.add_subscription(
-            "forks",
+            "active_fork",
             (
-                "subscribe_forks",
+                "subscribe_active_fork",
                 move |params: Params, _, subscriber: Subscriber| {
-                    info!("Subscribe to forks");
+                    info!("Subscribe to active fork");
                     let mut rng = rand::rngs::OsRng::default();
                     if params != Params::None {
                         subscriber
@@ -729,13 +1129,16 @@ pub fn run_server(
                     let (notify_tx, notify_rx) = unbounded();
                     {
                         let mut sub_lock = subscriptions.lock().expect("Lock poisoned");
-                        sub_lock.entry("forks").or_insert(vec![]).push(notify_tx);
+                        sub_lock
+                            .entry("active_fork")
+                            .or_insert(vec![])
+                            .push(notify_tx);
                     }
 
-                    handle_subscribe(kill_switch, notify_rx, pool2.clone(), params, sink)
+                    handle_subscribe(kill_switch, notify_rx, tips1.clone(), params, sink)
                 },
             ),
-            ("unsubscribe_forks", move |id: SubscriptionId, _| {
+            ("unsubscribe_active_fork", move |id: SubscriptionId, _| {
                 if let Some(arc) = killer_clone2.lock().expect("Lock poisoned").remove(&id) {
                     arc.store(true, Ordering::SeqCst);
                 }
@@ -743,6 +1146,48 @@ pub fn run_server(
             }),
         );
 
+        // ws subscription endpoint for fork notifications
+        io.add_subscription(
+            "forks",
+            (
+                "subscribe_forks",
+                move |params: Params, _, subscriber: Subscriber| {
+                    info!("Subscribe to forks");
+                    let mut rng = rand::rngs::OsRng::default();
+                    if params != Params::None {
+                        subscriber
+                            .reject(Error {
+                                code: ErrorCode::ParseError,
+                                message: "Invalid parameters. Subscription rejected.".into(),
+                                data: None,
+                            })
+                            .unwrap();
+                        return;
+                    }
+
+                    let kill_switch = Arc::new(AtomicBool::new(false));
+                    let sub_id = SubscriptionId::Number(rng.gen());
+                    let sink = subscriber.assign_id(sub_id.clone()).unwrap();
+                    killer_clone10
+                        .lock()
+                        .expect("Lock poisoned")
+                        .insert(sub_id, kill_switch.clone());
+                    let (notify_tx, notify_rx) = unbounded();
+                    {
+                        let mut sub_lock = subscriptions6.lock().expect("Lock poisoned");
+                        sub_lock.entry("forks").or_insert(vec![]).push(notify_tx);
+                    }
+
+                    handle_subscribe_forks(kill_switch, pool5.clone(), notify_rx, params, sink)
+                },
+            ),
+            ("unsubscribe_forks", move |id: SubscriptionId, _| {
+                if let Some(arc) = killer_clone11.lock().expect("Lock poisoned").remove(&id) {
+                    arc.store(true, Ordering::SeqCst);
+                }
+                Box::pin(futures::future::ok(Value::Bool(true)))
+            }),
+        );
         // subscription endpoint for giving diff between tip height and stale block heights
         io.add_subscription(
             "validation_checks",
@@ -775,7 +1220,7 @@ pub fn run_server(
                     let kill_switch = Arc::new(AtomicBool::new(false));
                     let sub_id = SubscriptionId::Number(rng.gen());
                     let sink = subscriber.assign_id(sub_id.clone()).unwrap();
-                    killers
+                    killer_clone3
                         .lock()
                         .expect("Lock poisoned")
                         .insert(sub_id, kill_switch.clone());
@@ -800,13 +1245,172 @@ pub fn run_server(
             (
                 "unsubscribe_validation_checks",
                 move |id: SubscriptionId, _| {
-                    if let Some(arc) = killer_clone3.lock().expect("Lock poisoned").remove(&id) {
+                    if let Some(arc) = killer_clone4.lock().expect("Lock poisoned").remove(&id) {
                         arc.store(true, Ordering::SeqCst);
                     }
                     Box::pin(futures::future::ok(Value::Bool(true)))
                 },
             ),
         );
+
+        io.add_subscription(
+            "invalid_block_checks",
+            (
+                "invalid_block_checks",
+                move |params: Params, _, subscriber: Subscriber| {
+                    info!("Subscribe to invalid block checks");
+                    let mut rng = rand::rngs::OsRng::default();
+
+                    if params != Params::None {
+                        subscriber
+                            .reject(Error {
+                                code: ErrorCode::ParseError,
+                                message: "Invalid parameters. Subscription rejected.".into(),
+                                data: None,
+                            })
+                            .unwrap();
+                        return;
+                    }
+
+                    let kill_switch = Arc::new(AtomicBool::new(false));
+                    let sub_id = SubscriptionId::Number(rng.gen());
+                    let sink = subscriber.assign_id(sub_id.clone()).unwrap();
+                    killers
+                        .lock()
+                        .expect("Lock poisoned")
+                        .insert(sub_id, kill_switch.clone());
+                    let (notify_tx, notify_rx) = unbounded();
+                    {
+                        let mut sub_lock = subscriptions3.lock().expect("Lock poisoned");
+                        sub_lock
+                            .entry("invalid_block_checks")
+                            .or_insert(vec![])
+                            .push(notify_tx);
+                    }
+
+                    handle_invalid_block_subscribe(kill_switch, notify_rx, sink)
+                },
+            ),
+            (
+                "unsubscribe_invalid_block_checks",
+                move |id: SubscriptionId, _| {
+                    if let Some(arc) = killer_clone5.lock().expect("Lock poisoned").remove(&id) {
+                        arc.store(true, Ordering::SeqCst);
+                    }
+                    Box::pin(futures::future::ok(Value::Bool(true)))
+                },
+            ),
+        );
+
+        io.add_subscription(
+            "lagging_nodes_checks",
+            (
+                "lagging_nodes_checks",
+                move |params: Params, _, subscriber: Subscriber| {
+                    info!("Subscribe to lagging nodes checks");
+                    let mut rng = rand::rngs::OsRng::default();
+
+                    if params != Params::None {
+                        subscriber
+                            .reject(Error {
+                                code: ErrorCode::ParseError,
+                                message: "Invalid parameters. Subscription rejected.".into(),
+                                data: None,
+                            })
+                            .unwrap();
+                        return;
+                    }
+
+                    let kill_switch = Arc::new(AtomicBool::new(false));
+                    let sub_id = SubscriptionId::Number(rng.gen());
+                    let sink = subscriber.assign_id(sub_id.clone()).unwrap();
+                    killer_clone6
+                        .lock()
+                        .expect("Lock poisoned")
+                        .insert(sub_id, kill_switch.clone());
+                    let (notify_tx, notify_rx) = unbounded();
+                    {
+                        let mut sub_lock = subscriptions4.lock().expect("Lock poisoned");
+                        sub_lock
+                            .entry("lagging_nodes")
+                            .or_insert(vec![])
+                            .push(notify_tx);
+                    }
+
+                    handle_lagging_nodes_subscribe(kill_switch, notify_rx, sink)
+                },
+            ),
+            (
+                "unsubscribe_lagging_nodes_checks",
+                move |id: SubscriptionId, _| {
+                    if let Some(arc) = killer_clone7.lock().expect("Lock poisoned").remove(&id) {
+                        arc.store(true, Ordering::SeqCst);
+                    }
+                    Box::pin(futures::future::ok(Value::Bool(true)))
+                },
+            ),
+        );
+
+        io.add_subscription(
+            "watched_address_checks",
+            (
+                "watched_address_checks",
+                move |params: Params, _, subscriber: Subscriber| {
+                    info!("Subscribe to watched address checks");
+                    let mut rng = rand::rngs::OsRng::default();
+
+                    let WatchAddress { watch, watch_until } = match params.parse() {
+					    Ok(parm) => parm,
+						Err(e) => {
+							subscriber
+								.reject(Error {
+									code: ErrorCode::ParseError,
+									message: format!("Invalid parameters. Expected list of addresses to watch. {:?}", e)
+										.into(),
+									data: None,
+								})
+								.unwrap();
+							return;
+						}
+                    };
+
+                    let kill_switch = Arc::new(AtomicBool::new(false));
+                    let sub_id = SubscriptionId::Number(rng.gen());
+                    let sink = subscriber.assign_id(sub_id.clone()).unwrap();
+                    killer_clone8
+                        .lock()
+                        .expect("Lock poisoned")
+                        .insert(sub_id, kill_switch.clone());
+                    let (notify_tx, notify_rx) = unbounded();
+                    {
+                        let mut sub_lock = subscriptions5.lock().expect("Lock poisoned");
+                        sub_lock
+                            .entry("watched_addresses")
+                            .or_insert(vec![])
+                            .push(notify_tx);
+                    }
+
+                    handle_watched_addresses(
+                        kill_switch,
+                        notify_rx,
+                        watch,
+                        watch_until,
+                        pool4.clone(),
+                        sink,
+                    )
+                },
+            ),
+            (
+                "unsubscribe_watched_address_checks",
+                move |id: SubscriptionId, _| {
+                    if let Some(arc) = killer_clone9.lock().expect("Lock poisoned").remove(&id) {
+                        arc.store(true, Ordering::SeqCst);
+                    }
+                    Box::pin(futures::future::ok(Value::Bool(true)))
+                },
+            ),
+        );
+
         info!("Coming up on {} {}", listen, subs);
         let server = wss::ServerBuilder::with_meta_extractor(io, session_meta)
             .start(&SocketAddr::from((listen.parse::<IpAddr>().unwrap(), subs)))

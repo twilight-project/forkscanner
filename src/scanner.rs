@@ -1,9 +1,11 @@
 use crate::{
-    Block, BlockTemplate, Chaintip, FeeRate, InflatedBlock, Node, Pool, SoftForks, StaleCandidate,
-    StaleCandidateChildren, Transaction, TxOutset,
+    Block, BlockTemplate, Chaintip, ConflictingBlock, FeeRate, InflatedBlock, InvalidBlock, Lags,
+    NewPeer, Node, Peer, Pool, SoftForks, StaleCandidate, StaleCandidateChildren, Transaction,
+    TransactionAddress, TxOutset, Watched,
 };
 use bigdecimal::{BigDecimal, FromPrimitive};
 use bitcoin::{consensus::encode::serialize_hex, util::amount::Amount};
+use bitcoin_hashes::hex::ToHex;
 use bitcoin_hashes::{sha256d, Hash};
 use bitcoincore_rpc::bitcoin as btc;
 use bitcoincore_rpc::bitcoincore_rpc_json::{
@@ -60,11 +62,14 @@ pub struct MinerPoolInfo {
 
 /// Notifications from forkscanner to the api server.
 pub enum ScannerMessage {
+    LaggingNodes(Vec<Lags>),
     NewChaintip,
+    NewBlockConflicts(Vec<ConflictingBlock>),
     AllChaintips(Vec<Chaintip>),
     StaleCandidateUpdate,
     TipUpdateFailed(String),
     TipUpdated(Vec<String>),
+    WatchedAddress(Vec<Transaction>),
 }
 
 /// Command types from api to forkscanner.
@@ -223,6 +228,7 @@ pub trait BtcClient: Sized {
         &self,
         hash: &btc::BlockHash,
     ) -> Result<GetBlockHeaderResult, bitcoincore_rpc::Error>;
+    fn get_block(&self, hash: &btc::BlockHash) -> Result<btc::Block, bitcoincore_rpc::Error>;
     fn get_block_hex(&self, hash: &btc::BlockHash) -> Result<String, bitcoincore_rpc::Error>;
     fn get_peer_info(&self) -> Result<Vec<PeerInfo>, bitcoincore_rpc::Error>;
     fn get_raw_transaction_info<'a>(
@@ -317,6 +323,10 @@ impl BtcClient for Client {
         hash: &btc::BlockHash,
     ) -> Result<GetBlockHeaderResult, bitcoincore_rpc::Error> {
         RpcApi::get_block_header_info(self, hash)
+    }
+
+    fn get_block(&self, hash: &btc::BlockHash) -> Result<btc::Block, bitcoincore_rpc::Error> {
+        RpcApi::get_block(self, hash)
     }
 
     fn get_block_hex(&self, hash: &btc::BlockHash) -> Result<String, bitcoincore_rpc::Error> {
@@ -646,10 +656,12 @@ impl<BC: BtcClient> ScannerClient<BC> {
 /// and db connection to record chain info.
 pub struct ForkScanner<BC: BtcClient + std::fmt::Debug> {
     node_list: Vec<Node>,
+    archive_node: ScannerClient<BC>,
     clients: Vec<ScannerClient<BC>>,
     db_conn: PgConnection,
     notify_tx: Sender<ScannerMessage>,
     command: Receiver<ScannerCommand>,
+	enable_address_watcher: bool,
 }
 
 impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
@@ -663,18 +675,34 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
         let node_list = Node::list(&db_conn)?;
 
         let mut clients = Vec::new();
+        let mut archive_node = None;
+        let mut found_archive = false;
 
         for node in &node_list {
             let host = format!("http://{}:{}", node.rpc_host, node.rpc_port);
             let auth = Auth::UserPass(node.rpc_user.clone(), node.rpc_pass.clone());
+
             let mirror_host = match node.mirror_rpc_port {
-                Some(port) => Some(format!("http://{}:{}", node.rpc_host, port)),
+                Some(port) => {
+                    let hostname = node.mirror_host.as_ref().unwrap_or(&node.rpc_host).clone();
+                    Some(format!("http://{}:{}", hostname, port))
+                }
                 None => None,
             };
             info!(
                 "Connecting to bitcoin client: {}, Mirror: {:?}",
                 host, mirror_host
             );
+
+            if archive_node.is_none() {
+                let client = ScannerClient::new(node.id, host.clone(), None, auth.clone())?;
+                archive_node = Some(client);
+            } else if node.archive {
+                let client = ScannerClient::new(node.id, host.clone(), None, auth.clone())?;
+                archive_node = Some(client);
+                found_archive = true;
+            }
+
             let client = ScannerClient::new(node.id, host, mirror_host, auth)?;
             clients.push(client);
         }
@@ -682,18 +710,28 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
         let (notify_tx, notify_rx) = unbounded();
         let (cmd_tx, cmd_rx) = unbounded();
 
+        if !found_archive {
+            warn!("No archive node was found, using first node as fallback!");
+        }
+
         Ok((
             ForkScanner {
+                archive_node: archive_node.unwrap(),
                 node_list,
                 clients,
                 db_conn,
                 notify_tx,
                 command: cmd_rx,
+				enable_address_watcher: false,
             },
             notify_rx,
             cmd_tx,
         ))
     }
+
+	pub fn enable_address_watcher(&mut self, watch: bool) {
+	    self.enable_address_watcher = watch;
+	}
 
     // fetch block templates and calculate fee rates.
     fn fetch_block_templates(&self, client: &BC, node: &Node) {
@@ -799,6 +837,12 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
                     changed |= rows > 0;
                 }
             }
+
+            if self.enable_address_watcher {
+				if let Ok(block) = Block::get(&self.db_conn, &hash) {
+					self.fetch_transactions(&block);
+				}
+			}
         }
         Ok(changed)
     }
@@ -950,6 +994,68 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
         Ok(())
     }
 
+    // get raw transaction hex for each watched address tx
+    fn watched_address_checks(&self) -> Vec<Transaction> {
+        // Clear expired watch entries
+        if let Err(e) = Watched::clear(&self.db_conn) {
+            error!("Watchlist query error {:?}", e);
+            return vec![];
+        }
+
+        match Watched::fetch(&self.db_conn) {
+            Ok(transactions) => transactions,
+            Err(e) => {
+                error!("An error occured fetching watch list {:?})", e);
+                vec![]
+            }
+        }
+    }
+
+    fn lag_checks(&self) -> Vec<Lags> {
+        if let Err(e) = Lags::purge(&self.db_conn) {
+            error!("Purge lag tables failed {:?}", e);
+        }
+
+        match Chaintip::list_active(&self.db_conn) {
+            Ok(tips) => {
+                let max_height = tips.iter().map(|t| t.height).max().unwrap();
+                let blocks: Vec<_> = tips
+                    .iter()
+                    .filter_map(|t| match Block::get(&self.db_conn, &t.block) {
+                        Ok(b) => Some(b),
+                        Err(e) => {
+                            error!("Database error checking block work: {:?}", e);
+                            None
+                        }
+                    })
+                    .collect();
+                let max_work = blocks.iter().map(|b| b.work.clone()).max().unwrap();
+
+                for tip in tips {
+                    let block = blocks.iter().find(|b| b.hash == tip.block).unwrap();
+
+                    // If it's 2 blocks behind or work is less, consider it lagging
+                    if tip.height < max_height - 1 || block.work < max_work {
+                        if let Err(e) = Lags::insert(&self.db_conn, tip.node) {
+                            error!("Node lag update failed: {:?}", e);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Lag checks failed {:?}", e);
+            }
+        }
+
+        match Lags::list(&self.db_conn) {
+            Ok(lags) => lags,
+            Err(e) => {
+                error!("Error fetching lagging nodes: {:?}", e);
+                vec![]
+            }
+        }
+    }
+
     // We initialized with get_best_block_hash, now we just poll continually
     // for new blocks, and fetch ancestors up to MAX_BLOCK_HEIGHT postgres
     // will do the rest for us.
@@ -1036,6 +1142,24 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
 
         let mut changed = false;
         for (client, node) in self.clients.iter().zip(&self.node_list) {
+            if let Ok(peers) = client.client().get_peer_info() {
+                let peers = peers
+                    .into_iter()
+                    .map(|p| NewPeer {
+                        node_id: node.id,
+                        peer_id: p.id as i64,
+                        address: p.addr,
+                        version: p.version as i64,
+                    })
+                    .collect();
+
+                if let Err(e) = Peer::update_peers(&self.db_conn, node.id, peers) {
+                    error!("Peer list update failed! {:?}", e);
+                }
+            } else {
+                error!("RPC get peers failed!");
+            }
+
             if let Ok(info) = client.client().get_blockchain_info() {
                 info!("Got blockchain info");
                 if let Err(e) =
@@ -1048,6 +1172,7 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
                     "Failed to fetch blockchain info from {:?}!",
                     client.client()
                 );
+                continue;
             }
 
             self.fetch_block_templates(client.client(), node);
@@ -1062,12 +1187,44 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
             };
         }
 
+        // We have up to date chaintips, check for lags
+        let lags = self.lag_checks();
+
+        if lags.len() > 0 {
+            info!("We have {} lagging nodes", lags.len());
+            self.notify_tx
+                .send(ScannerMessage::LaggingNodes(lags))
+                .expect("Channel closed");
+        }
+
+        // Check watched addresses
+        let addresses = self.watched_address_checks();
+
+        if addresses.len() > 0 {
+            info!("We have {} watched address activity", addresses.len());
+            self.notify_tx
+                .send(ScannerMessage::WatchedAddress(addresses))
+                .expect("Channel closed");
+        }
+
         // update the API server of chaintip updates
         if changed {
             info!("Sending chaintip notifications");
             self.notify_tx
                 .send(ScannerMessage::NewChaintip)
                 .expect("Channel closed");
+        }
+
+        match InvalidBlock::get_recent_conflicts(&self.db_conn) {
+            Ok(conflicts) if conflicts.len() > 0 => {
+                self.notify_tx
+                    .send(ScannerMessage::NewBlockConflicts(conflicts))
+                    .expect("Channel closed");
+            }
+            Ok(_) => {}
+            Err(e) => {
+                error!("Error querying database for block conflicts! {:?}", e);
+            }
         }
 
         // get min height block template, and blocks with no fee diffs yet.
@@ -1154,11 +1311,21 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
             }
         };
 
-        match Chaintip::list(&self.db_conn) {
+        match Chaintip::list_non_lagging(&self.db_conn) {
             Ok(tips) => {
-                self.notify_tx
-                    .send(ScannerMessage::AllChaintips(tips))
-                    .expect("Channel closed");
+                // Get the most frequent tip
+                let counts = tips
+                    .iter()
+                    .map(|tip| tip.block.clone())
+                    .collect::<counter::Counter<_>>();
+
+                if let Some((top, _)) = counts.most_common().into_iter().next() {
+                    let tip = tips.into_iter().find(|item| item.block == top).unwrap();
+
+                    self.notify_tx
+                        .send(ScannerMessage::AllChaintips(vec![tip]))
+                        .expect("Channel closed");
+                }
             }
             Err(e) => error!("Database error: {:?}", e),
         }
@@ -1216,11 +1383,11 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
 
         info!("Checking mirror node reachability");
         for mut mirror in mirrors {
-            if let Some(_ts) = mirror.unreachable_since {
-                let last_poll = mirror.last_polled.expect("No last_polled");
+            if let Some(_ts) = mirror.mirror_unreachable_since {
+                let last_poll = mirror.mirror_last_polled.expect("No last_polled");
                 let elapsed = Utc::now().signed_duration_since(last_poll);
                 if elapsed.num_minutes() > REACHABLE_CHECK_INTERVAL {
-                    mirror.last_polled = Some(Utc::now());
+                    mirror.mirror_last_polled = Some(Utc::now());
                     let node = self
                         .clients
                         .iter()
@@ -1233,8 +1400,8 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
                     match node.get_blockchain_info() {
                         Ok(info) => {
                             mirror.initial_block_download = info.initial_block_download;
-                            mirror.unreachable_since = None;
-                            mirror.last_polled = None;
+                            mirror.mirror_unreachable_since = None;
+                            mirror.mirror_last_polled = None;
                         }
                         Err(e) => debug!("Could not reach mirror on reachable check {e:?}"),
                     }
@@ -1926,14 +2093,16 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
 
     // get transactions for a block and save info to database.
     fn fetch_transactions(&self, block: &Block) {
-        let node = self
-            .clients
-            .iter()
-            .find(|c| c.node_id == block.first_seen_by)
-            .unwrap()
-            .clone();
+        let processed = Transaction::block_processed(&self.db_conn, &block.hash);
 
-        let block_info = match node.client().get_block_verbose(block.hash.clone()) {
+        if processed.is_err() || processed.unwrap() {
+            return;
+        }
+
+        let node = self.clients.iter().next().unwrap().clone();
+
+        let hash = btc::BlockHash::from_str(&block.hash).unwrap();
+        let block_info = match node.client().get_block(&hash) {
             Ok(bi) => bi,
             Err(e) => {
                 error!("RPC call failed {:?}", e);
@@ -1941,19 +2110,66 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
             }
         };
 
-        for (idx, tx) in block_info.tx.iter().enumerate() {
-            let value = tx.vout.iter().fold(0., |a, amt| a + amt.value);
+        let mut tx_addrs = Vec::new();
+        info!("Fetching transactions for {}", block.hash);
+        for (idx, tx) in block_info.txdata.iter().enumerate() {
+            let hex = serialize_hex(tx);
+
+            for vout in &tx.output {
+                let spk = &vout.script_pubkey;
+                let address = spk.script_hash().to_string();
+                tx_addrs.push((block.hash.clone(), tx.txid().to_hex(), address));
+            }
+
+            let value = tx.output.iter().fold(0, |a, amt| a + amt.value);
             if let Err(e) = Transaction::create(
                 &self.db_conn,
+                false,
                 block.hash.to_string(),
                 idx,
-                &tx.txid,
-                &tx.hex,
-                value,
+                &tx.txid().to_hex(),
+                &hex,
+                value as f64,
             ) {
                 error!("Could not insert transaction {:?}", e);
             }
         }
+
+        if let Err(e) = TransactionAddress::insert(&self.db_conn, tx_addrs) {
+            error!("Database update failed: {:?}", e);
+        }
+    }
+
+    fn get_input_addrs(&self, idx: usize, tx: &JsonTransaction) -> HashSet<btc::Address> {
+        // find the input amount for the tx
+        let mut input_amounts = HashSet::default();
+
+        info!("Fetching input tx info for txindex {}", idx);
+        for txin in tx.vin.iter() {
+            if let Some(txid) = &txin.txid {
+                let txid = btc::Txid::from_str(&txid).unwrap();
+                match self
+                    .archive_node
+                    .client()
+                    .get_raw_transaction_info(&txid, None)
+                {
+                    Ok(tx) => {
+                        for vout in tx.vout.iter() {
+                            if let Some(addrs) = &vout.script_pub_key.addresses {
+                                input_amounts.extend(addrs.iter().cloned());
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // This is very noisy when you don't have an archive node.
+                        debug!("Could not fetch transaction info! {:?}", txid);
+                        continue;
+                    }
+                }
+            }
+        }
+
+        input_amounts
     }
 
     // Rollback checks. Here we are looking to use the mirror node to try to set a 'valid-headers'
@@ -2210,6 +2426,7 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
 
         let mut headers_only_blocks = match Block::headers_only(&self.db_conn, tip_height - 40_000)
         {
+            Ok(blocks) if blocks.len() == 0 => return,
             Ok(blocks) => blocks,
             Err(e) => {
                 error!("Header query failed {:?}", e);
@@ -2246,15 +2463,15 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
 
                 if raw_block.is_some() {
                     let b = raw_block.clone().unwrap();
-                    let node = self
-                        .clients
-                        .iter()
-                        .find(|c| c.node_id == originally_seen)
-                        .unwrap();
+                    let node = self.clients.iter().find(|c| c.node_id == originally_seen);
 
-                    if let Err(e) = node.client().submit_block(b, &hash) {
-                        error!("Could not submit block {:?}", e);
-                        continue;
+                    if let Some(node) = node {
+                        if let Err(e) = node.client().submit_block(b, &hash) {
+                            error!("Could not submit block {:?}", e);
+                            continue;
+                        }
+                    } else {
+                        warn!("Originally seen node not found!");
                     }
                 }
             }
@@ -2277,22 +2494,23 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
                     if code == BLOCK_NOT_FOUND =>
                 {
                     debug!("Header not found");
-                    let node = self
-                        .clients
-                        .iter()
-                        .find(|c| c.node_id == originally_seen)
-                        .unwrap();
-                    let header = match node.client().get_block_header(&hash) {
-                        Ok(block_header) => serialize_hex(&block_header),
-                        Err(e) => {
-                            error!("Could not fetch header from originally seen {:?}", e);
+                    let node = self.clients.iter().find(|c| c.node_id == originally_seen);
+
+                    if let Some(node) = node {
+                        let header = match node.client().get_block_header(&hash) {
+                            Ok(block_header) => serialize_hex(&block_header),
+                            Err(e) => {
+                                error!("Could not fetch header from originally seen {:?}", e);
+                                continue;
+                            }
+                        };
+
+                        if let Err(e) = mirror.submit_header(header) {
+                            error!("Could not submit block {:?}", e);
                             continue;
                         }
-                    };
-
-                    if let Err(e) = mirror.submit_header(header) {
-                        error!("Could not submit block {:?}", e);
-                        continue;
+                    } else {
+                        warn!("Originally seen node not found!");
                     }
                 }
                 Err(e) => {
@@ -2315,6 +2533,71 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
                 }
             }
             gbfp_blocks.push(block);
+        }
+
+        let client = self.clients.iter().filter(|c| c.mirror().is_some()).next();
+
+        if client.is_none() {
+            error!("No mirror nodes!");
+            return;
+        }
+
+        let client = client.unwrap();
+        let mirror = client.mirror().as_ref().unwrap();
+
+        let mut found_block = false;
+        for mut block in gbfp_blocks.into_iter() {
+            let hash = btc::BlockHash::from_str(&block.hash).unwrap();
+            match mirror.get_block_hex(&hash) {
+                Ok(block_hex) => {
+                    found_block = true;
+                    match mirror.get_block_header_info(&hash) {
+                        Ok(info) => {
+                            block.headers_only = false;
+                            block.work = hex::encode(info.chainwork);
+                            if let Err(e) = block.update(&self.db_conn) {
+                                error!("Could not clear headers flag {:?}", e);
+                            }
+                        }
+                        Err(e) => {
+                            error!("Error fetching block info! {:?}", e);
+                        }
+                    };
+
+                    match self
+                        .clients
+                        .iter()
+                        .filter(|c| c.node_id == block.first_seen_by)
+                        .next()
+                    {
+                        Some(client) => {
+                            if let Err(e) = client.client().submit_block(block_hex, &hash) {
+                                error!("Could not submit block to client! {:?}", e);
+                                continue;
+                            }
+                        }
+                        None => {
+                            error!("Could not find client that saw this block!");
+                            continue;
+                        }
+                    }
+                }
+                _ => continue,
+            }
+        }
+
+        if !found_block {
+            // disconnect all peers
+            match mirror.get_peer_info() {
+                Ok(peers) => {
+                    for peer in peers {
+                        let _ = mirror.disconnect_node(peer.id);
+                    }
+                }
+                Err(e) => {
+                    error!("No peers: {e:?}");
+                }
+            }
         }
     }
 }

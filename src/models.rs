@@ -3,13 +3,15 @@ use bitcoincore_rpc::bitcoincore_rpc_json::{GetBlockHeaderResult, Softfork};
 use chrono::prelude::*;
 use diesel::prelude::*;
 use diesel::result::QueryResult;
+use diesel::sql_types;
 use serde::{Deserialize, Serialize, Serializer};
 use std::collections::HashMap;
 
 use crate::schema::{
     block_templates, blocks, chaintips, double_spent_by, fee_rates, inflated_blocks,
-    invalid_blocks, nodes, peers, pool, rbf_by, softforks, stale_candidate,
-    stale_candidate_children, transaction, tx_outsets, valid_blocks,
+    invalid_blocks, lags, nodes, peers, pool, rbf_by, softforks, stale_candidate,
+    stale_candidate_children, transaction, transaction_addresses, tx_outsets, valid_blocks,
+    watched,
 };
 use crate::MinerPoolInfo;
 
@@ -67,6 +69,15 @@ impl Chaintip {
         chaintips
             .filter(height.gt(tip_height).and(status.eq("invalid")))
             .load(conn)
+    }
+
+    pub fn list_non_lagging(conn: &PgConnection) -> QueryResult<Vec<Chaintip>> {
+        use crate::schema::chaintips::dsl::*;
+        use crate::schema::lags::dsl as ldsl;
+
+        let laggers: Vec<i64> = ldsl::lags.select(ldsl::node_id).load::<i64>(conn)?;
+
+        chaintips.filter(node.ne_all(laggers)).load(conn)
     }
 
     /// List all active tips.
@@ -190,6 +201,33 @@ impl Chaintip {
 #[table_name = "blocks"]
 pub struct Height {
     pub height: i64,
+}
+
+#[derive(Debug, AsChangeset, QueryableByName, Queryable, Insertable)]
+#[table_name = "transaction_addresses"]
+pub struct TransactionAddress {
+    pub hash: String,
+    pub txid: String,
+    pub address: String,
+}
+
+impl TransactionAddress {
+    pub fn insert(conn: &PgConnection, data: Vec<(String, String, String)>) -> QueryResult<usize> {
+        use crate::schema::transaction_addresses::dsl::*;
+        let tx_addrs: Vec<_> = data
+            .into_iter()
+            .map(|(tx_hash, id, tx_address)| TransactionAddress {
+                hash: tx_hash,
+                txid: id,
+                address: tx_address,
+            })
+            .collect();
+
+        diesel::insert_into(transaction_addresses)
+            .values(&tx_addrs)
+            .on_conflict_do_nothing()
+            .execute(conn)
+    }
 }
 
 #[derive(Debug, AsChangeset, QueryableByName, Queryable, Insertable)]
@@ -753,6 +791,7 @@ impl Block {
         let block = ValidBlock {
             hash: block_hash.to_string(),
             node: node_id,
+            created_at: Some(Utc::now()),
         };
 
         diesel::insert_into(valid_blocks)
@@ -808,6 +847,7 @@ impl Block {
         let block = InvalidBlock {
             hash: block_hash.to_string(),
             node: node_id,
+            created_at: Some(Utc::now()),
         };
 
         diesel::insert_into(invalid_blocks)
@@ -822,7 +862,7 @@ impl Block {
     }
 }
 
-#[derive(QueryableByName, Queryable, Insertable)]
+#[derive(Clone, Serialize, Deserialize, QueryableByName, Queryable, Insertable)]
 #[table_name = "transaction"]
 pub struct Transaction {
     pub block_id: String,
@@ -830,11 +870,13 @@ pub struct Transaction {
     pub is_coinbase: bool,
     pub hex: String,
     pub amount: f64,
+    pub swept: Option<bool>,
 }
 
 impl Transaction {
     pub fn create(
         conn: &PgConnection,
+        sweep: bool,
         block: String,
         idx: usize,
         tx_id: &String,
@@ -849,6 +891,7 @@ impl Transaction {
             txid: tx_id.clone(),
             hex: tx_hex.clone(),
             amount: tx_amount,
+            swept: Some(sweep),
         };
 
         diesel::insert_into(transaction)
@@ -893,6 +936,12 @@ impl Transaction {
             .flatten()
             .collect();
         Ok(descendants)
+    }
+
+    pub fn block_processed(conn: &PgConnection, hash: &String) -> QueryResult<bool> {
+        use crate::schema::transaction::dsl::*;
+        let result: Vec<Transaction> = transaction.filter(block_id.eq(hash)).load(conn)?;
+        Ok(result.len() > 0)
     }
 }
 
@@ -1067,9 +1116,18 @@ pub struct Node {
     pub unreachable_since: Option<DateTime<Utc>>,
     pub last_polled: Option<DateTime<Utc>>,
     pub initial_block_download: bool,
+    pub mirror_host: Option<String>,
+    pub mirror_last_polled: Option<DateTime<Utc>>,
+    pub mirror_unreachable_since: Option<i64>,
+    pub archive: bool,
 }
 
 impl Node {
+    pub fn get(conn: &PgConnection, node_id: i64) -> QueryResult<Node> {
+        use crate::schema::nodes::dsl::*;
+        nodes.filter(id.eq(node_id)).get_result(conn)
+    }
+
     pub fn list(conn: &PgConnection) -> QueryResult<Vec<Node>> {
         nodes::dsl::nodes.load(conn)
     }
@@ -1099,7 +1157,7 @@ impl Node {
                 mirror_rpc_port.is_not_null().and(
                     initial_block_download
                         .eq(false)
-                        .and(unreachable_since.is_null()),
+                        .and(mirror_unreachable_since.is_null()),
                 ),
             )
             .load(conn)
@@ -1113,6 +1171,8 @@ impl Node {
         mirror: Option<i32>,
         user: String,
         pass: String,
+        mirror_hostname: Option<String>,
+        archiver: bool,
     ) -> QueryResult<Node> {
         use crate::schema::nodes::dsl::*;
         diesel::insert_into(nodes)
@@ -1123,12 +1183,23 @@ impl Node {
                 mirror_rpc_port.eq(mirror),
                 rpc_user.eq(user),
                 rpc_pass.eq(pass),
+                mirror_host.eq(mirror_hostname),
+                archive.eq(archiver),
             ))
             .get_result(conn)
     }
 }
 
-#[derive(QueryableByName, Queryable, Insertable)]
+#[derive(Serialize, QueryableByName, Queryable, Insertable)]
+#[table_name = "peers"]
+pub struct NewPeer {
+    pub node_id: i64,
+    pub peer_id: i64,
+    pub address: String,
+    pub version: i64,
+}
+
+#[derive(Serialize, QueryableByName, Queryable, Insertable)]
 #[table_name = "peers"]
 pub struct Peer {
     pub id: i64,
@@ -1138,13 +1209,69 @@ pub struct Peer {
     pub version: i64,
 }
 
-impl Peer {}
+impl Peer {
+    pub fn update_peers(
+        conn: &PgConnection,
+        n_id: i64,
+        peer_list: Vec<NewPeer>,
+    ) -> QueryResult<usize> {
+        use crate::schema::peers::dsl::*;
+
+        diesel::delete(peers)
+            .filter(node_id.eq(n_id))
+            .execute(conn)?;
+
+        diesel::insert_into(peers)
+            .values(peer_list)
+            .on_conflict_do_nothing()
+            .execute(conn)
+    }
+
+    pub fn list(conn: &PgConnection, n_id: i64) -> QueryResult<Vec<Peer>> {
+        use crate::schema::peers::dsl::*;
+        peers.filter(node_id.eq(n_id)).load(conn)
+    }
+}
 
 #[derive(QueryableByName, Queryable, Insertable)]
 #[table_name = "invalid_blocks"]
 pub struct InvalidBlock {
     pub hash: String,
     pub node: i64,
+    pub created_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Serialize, QueryableByName)]
+pub struct ConflictingBlock {
+    #[sql_type = "sql_types::Text"]
+    pub hash: String,
+    #[sql_type = "sql_types::Array<sql_types::BigInt>"]
+    pub valid_by: Vec<i64>,
+    #[sql_type = "sql_types::Array<sql_types::BigInt>"]
+    pub invalid_by: Vec<i64>,
+}
+
+impl InvalidBlock {
+    pub fn get_recent_conflicts(conn: &PgConnection) -> QueryResult<Vec<ConflictingBlock>> {
+        let raw_query = format!(
+            "
+			SELECT hash, array_agg(distinct valid_by) as valid_by, array_agg(distinct invalid_by) as invalid_by
+			FROM (
+				SELECT
+					ivb.hash as hash,
+					vb.node as valid_by,
+					ivb.node as invalid_by
+				FROM valid_blocks as vb
+				INNER JOIN invalid_blocks as ivb
+				ON vb.hash = ivb.hash
+				WHERE ivb.created_at > now() - interval '15 minutes'
+			) q
+			GROUP BY hash
+        ",
+        );
+
+        diesel::sql_query(raw_query).load(conn)
+    }
 }
 
 #[derive(QueryableByName, Queryable, Insertable)]
@@ -1152,4 +1279,122 @@ pub struct InvalidBlock {
 pub struct ValidBlock {
     pub hash: String,
     pub node: i64,
+    pub created_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Serialize, QueryableByName, Queryable, Insertable)]
+#[table_name = "watched"]
+pub struct Watched {
+    pub address: String,
+    pub created_at: DateTime<Utc>,
+    pub watch_until: DateTime<Utc>,
+}
+
+impl Watched {
+    pub fn insert(
+        conn: &PgConnection,
+        watches: Vec<(String, DateTime<Utc>)>,
+    ) -> QueryResult<usize> {
+        use crate::schema::watched::dsl::*;
+
+        let watch_list: Vec<_> = watches
+            .into_iter()
+            .map(|(addr, exp)| Watched {
+                address: addr,
+                created_at: Utc::now(),
+                watch_until: exp,
+            })
+            .collect();
+
+        diesel::insert_into(watched)
+            .values(watch_list)
+            .on_conflict_do_nothing()
+            .execute(conn)
+    }
+
+    pub fn remove(
+        conn: &PgConnection,
+        addresses: Vec<String>,
+    ) -> QueryResult<usize> {
+        use crate::schema::watched::dsl::*;
+
+		diesel::delete(watched)
+		    .filter(address.eq_any(addresses))
+			.execute(conn)
+	}
+
+    pub fn clear(conn: &PgConnection) -> QueryResult<usize> {
+        use crate::schema::watched::dsl::*;
+        let utc_now = Utc::now();
+
+        diesel::delete(watched)
+            .filter(watch_until.lt(utc_now))
+            .execute(conn)
+    }
+
+    pub fn fetch(conn: &PgConnection) -> QueryResult<Vec<Transaction>> {
+        use crate::schema::transaction::dsl as tdsl;
+        use crate::schema::transaction_addresses::dsl as tadsl;
+        use crate::schema::watched::dsl as wdsl;
+        use diesel::dsl::any;
+
+        let watched: Vec<_> = wdsl::watched.load(conn)?;
+        let watched: Vec<_> = watched.into_iter().map(|w: Watched| w.address).collect();
+
+        let transactions: Vec<(String, String, String)> = tadsl::transaction_addresses
+            .filter(tadsl::address.eq(any(watched)))
+            .load(conn)?;
+
+        let mut block_ids = Vec::new();
+        let mut tx_ids = Vec::new();
+
+        for (h, id, _) in transactions.into_iter() {
+            block_ids.push(h);
+            tx_ids.push(id);
+        }
+
+        let transactions: Vec<_> = tdsl::transaction
+            .filter(
+                tdsl::block_id
+                    .eq_any(block_ids)
+                    .and(tdsl::txid.eq_any(tx_ids)),
+            )
+            .load(conn)?;
+
+        Ok(transactions)
+    }
+}
+
+#[derive(Clone, Serialize, QueryableByName, Queryable, Insertable)]
+#[table_name = "lags"]
+pub struct Lags {
+    pub node_id: i64,
+    pub created_at: DateTime<Utc>,
+    pub deleted_at: Option<DateTime<Utc>>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl Lags {
+    pub fn purge(conn: &PgConnection) -> QueryResult<usize> {
+        use crate::schema::lags::dsl::*;
+        diesel::delete(lags).execute(conn)
+    }
+
+    pub fn insert(conn: &PgConnection, id: i64) -> QueryResult<usize> {
+        use crate::schema::lags::dsl::*;
+
+        let lag = Lags {
+            node_id: id,
+            created_at: Utc::now(),
+            deleted_at: None,
+            updated_at: Utc::now(),
+        };
+
+        diesel::insert_into(lags).values(lag).execute(conn)
+    }
+
+    pub fn list(conn: &PgConnection) -> QueryResult<Vec<Lags>> {
+        use crate::schema::lags::dsl::*;
+        lags.load(conn)
+    }
 }

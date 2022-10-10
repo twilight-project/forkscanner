@@ -80,6 +80,16 @@ diesel::table! {
     invalid_blocks (hash, node) {
         hash -> Varchar,
         node -> Int8,
+        created_at -> Nullable<Timestamptz>,
+    }
+}
+
+diesel::table! {
+    lags (node_id, created_at, updated_at) {
+        node_id -> Int8,
+        created_at -> Timestamptz,
+        deleted_at -> Nullable<Timestamptz>,
+        updated_at -> Timestamptz,
     }
 }
 
@@ -95,6 +105,10 @@ diesel::table! {
         unreachable_since -> Nullable<Timestamptz>,
         last_polled -> Nullable<Timestamptz>,
         initial_block_download -> Bool,
+        mirror_host -> Nullable<Varchar>,
+        mirror_last_polled -> Nullable<Timestamptz>,
+        mirror_unreachable_since -> Nullable<Int8>,
+        archive -> Bool,
     }
 }
 
@@ -167,6 +181,15 @@ diesel::table! {
         is_coinbase -> Bool,
         hex -> Varchar,
         amount -> Float8,
+        swept -> Nullable<Bool>,
+    }
+}
+
+diesel::table! {
+    transaction_addresses (hash, txid, address) {
+        hash -> Varchar,
+        txid -> Varchar,
+        address -> Varchar,
     }
 }
 
@@ -186,10 +209,20 @@ diesel::table! {
     valid_blocks (hash, node) {
         hash -> Varchar,
         node -> Int8,
+        created_at -> Nullable<Timestamptz>,
+    }
+}
+
+diesel::table! {
+    watched (address) {
+        address -> Varchar,
+        created_at -> Timestamptz,
+        watch_until -> Timestamptz,
     }
 }
 
 diesel::joinable!(inflated_blocks -> blocks (block_hash));
+diesel::joinable!(lags -> nodes (node_id));
 diesel::joinable!(peers -> nodes (node_id));
 diesel::joinable!(softforks -> nodes (node_id));
 diesel::joinable!(stale_candidate_children -> stale_candidate (candidate_height));
@@ -204,6 +237,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     fee_rates,
     inflated_blocks,
     invalid_blocks,
+    lags,
     nodes,
     peers,
     pool,
@@ -212,6 +246,8 @@ diesel::allow_tables_to_appear_in_same_query!(
     stale_candidate,
     stale_candidate_children,
     transaction,
+    transaction_addresses,
     tx_outsets,
     valid_blocks,
+    watched,
 );
