@@ -75,7 +75,7 @@ example of result returned by the **rpc::getchaintips** can be viewed [here](htt
 
 Also please keep in mind that chaintip is the blockhash of the latest block of the btc chain and that a bitcoin node can only have one chaintip which it considers active. Each chaintip status mentioned above is processed differently.
 
-## Active
+### Active
 Active means that node considers this chaintip to be the latest one. when the forkscanner gets active chaintip from the node, it follows below steps
 
 - Create an entry for this block in blocks table, if it does not exist already.
@@ -86,7 +86,7 @@ Active means that node considers this chaintip to be the latest one. when the fo
     - set parent_chaintip_id to null.
     - set each childs parent_chaintip_id to null.
 
-## Valid-forks
+### Valid-forks
 valid fork means that the node has validated that a fork occured with this chaintip. since valid-fork means that its a fork, forkscanner needs to maintain a hierarchy to find the block where the fork occured. when the forkscanner gets valid-fork chaintip from the node, it follows below steps
 
 - Find or create a the block and its ancestors.
@@ -118,19 +118,19 @@ node and chain tip combination. (All 3 processes are explained below)
 - After creating block entries we check for invalid blocks (explained below)
 - The last step in this service is to detect the blocks which have the tendency to go stale.
 
-## Invalid:
+### Invalid:
 invalid means that there isa chaintips which this nodes considers invalid. processing is as follow
 
 -its the same as valid-forks except that we set the mark_invalid field.
 
-## Valid-headers/Headers-only:
+### Valid-headers/Headers-only:
 Headers only means that the node only have the header for this chaintip where as valid-headers means that the node only has headers but considers these headers valid. the processing of these statuses are a under.
 
 - Return if the block height is less then minimum height.
 - Return if block is present in DB
 - Otherwise create an entry in DB and mark the headers-only field as True.
 
-**Match Children:**
+### Match Children:
 Check if any of the other nodes are behind us. If they don't have a parent,
 mark us their parent chaintip, unless they consider us invalid.
 
@@ -148,7 +148,7 @@ mark us their parent chaintip, unless they consider us invalid.
 - End of inner loop.^
 - Break if candidate has parent chain tip^
 
-**Check Parent:**
+### Check Parent:
 If chaintip has a parent, find all invalid chaintips above it, traverse down to see if it descends from
 us. If so, disconnect parent.
 
@@ -161,13 +161,13 @@ us. If so, disconnect parent.
           - If parent == block^
              - Update parent_chaintip to null and break^
           - Parent = parent.parent^
-**Match Parent:**
+### Match Parent:
 If we don't already have a parent, check if any of the other nodes are ahead of us. Use their chain
 tip instead unless we consider it invalid
 - Steps are same as match children except we replace Update candidates’ parent chain tip to self
 by Update parent chain tip to candidate tip
 
-**Check Invalid Blocks:**
+### Check Invalid Blocks:
 In this part we check the blocks and see if they are marked invalid by a node. If so we add that in
 the invalid blocks table (Schema Shared above).
 
@@ -176,7 +176,7 @@ the invalid blocks table (Schema Shared above).
     - Get the first node which marked the block invalid.^
     - Create an entry in the invalid_block table for this block.^
 
-**Check for Stale Candidates:**
+### Check for Stale Candidates:
 After populating the DB with the blocks from the nodes and maintaining the parent child
 relationships we determine the blocks which have a tendency to become stale blocks. We will call
 them stale candidates.
