@@ -1,283 +1,18 @@
- PDF To Markdown Converter
-Debug View
-Result View
-specs_v2
-# SPECS for ForkScanner
+#                                                                 SPECS for ForkScanner
 
-Responsibility of this Fork Scanner will be to detect forks in BTC chain as well and check for
-double spends. Please ensure that following requirements are met.
+As the name suggests Forkscanner is responsible to scan the bitcoin chain continously. It monitors the forks in the BTC blockchian, and at any given moment it should be able to give us the current active chaintip. Forkscanner relies on multiple bitcoin nodes, these nodes are geographically split and use different btc core versions. this configuration of nodes ensures that we detect all forks. 
+
+Apart from monitoring forks, forkscanner also checks for any potential double spends in the chain and keeps track of inflation. there is also an address watcher incorporated in the forkscanner, which keeps an eye out for the addresses we want to monitor and notifies when there is an inflow or outflow of funds from any of addresses under watch.
 
 ## Requirements:
 
-- The system will run and maintain at least 3 BTC nodes with different versions.^
-    - Create sh files to run nodes.^
-- Each node maintained by the system will also have a mirror node.^
-- System should also be able to connect with other nodes randomly. (not the ones managed by
-    the system)
-- A SQL DB shall be maintained (Schema diagram shared with this document).^
-- An API to add and retrieve data (details below)^
-- System shall have a service for bootstrapping. (Details below)^
-- System will have a service for fork validation. (Explained below)^
-- System will have a service for double spend detection. (Explained below)^
-
-## Block
-
-A block is a bitcoin core block obtained from a full node
-
-**Struct**
-
-string "block_hash"
-integer "height"
-integer "timestamp"
-string "work"
-datetime "created_at"
-datetime "updated_at"
-bigint "parent_id"
-integer "mediantime"
-bigint "first_seen_by_id"
-integer "version"
-integer "coin"
-string "pool"
-integer "tx_count"
-integer "size"
-boolean "connected"
-integer Array "marked_invalid_by"
-integer Array "marked_valid_by"
-string "coinbase_message"
-boolean "headers_only"
-
-**Parent_ID:** Blocks will maintain a parent child relationship using the parent_id field in above
-struct.
-
-**Block Header:** If we only get a block header from the node this field is marked as True. Otherwise
-if we get a complete block it is set to False.
-
-**Height:**
-
-**Headers-Only:**
-
-
-## ChainTip
-
-A Chaintip is a bitcoin core chaintip object returned by calling the getchaintip Json-RPC call.
-
-**Struct**
-
-bigint "node_id"
-bigint "block_id"
-bigint "parent_chaintip_id"
-string "status"
-datetime "created_at"
-datetime "updated_at"
-
-**Parent_ID:** Chaintips will maintain a parent child relationship using the parent_chaintip_id field in
-above struct.
-
-**NODE_ID:** Node id is foreign key from the Node struct used to maintain a relation between chain
-tips and node it came from.
-
-## Node
-
-A full bitcoin core node that runs the different bitcoin core versions. This struct It keeps a record
-of all the Bitcoin Nodes available to Forkscanner for RPC connections.
-
-**Struct**
-
-string "name"
-integer "version"
-bigint "block_id"
-datetime "created_at"
-datetime "updated_at"
-datetime "unreachable_since"
-string "rpchost"
-string "rpcuser"
-string "rpcpassword"
-integer "peer_count"
-integer "client_type"
-integer "rpcport"
-string "version_extra"
-boolean "enabled"
-string "mirror_rpchost"
-integer "mirror_rpcport"
-bigint "mirror_block_id"
-boolean "txindex"
-datetime "mirror_rest_until"
-datetime "polled_at"
-integer "sync_height"
-datetime "mirror_unreachable_since"
-
-**Mirror Node**
-
-A replica of the current state of the block headers maintained by the local full node of bitcoin core.
-The mirror node follows the schema for the Bitcoin Full node. Information about the mirror node is
-saved in mirror_* variables in above struct.
-
-
-## Peer Info
-
-This manages a list of peers that the Bitcoin Full Nodes are connects to download block info. We
-use the below RPC call
-**rpc::getpeerinfo**
-
-**Struct**
-string "name"
-integer "version"
-datetime "created_at"
-datetime "updated_at"
-string “rpchost"
-
-## Stale Candidate.
-
-This is to store blocks which have a probability to go stale. Also we use this to detect double
-spent and replace by fee transactions. The Schema is explained below.
-
-**Struct**
-
-integer "height"
-datetime "notified_at"
-datetime "created_at"
-datetime "updated_at"
-integer "coin"
-string "confirmed_in_one_branch"
-decimal "confirmed_in_one_branch_total"
-string "double_spent_in_one_branch"
-decimal "double_spent_in_one_branch_total"
-integer "n_children"
-string "rbf"
-decimal "rbf_total"
-integer "height_processed"
-string “double_spent_by"
-string “rbf_by"
-boolean “missing_transactions"
-
-## Stale Candidate Children.
-
-This model is used to maintain the child of stale candidate, we don not store the children rather
-the root of the chain tip (which would be the id of the corresponding block) branchlen and the
-corresponding chain tip id, the schema is defined below,
-
-**Struct**
-
-bigint "stale_candidate_id"
-bigint "root_id"
-bigint "tip_id"
-integer "length"
-datetime "created_at"
-datetime "updated_at"
-
-## Invalid Block:
-
-This model is to keep a record of the blocks which have been marked invalid by a node. The
-schema for this is mentioned below.
-
-
-**Struct**
-
-bigint "block_id"
-bigint "node_id"
-datetime "notified_at"
-datetime "created_at", null: false
-datetime "updated_at", null: false
-datetime “dismissed_at"
-
-## Transaction:
-
-This model is used to save the transactions for every block. Please refer to the schema below
-
-**Struct**
-
-bigint "block_id"
-string "tx_id"
-boolean "is_coinbase"
-datetime "created_at"
-datetime "updated_at"
-decimal "amount"
-binary "raw"
-
-
-## Inflated blocks:
-
-This model is used to save the information for inflated block. Please refer to the schema below
-
-**Struct**
-
-bigint "block_id"
-decimal "max_inflation",
-decimal "actual_inflation
-datetime "notified_at"
-datetime "created_at", null: false
-datetime "updated_at", null: false
-bigint "node_id"
-datetime "dismissed_at"
-
-
-
-## Tx outsets:
-
-This model is used to save the transaction's tx outset. Please refer to the schema below
-
-**Struct**
-
-bigint "block_id"
-integer "txouts"
-decimal "total_amount”
-datetime "created_at", null: false
-datetime "updated_at", null: false
-bigint "node_id"
-boolean "inflated", default: false, null: false
-
-
-## Tx outsets:
-
-This model is used to save information about mininig pool. Please refer to the schema below
-
-**Struct**
-
-string "tag"
-string "name"
-string "url"
-datetime "created\_at"
-datetime "updated\_at"
-
-
-
-## Block Template:
-
-This model is used to saves the block template shared by the bitcoin core to the miner, this template is used by miner to generate a block. Please refer to the schema below
-
-**Struct**
-
-bigint "parent\_block\_id"
-bigint "node\_id"
-decimal "fee\_total"
-datetime "timestamp"
-integer "height"
-datetime "created\_at",
-datetime "updated\_at"
-integer "n\_transactions”
-binary "tx\_ids"
-integer "coin", null: false
-integer "tx\_fee\_rates"
-integer "lowest\_fee\_rate"
-
-
-## Soft Forks :
-
-This model is used to keep a record of all the soft forks. Please refer to the schema below
-
-**Struct**
-
-create\_table "softforks
-integer "coin"
-bigint "node\_id"
-integer "fork\_type"
-string "name"
-integer "bit"
-integer "status"
-integer "since"
-datetime "created\_at”
-datetime "updated\_at"
-datetime "notified\_at"
+- The system will run and maintain at least 3 BTC nodes with different versions.
+- One of these 3 nodes will also have a mirror node.
+- A SQL DB shall be maintained (Schema diagram shared with this document).
+- An API to add and retrieve data (details below)
+- System shall have a service for bootstrapping. (Details below)
+- System will have a service for fork validation. (Explained below)
+- System will have a service for double spend detection. (Explained below)
 
 
 ## API Spec
@@ -295,77 +30,78 @@ is the same as the Node and block struct shared above.
 Node API endpoint needs authentication. For that we can either decide to create and maintain a
 user table or just use a JWT token. That is on the developer to decide
 
-## Bootstrapping Forkscanner
+##                                                             Fork Detection
 
-For Bootstrapping we will create a service that will query the nodes and update the DB. For this
-we use the **rpc::getchaintips** Json-Rpc call. We query all nodes to share their latest chain tips
-and we save those in the DB
+To begin with Forkscanner connects with the bitcoin nodes and uses **rpc::getchaintips** to get the chaintips from all connected bitcoin nodes. This information is saved in the Postgres DB and is later used to deduce the True chaintip.
 
-**Tip height/Chain tip height:**
-Tip height is the height of the block at the tip of a chain.
+## bootstrapping the system
 
-**Service**
-The service will perform the following tasks.
+When the system starts, It cleans old/inactive chaintips, this is accomplished by removing any chaintips entries from the DB. Then forkscanner starts querying the connected nodes using the **rpc::getchaintips**. 
 
-- First check any old inactive and unreachable chain tips in the DB and remove them.
-- Then Query all nodes using the getchaintip RPC call.
-- Run a loop on chain tips.
-    - Get the latest tip block for the chaintip (Hence forth mentioned as the block )^
-    - The chain tip returned by the RPC call will have a status.^
+example of result returned by the **rpc::getchaintips** can be viewed [here](https://developer.bitcoin.org/reference/rpc/getchaintips.html). As described in the example this endpoint returns a list of chaintips seen by that specific node. Each of these chaintips has one of the below listed status
 
-
-**- Active
-- Invalid
-- Valid fork
+- active
+- valid-fork
+- invalid
+- headers only
 - Valid headers
-- Headers-only**
+
+Also please keep in mind that chaintip is the blockhash of the latest block of the btc chain and that a bitcoin node can only have one chaintip which it considers active. Each chaintip status mentioned above is processed differently.
+
+## Active
+Active means that node considers this chaintip to be the latest one. when the forkscanner gets active chaintip from the node, it follows below steps
+
+- Create an entry for this block in blocks table, if it does not exist already.
+- Update the mark_valid_by field in the block table by the node id of the chaintip object.
+- Find or create the chain tip in DB (chaintips table).
+- If chain tip exists and the latest tip block is not equal to the block we got earlier.
+    - Update the tip block.
+    - set parent_chaintip_id to null.
+    - set each childs parent_chaintip_id to null.
+
+## Valid-forks
+valid fork means that the node has validated that a fork occured with this chaintip. since valid-fork means that its a fork, forkscanner needs to maintain a hierarchy to find the block where the fork occured. when the forkscanner gets valid-fork chaintip from the node, it follows below steps
+
+- Find or create a the block and its ancestors.
+    - Get the block by hash form DB.
+    - If we don’t find the block
+       - Get the block from node and add in the DB.
+    - Once we have the block find its ancestors.
+       - We run a loop and break if a certain height is achieved (height check is to limit computing).
+          - Get block from DB.
+          - Set parent = current block’s parent.
+          - If parent is null.
+             - Get current block from node or just block headers from node if block is not found.
+             - Set parent = as currents block’s previous block hash.
+             - Update current blocks parent_id DB with parent.
+          - If we have a parent in DB.
+             - Break if parent is connected.
+          - Else
+             - We get the parent block from Node.
+          - Update parent by this new block and add the parent block in DB. And set mark_valid
+             field.
+          - Update current’s block’s parent_id by parent.
+          - Set block as the parent and re run the loop for parent to find ancestors.
+
+
+
 - We process each scenario differently (explained below).^
 - After processing the chain tips we match children, check_parent, match_parent for each
 node and chain tip combination. (All 3 processes are explained below)
 - After creating block entries we check for invalid blocks (explained below)
 - The last step in this service is to detect the blocks which have the tendency to go stale.
 
-**Active:**
+## Invalid:
+invalid means that there isa chaintips which this nodes considers invalid. processing is as follow
 
-- update the mark_valid_by field in the block table by the node id of the chaintip object.^
-- Find or create the chain tip in DB.^
-- If chain tip exists and the latest tip block is not equal to the block we got earlier.^
-    - Update the tip block^
-    - set parent_chaintip_id to null^
-    - set each childs parent_chaintip_id to null^
+-its the same as valid-forks except that we set the mark_invalid field.
 
-**Valid-forks:**
+## Valid-headers/Headers-only:
+Headers only means that the node only have the header for this chaintip where as valid-headers means that the node only has headers but considers these headers valid. the processing of these statuses are a under.
 
-- Find or create a the block and its ancestors.^
-    - Get the block by hash form DB.^
-    - If we don’t find the block^
-       - Get the block from node and add in the DB^
-    - Once we have the block find its ancestors.^
-       - We run a loop and break if a certain height is achieved.^
-          - Get block from DB^
-          - Set parent = current block’s parent^
-          - If parent is null^
-             - Get current block from node or just block headers from node if block is not found.^
-             - Set parent = as currents block’s previous block hash.^
-             - Update current blocks parent_id DB with parent.^
-          - If we have a parent in DB^
-             - Break if parent is connected.^
-          - Else^
-             - We get the parent block from Node^
-          - Update parent by this new block and add the parent block in DB. And set mark_valid
-             field.
-          - Update current’s block’s parent_id by parent.^
-          - Set block as the parent and re run the loop for parent to find ancestors.^
-
-**Invalid:**
-
-**-** its the same as valid-forks except that we set the mark_invalid field.^
-
-**Valid-headers/Headers-only:**
-
-- Return if the block height is less then minimum height.^
-- Return if block is present in DB^
-- Otherwise create an entry in DB and mark the headers-only field as True.^
+- Return if the block height is less then minimum height.
+- Return if block is present in DB
+- Otherwise create an entry in DB and mark the headers-only field as True.
 
 **Match Children:**
 Check if any of the other nodes are behind us. If they don't have a parent,
@@ -845,8 +581,50 @@ This is where we process the templates we retrieved in previous step.
 
 This part of the code simply keeps a track of soft forks that have occurred uptil now. Simply query the bitcoin node with get_block_chain_info RPC call. In the result we will have information for all softforks. Create or update the entries in DB accordingly. Do this for each connected node.
 
+### Lagging Nodes
+ 
+We need to add functionality to keep tracks of nodes which lag behind. This will help us ignore such nodes while we are querying active chaintips.
+after polling the nodes for blocks and chaintips. Follow the below steps.
 
-## DB SCHEMA
+1.	Query the nodes table and get a list of nodes.
+2.	Run this for all nodes.
+3.	Compare the active chaintip block from this node to the active chaintip block from other nodes if its equal the node is nor behind.
+4.	If the node is not lagging behind. Delete the entry (if any) for this node
+5.	Otherwise check the work for the latest block on this node and the latest block on current active tip. If the active chain tips work is less than the work of this node. It means the node is lagging behind.
+6.	Also check if the height of current node is less than the height of active chaintip. If the difference is more than one block. Then it means that the node is lagging behind.
+7.	Add the entry in Lag table.
 
-This is a offline tool, your data stays locally and is not send to any server!
-Feedback & Bug Reports
+We will also need a pubsub which would give us the current lagging nodes. 
+
+Also filter lagging nodes out of the get_forks pubsub as well. So that at any given time get_forks only gives us one chaintip.
+
+
+### PubSub for invalid blocks.
+
+We need an RSS feed (pubsub) for invalid blocks. If we have a block which is marked valid by one node and invalid by another node, that means there is an issue with the consensus, which will be fixed by the chain.
+
+we need to be notified of such occurrence in the fork scanner so that we can make decisions based on this information.
+
+We have valid blocks and invalid blocks table. We have nodes column in both these tables. we can pick up blocks which are marked valid by on node and invalid by another node by using these tables. 
+
+we will have to create a new column created_at. This will allow us to limit our search to past 15 min.
+
+### Address watcher
+A Pubsub API endpoint which would take an address upon subscription and will publish back if there is a transaction made against that address.
+
+To do that forkscanner should maintain a DB table ‘watched’ schema provided below. 
+
+With every new block mined. Fork scanner will pick it up and check each transaction in this block. And see if the active addresses in the watched tables are in any transaction. (TxIn and TxOut)
+
+if we find a transaction save it in a Database table ‘watched transactions’(Schema below) and return the complete list of transactions (old and the new one) back to subscriber. 
+
+Moreover, when an entity subscribes it will share an address and a time limit till which address watcher will keep that address under watch. 
+
+If the time limit field is left empty, it means that this address needs to be under watch indefinitely.
+
+
+### Submit Block to Fork Scanner.
+
+A JSON RPC endpoint, which will be used by fork oracle to submit a block to fork scanner. For instance, fork oracle gets a confirmation of a block form one instance of fork scanner. It should be able to submit that block to another instance of fork scanner.
+
+for this purpose we require a JSON endpoint which will take the block hash as an input. The fork scanner will send a get block from peers RPC call to all connected bitcoin nodes and pass the block hash and the peer id as arguments. If any node manages to get hold of the block the fork scanner should add this information in the blocks table in the DB.
