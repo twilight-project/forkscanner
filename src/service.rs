@@ -1365,7 +1365,7 @@ pub fn run_server(
 							subscriber
 								.reject(Error {
 									code: ErrorCode::ParseError,
-									message: "Invalid parameters. Expected list of addresses to watch."
+									message: format!("Invalid parameters. Expected list of addresses to watch. {:?}", e)
 										.into(),
 									data: None,
 								})
