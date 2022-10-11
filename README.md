@@ -22,17 +22,6 @@ CREATE USER forkscanner WITH ENCRYPTED PASSWORD 'forkscanner';
 CREATE DATABASE forkscanner;
 GRANT ALL PRIVILEGES ON DATABASE forkscanner TO forkscanner;
 ```
-
-## Insert nodes into node table
-setup_nodes.sql provides an example of how to add bitcoin nodes to the list that forkscanner will monitor.
-At least one mirror node is necessary. The mirror node will be used to run rollback checks,
-which will interrupt the operation of the mirror node p2p.
-
-Edit setup_nodes.sql with credentials and rpc endpoints for your nodes, then run:
-```
-psql -f setup_nodes.sql postgres://forkscanner:forkscanner@localhost/forkscanner
-```
-
 Do the above with user forktester as well to run the tests.
 
 ## Install diesel cli-tool
@@ -46,6 +35,9 @@ On linux if you get cc linker error `cannot find -lpq` run below command
 `diesel migration run`
 
 ## Insert nodes into node table
+setup_nodes.sql provides an example of how to add bitcoin nodes to the list that forkscanner will monitor.
+At least one mirror node is necessary. The mirror node will be used to run rollback checks,
+which will interrupt the operation of the mirror node p2p.
 Edit setup_nodes.sql with credentials and rpc endpoints for your nodes, then run:
 ```
 psql -f scripts/nodes_setup.sql postgres://forkscanner:forkscanner@localhost/forkscanner
