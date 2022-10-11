@@ -1,9 +1,12 @@
 #[macro_use]
 extern crate diesel;
 
+mod models;
 mod scanner;
 mod schema;
-mod models;
+mod service;
 
-pub use models::Block;
-pub use scanner::{ForkScanner, ReorgMessage};
+pub use models::*;
+pub(crate) use scanner::MinerPoolInfo;
+pub use scanner::{ForkScanner, ScannerCommand, ScannerMessage};
+pub use service::run_server;
