@@ -31,7 +31,7 @@ fn main() {
 
     let (mut scanner, receiver, command) =
         ForkScanner::<Client>::new(db_conn).expect("Launching forkscanner failed");
-	scanner.enable_address_watcher(opt.watch_addresses);
+    scanner.enable_address_watcher(opt.watch_addresses);
     let duration = std::time::Duration::from_millis(10_000);
 
     let _handle = std::thread::spawn(move || loop {

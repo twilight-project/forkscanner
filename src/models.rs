@@ -1103,7 +1103,7 @@ impl StaleCandidate {
     }
 }
 
-#[derive(AsChangeset, QueryableByName, Queryable, Insertable, Serialize)]
+#[derive(Debug, AsChangeset, QueryableByName, Queryable, Insertable, Serialize)]
 #[table_name = "nodes"]
 pub struct Node {
     pub id: i64,
@@ -1312,16 +1312,13 @@ impl Watched {
             .execute(conn)
     }
 
-    pub fn remove(
-        conn: &PgConnection,
-        addresses: Vec<String>,
-    ) -> QueryResult<usize> {
+    pub fn remove(conn: &PgConnection, addresses: Vec<String>) -> QueryResult<usize> {
         use crate::schema::watched::dsl::*;
 
-		diesel::delete(watched)
-		    .filter(address.eq_any(addresses))
-			.execute(conn)
-	}
+        diesel::delete(watched)
+            .filter(address.eq_any(addresses))
+            .execute(conn)
+    }
 
     pub fn clear(conn: &PgConnection) -> QueryResult<usize> {
         use crate::schema::watched::dsl::*;
