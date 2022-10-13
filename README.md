@@ -62,6 +62,8 @@ This needs to be run on a node with bitcoin running.
 - `get_peers`: params: { "id": 8 }
    Query a nodes active peer list.
 
+- `update_watched_addresses`: params: { "remove": [ string ], "add": [ (string, date) ] }
+   Query a nodes active peer list.
 ```
 
 ### WS notification endpoints
@@ -254,6 +256,35 @@ Response:
 POST
 ```json
   { "id": 8 }
+```
+
+Response:
+```json
+{
+  "jsonrpc": "2.0",
+  "result": [
+      { "id": "node_id", "address": "127.0.0.1" },
+  ],
+  "id": 1
+}
+```
+
+`update_watched_addresses`:
+
+POST
+```json
+  { "remove": ["cdef9ae998abe7d1c287d741ab9007de848294c0"], "add": [] }
+```
+
+Response:
+```json
+{
+  "jsonrpc": "2.0",
+  "result": [
+    "OK"
+  ],
+  "id": 1
+}
 ```
 
 Response:

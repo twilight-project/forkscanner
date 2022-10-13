@@ -88,6 +88,12 @@ struct NodeArgs {
 }
 
 #[derive(Debug, Deserialize)]
+struct WatchedAddressUpdate {
+    remove: Vec<String>,
+	add: Vec<(String, DateTime<Utc>)>,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 struct WatchAddress {
     watch: Vec<String>,
@@ -289,7 +295,29 @@ fn tx_is_active(conn: Conn, params: Params) -> Result<Value> {
     }
 }
 
-// upload block to a node
+// update watched addresses
+fn update_watched_addresses(conn: Conn, params: Params) -> Result<Value> {
+    match params.parse::<WatchedAddressUpdate>() {
+	    Ok(updates) => {
+		    let WatchedAddressUpdate { remove, add } = updates;
+
+		    if let Err(_) = Watched::remove(&conn, remove) {
+                return Err(JsonRpcError::internal_error());
+			};
+
+            if let Err(_) = Watched::insert(&conn, add) {
+                return Err(JsonRpcError::internal_error());
+			}
+
+		    Ok("OK".into())
+		}
+        Err(args) => {
+            let err = JsonRpcError::invalid_params(format!("Invalid parameters, {:?}", args));
+            Err(err)
+        }
+	}
+}
+
 fn submit_block(conn: Conn, params: Params) -> Result<Value> {
     match params.parse::<BlockUpload>() {
         Ok(upload) => match Node::get(&conn, upload.node_id) {
@@ -626,7 +654,8 @@ fn handle_watched_addresses(
 ) {
     let conn = pool.get().expect("Connection pool failure");
 
-    Watched::insert(&conn, watch, watch_until).expect("Could not insert watchlist!");
+    let watches: Vec<_> = watch.into_iter().map(|w| (w, watch_until.clone())).collect();
+    Watched::insert(&conn, watches).expect("Could not insert watchlist!");
 
     info!("New address activity");
     let send_update =
@@ -937,6 +966,12 @@ pub fn run_server(
             submit_block(conn, params)
         });
 
+        let p = pool.clone();
+        io.add_sync_method("update_watched_addresses", move |params: Params| {
+            let conn = p.get().unwrap();
+            update_watched_addresses(conn, params)
+        });
+
         let server = hts::ServerBuilder::new(io)
             .start_http(&SocketAddr::from((l1.parse::<IpAddr>().unwrap(), rpc)))
             .expect("Failed to start RPC server");
@@ -1048,7 +1083,7 @@ pub fn run_server(
                         "New stale candidates: updating {} subscriptions",
                         subs.len()
                     );
-                    subs.retain(|sub| sub.send(ScannerMessage::StaleCandidateUpdate).is_ok());
+					subs.retain(|sub| sub.send(ScannerMessage::StaleCandidateUpdate).is_ok());
                 }
             }
             Ok(ScannerMessage::AllChaintips(mut t)) => {
@@ -1352,18 +1387,19 @@ pub fn run_server(
                     info!("Subscribe to watched address checks");
                     let mut rng = rand::rngs::OsRng::default();
 
-                    let WatchAddress { watch, watch_until } = if let Ok(parm) = params.parse() {
-                        parm
-                    } else {
-                        subscriber
-                            .reject(Error {
-                                code: ErrorCode::ParseError,
-                                message: "Invalid parameters. Expected list of addresses to watch."
-                                    .into(),
-                                data: None,
-                            })
-                            .unwrap();
-                        return;
+                    let WatchAddress { watch, watch_until } = match params.parse() {
+					    Ok(parm) => parm,
+						Err(e) => {
+							subscriber
+								.reject(Error {
+									code: ErrorCode::ParseError,
+									message: format!("Invalid parameters. Expected list of addresses to watch. {:?}", e)
+										.into(),
+									data: None,
+								})
+								.unwrap();
+							return;
+						}
                     };
 
                     let kill_switch = Arc::new(AtomicBool::new(false));

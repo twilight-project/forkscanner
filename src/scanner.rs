@@ -661,6 +661,7 @@ pub struct ForkScanner<BC: BtcClient + std::fmt::Debug> {
     db_conn: PgConnection,
     notify_tx: Sender<ScannerMessage>,
     command: Receiver<ScannerCommand>,
+	enable_address_watcher: bool,
 }
 
 impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
@@ -721,11 +722,16 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
                 db_conn,
                 notify_tx,
                 command: cmd_rx,
+				enable_address_watcher: false,
             },
             notify_rx,
             cmd_tx,
         ))
     }
+
+	pub fn enable_address_watcher(&mut self, watch: bool) {
+	    self.enable_address_watcher = watch;
+	}
 
     // fetch block templates and calculate fee rates.
     fn fetch_block_templates(&self, client: &BC, node: &Node) {
@@ -832,9 +838,11 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
                 }
             }
 
-            if let Ok(block) = Block::get(&self.db_conn, &hash) {
-                self.fetch_transactions(&block);
-            }
+            if self.enable_address_watcher {
+				if let Ok(block) = Block::get(&self.db_conn, &hash) {
+					self.fetch_transactions(&block);
+				}
+			}
         }
         Ok(changed)
     }

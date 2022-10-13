@@ -896,7 +896,8 @@ impl Transaction {
 
         diesel::insert_into(transaction)
             .values(tx)
-            .on_conflict_do_nothing()
+            .on_conflict((block_id, txid))
+            .do_nothing()
             .execute(conn)
     }
 
@@ -1292,17 +1293,16 @@ pub struct Watched {
 impl Watched {
     pub fn insert(
         conn: &PgConnection,
-        addresses: Vec<String>,
-        duration: DateTime<Utc>,
+        watches: Vec<(String, DateTime<Utc>)>,
     ) -> QueryResult<usize> {
         use crate::schema::watched::dsl::*;
 
-        let watch_list: Vec<_> = addresses
+        let watch_list: Vec<_> = watches
             .into_iter()
-            .map(|addr| Watched {
+            .map(|(addr, exp)| Watched {
                 address: addr,
                 created_at: Utc::now(),
-                watch_until: duration.clone(),
+                watch_until: exp,
             })
             .collect();
 
@@ -1311,6 +1311,17 @@ impl Watched {
             .on_conflict_do_nothing()
             .execute(conn)
     }
+
+    pub fn remove(
+        conn: &PgConnection,
+        addresses: Vec<String>,
+    ) -> QueryResult<usize> {
+        use crate::schema::watched::dsl::*;
+
+		diesel::delete(watched)
+		    .filter(address.eq_any(addresses))
+			.execute(conn)
+	}
 
     pub fn clear(conn: &PgConnection) -> QueryResult<usize> {
         use crate::schema::watched::dsl::*;
