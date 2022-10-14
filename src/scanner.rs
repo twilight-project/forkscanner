@@ -1228,7 +1228,7 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
         }
 
         // get min height block template, and blocks with no fee diffs yet.
-        info!("Fecthing block templates");
+        info!("Fetching block templates");
         match BlockTemplate::get_min(&self.db_conn) {
             Ok(Some(min_template)) => {
                 if let Ok(blocks) = Block::get_with_fee_no_diffs(&self.db_conn, min_template) {
