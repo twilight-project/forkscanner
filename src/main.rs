@@ -18,7 +18,7 @@ struct Opt {
     ws: u16,
 
     /// Enable address watcher
-    #[structopt(short = "a", long = "watch-addresses", default_value = "none")]
+    #[structopt(short = "a", long = "watch-addresses", default_value = "none", possible_values(&["none", "inputs", "outputs", "all"]))]
     watch_addresses: WatcherMode,
 }
 
