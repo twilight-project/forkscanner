@@ -186,10 +186,11 @@ diesel::table! {
 }
 
 diesel::table! {
-    transaction_addresses (hash, txid, address) {
-        hash -> Varchar,
+    transaction_addresses (txid, address) {
+        created_at -> Timestamptz,
         txid -> Varchar,
         address -> Varchar,
+        direction -> Varchar,
     }
 }
 

@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     net::{IpAddr, SocketAddr},
+    str::FromStr,
     sync::atomic::{AtomicBool, Ordering},
     sync::{Arc, Mutex, RwLock},
     thread, time,
@@ -33,6 +34,30 @@ const BLOCK_WINDOW: i64 = 10;
 
 type Conn = PooledConnection<ConnectionManager<diesel::PgConnection>>;
 type ManagedPool = r2d2::Pool<ConnectionManager<PgConnection>>;
+
+pub type ModeError = &'static str;
+
+#[derive(Debug, PartialEq)]
+pub enum WatcherMode {
+    None,
+    Inputs,
+    Outputs,
+    All,
+}
+
+impl FromStr for WatcherMode {
+    type Err = ModeError;
+
+    fn from_str(mode: &str) -> std::result::Result<WatcherMode, Self::Err> {
+        match mode {
+            "none" => Ok(WatcherMode::None),
+            "inputs" => Ok(WatcherMode::Inputs),
+            "outputs" => Ok(WatcherMode::Outputs),
+            "all" => Ok(WatcherMode::All),
+            _ => Err("Unknown watcher mode"),
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum WsError {
@@ -90,7 +115,7 @@ struct NodeArgs {
 #[derive(Debug, Deserialize)]
 struct WatchedAddressUpdate {
     remove: Vec<String>,
-	add: Vec<(String, DateTime<Utc>)>,
+    add: Vec<(String, DateTime<Utc>)>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -298,24 +323,24 @@ fn tx_is_active(conn: Conn, params: Params) -> Result<Value> {
 // update watched addresses
 fn update_watched_addresses(conn: Conn, params: Params) -> Result<Value> {
     match params.parse::<WatchedAddressUpdate>() {
-	    Ok(updates) => {
-		    let WatchedAddressUpdate { remove, add } = updates;
+        Ok(updates) => {
+            let WatchedAddressUpdate { remove, add } = updates;
 
-		    if let Err(_) = Watched::remove(&conn, remove) {
+            if let Err(_) = Watched::remove(&conn, remove) {
                 return Err(JsonRpcError::internal_error());
-			};
+            };
 
             if let Err(_) = Watched::insert(&conn, add) {
                 return Err(JsonRpcError::internal_error());
-			}
+            }
 
-		    Ok("OK".into())
-		}
+            Ok("OK".into())
+        }
         Err(args) => {
             let err = JsonRpcError::invalid_params(format!("Invalid parameters, {:?}", args));
             Err(err)
         }
-	}
+    }
 }
 
 fn submit_block(conn: Conn, params: Params) -> Result<Value> {
@@ -528,24 +553,27 @@ fn add_node(conn: Conn, params: Params) -> Result<Value> {
 
 // get nodes from database
 fn get_nodes(conn: Conn, params: Params) -> Result<Value> {
-	if params != Params::None {
-		let err = JsonRpcError::invalid_params(format!("Unexpected parameters to get_nodes."));
-		Err(err)
-	} else {
-		if let Ok(nodes) = Node::list(&conn) {
-		    let nodes: Vec<_> = nodes.into_iter().map(|mut n| {
-			    n.rpc_pass = "xxx".to_string();
-				n
-			}).collect();
+    if params != Params::None {
+        let err = JsonRpcError::invalid_params(format!("Unexpected parameters to get_nodes."));
+        Err(err)
+    } else {
+        if let Ok(nodes) = Node::list(&conn) {
+            let nodes: Vec<_> = nodes
+                .into_iter()
+                .map(|mut n| {
+                    n.rpc_pass = "xxx".to_string();
+                    n
+                })
+                .collect();
 
-		    match serde_json::to_value(&nodes) {
-			    Ok(n) => Ok(n),
-				Err(_) => Err(JsonRpcError::internal_error()),
-			}
-		} else {
-			Err(JsonRpcError::internal_error())
-		}
-	}
+            match serde_json::to_value(&nodes) {
+                Ok(n) => Ok(n),
+                Err(_) => Err(JsonRpcError::internal_error()),
+            }
+        } else {
+            Err(JsonRpcError::internal_error())
+        }
+    }
 }
 
 // remove node from database
@@ -654,7 +682,10 @@ fn handle_watched_addresses(
 ) {
     let conn = pool.get().expect("Connection pool failure");
 
-    let watches: Vec<_> = watch.into_iter().map(|w| (w, watch_until.clone())).collect();
+    let watches: Vec<_> = watch
+        .into_iter()
+        .map(|w| (w, watch_until.clone()))
+        .collect();
     Watched::insert(&conn, watches).expect("Could not insert watchlist!");
 
     info!("New address activity");
@@ -1083,7 +1114,7 @@ pub fn run_server(
                         "New stale candidates: updating {} subscriptions",
                         subs.len()
                     );
-					subs.retain(|sub| sub.send(ScannerMessage::StaleCandidateUpdate).is_ok());
+                    subs.retain(|sub| sub.send(ScannerMessage::StaleCandidateUpdate).is_ok());
                 }
             }
             Ok(ScannerMessage::AllChaintips(mut t)) => {
@@ -1388,9 +1419,9 @@ pub fn run_server(
                     let mut rng = rand::rngs::OsRng::default();
 
                     let WatchAddress { watch, watch_until } = match params.parse() {
-					    Ok(parm) => parm,
-						Err(e) => {
-							subscriber
+                        Ok(parm) => parm,
+                        Err(e) => {
+                            subscriber
 								.reject(Error {
 									code: ErrorCode::ParseError,
 									message: format!("Invalid parameters. Expected list of addresses to watch. {:?}", e)
@@ -1398,8 +1429,8 @@ pub fn run_server(
 									data: None,
 								})
 								.unwrap();
-							return;
-						}
+                            return;
+                        }
                     };
 
                     let kill_switch = Arc::new(AtomicBool::new(false));

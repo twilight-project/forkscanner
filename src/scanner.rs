@@ -1,10 +1,13 @@
 use crate::{
     Block, BlockTemplate, Chaintip, ConflictingBlock, FeeRate, InflatedBlock, InvalidBlock, Lags,
     NewPeer, Node, Peer, Pool, SoftForks, StaleCandidate, StaleCandidateChildren, Transaction,
-    TransactionAddress, TxOutset, Watched,
+    TransactionAddress, TxOutset, Watched, WatcherMode,
 };
 use bigdecimal::{BigDecimal, FromPrimitive};
-use bitcoin::{consensus::encode::serialize_hex, util::amount::Amount};
+use bitcoin::{
+    consensus::encode::{deserialize, serialize_hex},
+    util::amount::Amount,
+};
 use bitcoin_hashes::hex::ToHex;
 use bitcoin_hashes::{sha256d, Hash};
 use bitcoincore_rpc::bitcoin as btc;
@@ -20,6 +23,7 @@ use chrono::prelude::*;
 use crossbeam::channel::{unbounded, Receiver, Sender, TryRecvError};
 use diesel::prelude::PgConnection;
 use diesel::Connection;
+use hex::FromHex;
 use jsonrpc::error::Error as JsonRpcError;
 use jsonrpc::error::RpcError;
 use log::{debug, error, info, warn};
@@ -661,12 +665,13 @@ pub struct ForkScanner<BC: BtcClient + std::fmt::Debug> {
     db_conn: PgConnection,
     notify_tx: Sender<ScannerMessage>,
     command: Receiver<ScannerCommand>,
-	enable_address_watcher: bool,
+    address_watcher_mode: WatcherMode,
 }
 
 impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
     pub fn new(
         db_conn: PgConnection,
+        mode: WatcherMode,
     ) -> ForkScannerResult<(
         ForkScanner<BC>,
         Receiver<ScannerMessage>,
@@ -722,16 +727,12 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
                 db_conn,
                 notify_tx,
                 command: cmd_rx,
-				enable_address_watcher: false,
+                address_watcher_mode: mode,
             },
             notify_rx,
             cmd_tx,
         ))
     }
-
-	pub fn enable_address_watcher(&mut self, watch: bool) {
-	    self.enable_address_watcher = watch;
-	}
 
     // fetch block templates and calculate fee rates.
     fn fetch_block_templates(&self, client: &BC, node: &Node) {
@@ -838,11 +839,11 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
                 }
             }
 
-            if self.enable_address_watcher {
-				if let Ok(block) = Block::get(&self.db_conn, &hash) {
-					self.fetch_transactions(&block);
-				}
-			}
+            if self.address_watcher_mode != WatcherMode::None {
+                if let Ok(block) = Block::get(&self.db_conn, &hash) {
+                    self.fetch_transactions(&block);
+                }
+            }
         }
         Ok(changed)
     }
@@ -1425,7 +1426,11 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
         mirrors.par_iter().for_each(|mirror| {
             let host = format!(
                 "http://{}:{}",
-                mirror.mirror_host.as_ref().unwrap_or(&mirror.rpc_host).to_string(),
+                mirror
+                    .mirror_host
+                    .as_ref()
+                    .unwrap_or(&mirror.rpc_host)
+                    .to_string(),
                 mirror.mirror_rpc_port.expect("No mirror port")
             );
             let auth = Auth::UserPass(mirror.rpc_user.clone(), mirror.rpc_pass.clone());
@@ -2115,10 +2120,76 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
         for (idx, tx) in block_info.txdata.iter().enumerate() {
             let hex = serialize_hex(tx);
 
-            for vout in &tx.output {
-                let spk = &vout.script_pubkey;
-                let address = spk.script_hash().to_string();
-                tx_addrs.push((block.hash.clone(), tx.txid().to_hex(), address));
+            if self.address_watcher_mode == WatcherMode::Outputs
+                || self.address_watcher_mode == WatcherMode::All
+            {
+                for vin in &tx.input {
+                    let txid = &vin.previous_output.txid;
+
+                    let tx = match Transaction::get(&self.db_conn, txid.to_hex()) {
+                        Ok(Some(tx)) => {
+                            let tx_bytes: Vec<u8> =
+                                FromHex::from_hex(&tx.hex).expect("Invalid hex format!");
+                            deserialize(&tx_bytes).unwrap()
+                        }
+                        Ok(None) => {
+                            match self
+                                .archive_node
+                                .client()
+                                .get_raw_transaction_info(txid, None)
+                            {
+                                Ok(tx) => {
+                                    let tx = match tx.transaction() {
+                                        Ok(tx) => tx,
+                                        Err(e) => {
+                                            error!("Invalid tx format! {:?}", e);
+                                            return;
+                                        }
+                                    };
+
+                                    let hex = serialize_hex(&tx);
+
+                                    if let Err(e) = Transaction::create(
+                                        &self.db_conn,
+                                        false,
+                                        block.hash.to_string(),
+                                        0,
+                                        &tx.txid().to_hex(),
+                                        &hex,
+                                        0.0,
+                                    ) {
+                                        error!("Failed to insert transaction! {:?}", e);
+                                        return;
+                                    }
+
+                                    tx
+                                }
+                                Err(_) => {
+                                    debug!("Could not fetch transaction info! {:?}", txid);
+                                    return;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!("Transaction query failed! {:?}", e);
+                            return;
+                        }
+                    };
+
+                    let spk = &tx.output[vin.previous_output.vout as usize].script_pubkey;
+                    let address = spk.script_hash().to_string();
+                    tx_addrs.push((tx.txid().to_hex(), address, "outgoing".into()));
+                }
+            }
+
+            if self.address_watcher_mode == WatcherMode::Inputs
+                || self.address_watcher_mode == WatcherMode::All
+            {
+                for vout in &tx.output {
+                    let spk = &vout.script_pubkey;
+                    let address = spk.script_hash().to_string();
+                    tx_addrs.push((tx.txid().to_hex(), address, "incoming".into()));
+                }
             }
 
             let value = tx.output.iter().fold(0, |a, amt| a + amt.value);
@@ -2138,38 +2209,6 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
         if let Err(e) = TransactionAddress::insert(&self.db_conn, tx_addrs) {
             error!("Database update failed: {:?}", e);
         }
-    }
-
-    fn get_input_addrs(&self, idx: usize, tx: &JsonTransaction) -> HashSet<btc::Address> {
-        // find the input amount for the tx
-        let mut input_amounts = HashSet::default();
-
-        info!("Fetching input tx info for txindex {}", idx);
-        for txin in tx.vin.iter() {
-            if let Some(txid) = &txin.txid {
-                let txid = btc::Txid::from_str(&txid).unwrap();
-                match self
-                    .archive_node
-                    .client()
-                    .get_raw_transaction_info(&txid, None)
-                {
-                    Ok(tx) => {
-                        for vout in tx.vout.iter() {
-                            if let Some(addrs) = &vout.script_pub_key.addresses {
-                                input_amounts.extend(addrs.iter().cloned());
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        // This is very noisy when you don't have an archive node.
-                        debug!("Could not fetch transaction info! {:?}", txid);
-                        continue;
-                    }
-                }
-            }
-        }
-
-        input_amounts
     }
 
     // Rollback checks. Here we are looking to use the mirror node to try to set a 'valid-headers'

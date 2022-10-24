@@ -2,7 +2,7 @@ use bitcoincore_rpc::Client;
 use diesel::prelude::PgConnection;
 use diesel::Connection;
 use forkscanner::run_server;
-use forkscanner::ForkScanner;
+use forkscanner::{ForkScanner, WatcherMode};
 use log::info;
 use structopt::StructOpt;
 
@@ -18,8 +18,8 @@ struct Opt {
     ws: u16,
 
     /// Enable address watcher
-    #[structopt(short = "a", long = "watch-addresses")]
-    watch_addresses: bool,
+    #[structopt(short = "a", long = "watch-addresses", default_value = "none")]
+    watch_addresses: WatcherMode,
 }
 
 fn main() {
@@ -29,9 +29,8 @@ fn main() {
     let db_conn = PgConnection::establish(&db_url).expect("Connection failed");
     let opt = Opt::from_args();
 
-    let (mut scanner, receiver, command) =
-        ForkScanner::<Client>::new(db_conn).expect("Launching forkscanner failed");
-	scanner.enable_address_watcher(opt.watch_addresses);
+    let (scanner, receiver, command) = ForkScanner::<Client>::new(db_conn, opt.watch_addresses)
+        .expect("Launching forkscanner failed");
     let duration = std::time::Duration::from_millis(10_000);
 
     let _handle = std::thread::spawn(move || loop {

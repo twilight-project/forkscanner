@@ -15,6 +15,8 @@ use crate::schema::{
 };
 use crate::MinerPoolInfo;
 
+const WATCH_WINDOW: i64 = 30;
+
 pub fn serde_bigdecimal<S>(decimal: &Option<BigDecimal>, s: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
@@ -206,9 +208,10 @@ pub struct Height {
 #[derive(Debug, AsChangeset, QueryableByName, Queryable, Insertable)]
 #[table_name = "transaction_addresses"]
 pub struct TransactionAddress {
-    pub hash: String,
+    pub created_at: DateTime<Utc>,
     pub txid: String,
     pub address: String,
+    pub direction: String,
 }
 
 impl TransactionAddress {
@@ -216,10 +219,11 @@ impl TransactionAddress {
         use crate::schema::transaction_addresses::dsl::*;
         let tx_addrs: Vec<_> = data
             .into_iter()
-            .map(|(tx_hash, id, tx_address)| TransactionAddress {
-                hash: tx_hash,
+            .map(|(id, tx_address, dir)| TransactionAddress {
+                created_at: Utc::now(),
                 txid: id,
                 address: tx_address,
+                direction: dir,
             })
             .collect();
 
@@ -874,6 +878,15 @@ pub struct Transaction {
 }
 
 impl Transaction {
+    pub fn get(conn: &PgConnection, tx_id: String) -> QueryResult<Option<Transaction>> {
+        use crate::schema::transaction::dsl::*;
+        match transaction.filter(txid.eq(tx_id)).get_result(conn) {
+            Ok(result) => Ok(Some(result)),
+            Err(diesel::result::Error::NotFound) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     pub fn create(
         conn: &PgConnection,
         sweep: bool,
@@ -1312,16 +1325,13 @@ impl Watched {
             .execute(conn)
     }
 
-    pub fn remove(
-        conn: &PgConnection,
-        addresses: Vec<String>,
-    ) -> QueryResult<usize> {
+    pub fn remove(conn: &PgConnection, addresses: Vec<String>) -> QueryResult<usize> {
         use crate::schema::watched::dsl::*;
 
-		diesel::delete(watched)
-		    .filter(address.eq_any(addresses))
-			.execute(conn)
-	}
+        diesel::delete(watched)
+            .filter(address.eq_any(addresses))
+            .execute(conn)
+    }
 
     pub fn clear(conn: &PgConnection) -> QueryResult<usize> {
         use crate::schema::watched::dsl::*;
@@ -1341,24 +1351,25 @@ impl Watched {
         let watched: Vec<_> = wdsl::watched.load(conn)?;
         let watched: Vec<_> = watched.into_iter().map(|w: Watched| w.address).collect();
 
-        let transactions: Vec<(String, String, String)> = tadsl::transaction_addresses
-            .filter(tadsl::address.eq(any(watched)))
-            .load(conn)?;
+        let from_time = Utc::now() - chrono::Duration::minutes(WATCH_WINDOW);
 
-        let mut block_ids = Vec::new();
+        let transactions: Vec<(DateTime<Utc>, String, String, String)> =
+            tadsl::transaction_addresses
+                .filter(
+                    tadsl::address
+                        .eq(any(watched))
+                        .and(tadsl::created_at.gt(from_time)),
+                )
+                .load(conn)?;
+
         let mut tx_ids = Vec::new();
 
-        for (h, id, _) in transactions.into_iter() {
-            block_ids.push(h);
+        for (_, id, _, _) in transactions.into_iter() {
             tx_ids.push(id);
         }
 
         let transactions: Vec<_> = tdsl::transaction
-            .filter(
-                tdsl::block_id
-                    .eq_any(block_ids)
-                    .and(tdsl::txid.eq_any(tx_ids)),
-            )
+            .filter(tdsl::txid.eq_any(tx_ids))
             .load(conn)?;
 
         Ok(transactions)
