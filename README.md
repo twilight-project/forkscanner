@@ -50,6 +50,12 @@ This needs to be run on a node with bitcoin running.
 - `get_block`: params { hash: string } OR { height: int } 
   Get a block by hash or height.
 
+- `get_parent`: params { hash: string } 
+  Get parent of a block by hash.
+
+- `get_stale_candidates`: params { window: int } 
+  Get stale candidates from within the last `window` number of blocks.
+
 - `submit_block`: params { block: block_json, node: int }
   Upload a block to the given node.
 
@@ -151,6 +157,31 @@ Response:
 
 ```
 
+`get_stale_candidates`:
+
+POST
+```json
+    {"method": "get_stale_candidates", "params": { "window": 4 }, "jsonrpc": "2.0", "id" 1}
+```
+
+Response:
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": [
+    {
+		"tip": "00000000000000000006ead1cff09f279f7beb31a7290c2a603b0776d98dc334",
+		"tip_height": 498464,
+		"stale_height": 498462,
+		"height_difference": 2,
+		"stale_branch_len": 2,
+		"stale_branch_root": "00000000000000000006ead1cff09f279f7beb31a7290c2a603b0776d98dc334",
+	}
+  ]
+}
+```
+
 `get_block`:
 
 POST
@@ -193,6 +224,47 @@ Response:
   ],
   "id": 1
 }
+```
+
+`get_parent`:
+
+POST
+```json
+    {"method": "get_parent", "params": { "hash": "00000000000000000006ead1cff09f279f7beb31a7290c2a603b0776d98dc334" }, "jsonrpc": "2.0", "id" 1}
+```
+
+Response:
+```json
+{
+  "jsonrpc": "2.0",
+  "result": [
+    {
+      "coinbase_message": [ 123, 45, 67 ],
+      "connected": true,
+      "first_seen_by": 13,
+      "hash": "00000000000000000006ead1cff09f279f7beb31a7290c2a603b0776d98dc334",
+      "headers_only": false,
+      "height": 733430,
+      "lowest_template_fee_rate": null,
+      "parent_hash": "000000000000000000082af6a6db0e71d72f25dcfb513aeda1a1cb4044253030",
+      "pool_name": "Foundry USA",
+      "template_txs_fee_diff": null,
+      "total_fee": "0.09797872",
+      "tx_omitted_fee_rates": null,
+      "txids": [
+        "d6187e533fffece5c502e8a05242dba6e94a7eb9cdde241250f3ed16c31242eb",
+        "b76c3a88d50ff3b8a03fc623098f86d6872b3748d6cce956138fef8fa6f6c412",
+        "......"
+      ],
+      "txids_added": null,
+      "txids_omitted": null,
+      "work": "00000000000000000000000000000000000000002ca1bca6e028e261a6019f07"
+    }
+  ],
+  "id": 1
+}
+```
+
 
 `get_block_from_peer`:
 

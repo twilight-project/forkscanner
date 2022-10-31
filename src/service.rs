@@ -127,6 +127,18 @@ struct WatchAddress {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
+struct Window {
+    window: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct BlockHash {
+    hash: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
 enum BlockQuery {
     Height(i64),
     Hash(String),
@@ -481,6 +493,42 @@ fn get_block_from_peer(conn: Conn, params: Params) -> Result<Value> {
         },
         Err(e) => {
             let err = JsonRpcError::invalid_params(format!("Invalid parameters, {:?}", e));
+            Err(err)
+        }
+    }
+}
+
+fn get_stale_candidates(conn: Conn, params: Params) -> Result<Value> {
+    match params.parse::<Window>() {
+        Ok(q) => Ok(validation_checks(conn, q.window)?),
+        Err(args) => {
+            let err = JsonRpcError::invalid_params(format!("Invalid parameters, {:?}", args));
+            Err(err)
+        }
+    }
+}
+
+fn get_parent(conn: Conn, params: Params) -> Result<Value> {
+    match params.parse::<BlockHash>() {
+        Ok(q) => {
+            if let Ok(result) = Block::get(&conn, &q.hash) {
+                let parent = match result.parent(&conn) {
+                    Ok(p) => p,
+                    Err(_) => return Err(JsonRpcError::internal_error()),
+                };
+
+                let result = BlockResult::from_block(parent);
+
+                match serde_json::to_value(vec![result]) {
+                    Ok(s) => Ok(s),
+                    Err(_) => Err(JsonRpcError::internal_error()),
+                }
+            } else {
+                Err(JsonRpcError::internal_error())
+            }
+        }
+        Err(args) => {
+            let err = JsonRpcError::invalid_params(format!("Invalid parameters, {:?}", args));
             Err(err)
         }
     }
@@ -963,6 +1011,18 @@ pub fn run_server(
         io.add_sync_method("get_block", move |params: Params| {
             let conn = p.get().unwrap();
             get_block(conn, params)
+        });
+
+        let p = pool.clone();
+        io.add_sync_method("get_parent", move |params: Params| {
+            let conn = p.get().unwrap();
+            get_parent(conn, params)
+        });
+
+        let p = pool.clone();
+        io.add_sync_method("get_stale_candidates", move |params: Params| {
+            let conn = p.get().unwrap();
+            get_stale_candidates(conn, params)
         });
 
         let p = pool.clone();

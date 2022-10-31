@@ -23,8 +23,18 @@ struct Opt {
 }
 
 fn main() {
-    env_logger::init();
     dotenv::dotenv().expect("Failed loading dotenv");
+
+    let log_dir = std::env::var("LOG_DIR").map_or("/var/log".to_string(), |v| v);
+    let file_appender = tracing_appender::rolling::hourly(log_dir, "forkscanner.log");
+    tracing_subscriber::fmt::Subscriber::builder()
+        .with_writer(file_appender)
+        .with_env_filter(tracing_subscriber::filter::EnvFilter::from_default_env())
+        .with_ansi(false)
+        .with_level(true)
+        .with_line_number(true)
+        .init();
+
     let db_url = std::env::var("DATABASE_URL").expect("No DB url");
     let db_conn = PgConnection::establish(&db_url).expect("Connection failed");
     let opt = Opt::from_args();
