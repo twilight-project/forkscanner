@@ -2157,7 +2157,7 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
                         Ok(Some(tx)) => {
                             let tx_bytes: Vec<u8> =
                                 FromHex::from_hex(&tx.hex).expect("Invalid hex format!");
-                            deserialize(&tx_bytes).unwrap()
+                            Some(deserialize(&tx_bytes).unwrap())
                         }
                         Ok(None) => {
                             match self
@@ -2189,11 +2189,14 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
                                         return;
                                     }
 
-                                    tx
+                                    Some(tx)
                                 }
                                 Err(e) => {
-                                    debug!("Could not fetch transaction info! {:?}", txid);
-                                    return;
+                                    error!(
+                                        "Could not fetch transaction info! tx: {:?} e: {:?}",
+                                        txid, e
+                                    );
+                                    None
                                 }
                             }
                         }
@@ -2203,9 +2206,11 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
                         }
                     };
 
-                    let spk = &tx.output[vin.previous_output.vout as usize].script_pubkey;
-                    let address = spk.script_hash().to_string();
-                    tx_addrs.push((tx.txid().to_hex(), address, "outgoing".into()));
+                    if let Some(tx) = tx {
+                        let spk = &tx.output[vin.previous_output.vout as usize].script_pubkey;
+                        let address = spk.script_hash().to_string();
+                        tx_addrs.push((tx.txid().to_hex(), address, "outgoing".into()));
+                    }
                 }
             }
 
