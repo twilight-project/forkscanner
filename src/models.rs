@@ -234,10 +234,13 @@ impl TransactionAddress {
             })
             .collect();
 
-        diesel::insert_into(transaction_addresses)
-            .values(&tx_addrs)
-            .on_conflict_do_nothing()
-            .execute(conn)
+        for chunk in tx_addrs.as_slice().chunks(16384) {
+            let _ = diesel::insert_into(transaction_addresses)
+                .values(chunk)
+                .on_conflict_do_nothing()
+                .execute(conn)?;
+        }
+        Ok(tx_addrs.len())
     }
 }
 
