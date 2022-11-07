@@ -44,6 +44,7 @@ diesel::table! {
         block -> Varchar,
         height -> Int8,
         parent_chaintip -> Nullable<Int8>,
+        parent_block -> Nullable<Varchar>,
     }
 }
 

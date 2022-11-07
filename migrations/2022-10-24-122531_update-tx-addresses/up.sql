@@ -9,3 +9,6 @@ CREATE TABLE transaction_addresses (
 	direction varchar not null,
 	PRIMARY KEY(txid, address)
 );
+
+ALTER TABLE chaintips
+ADD COLUMN parent_block varchar;

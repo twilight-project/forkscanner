@@ -48,6 +48,7 @@ const REACHABLE_CHECK_INTERVAL: i64 = 10;
 const MINER_POOL_INFO: &str =
     "https://raw.githubusercontent.com/0xB10C/known-mining-pools/master/pools.json";
 const SATOSHI_TO_BTC: i64 = 100_000_000;
+const COINBASE_ADDR: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 type ForkScannerResult<T> = Result<T, ForkScannerError>;
 
@@ -622,7 +623,7 @@ fn find_fork_point(
 /// Holds connection info for a bitcoin node that forkscanner is
 /// connected to.
 pub struct ScannerClient<BC: BtcClient> {
-    node_id: i64,
+    pub node_id: i64,
     client: BC,
     mirror: Option<BC>,
 }
@@ -815,24 +816,47 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
                     create_block_and_ancestors(client, &self.db_conn, true, &hash, node.id)?;
                 }
                 GetChainTipsResultStatus::Invalid => {
-                    Chaintip::set_invalid_fork(&self.db_conn, tip.height as i64, &hash, node.id)?;
-
                     create_block_and_ancestors(client, &self.db_conn, false, &hash, node.id)?;
+
+                    let parent = Block::get(&self.db_conn, &hash)?;
+
+                    Chaintip::set_invalid_fork(
+                        &self.db_conn,
+                        tip.height as i64,
+                        &hash,
+                        node.id,
+                        &parent.parent_hash,
+                    )?;
 
                     Block::set_invalid(&self.db_conn, &hash, node.id)?;
                 }
                 GetChainTipsResultStatus::ValidFork => {
-                    Chaintip::set_valid_fork(&self.db_conn, tip.height as i64, &hash, node.id)?;
-
                     create_block_and_ancestors(client, &self.db_conn, false, &hash, node.id)?;
+
+                    let parent = Block::get(&self.db_conn, &hash)?;
+
+                    Chaintip::set_valid_fork(
+                        &self.db_conn,
+                        tip.height as i64,
+                        &hash,
+                        node.id,
+                        &parent.parent_hash,
+                    )?;
 
                     Block::set_valid(&self.db_conn, &hash, node.id)?;
                 }
                 GetChainTipsResultStatus::Active => {
-                    let rows =
-                        Chaintip::set_active_tip(&self.db_conn, tip.height as i64, &hash, node.id)?;
-
                     create_block_and_ancestors(client, &self.db_conn, false, &hash, node.id)?;
+
+                    let parent = Block::get(&self.db_conn, &hash)?;
+
+                    let rows = Chaintip::set_active_tip(
+                        &self.db_conn,
+                        tip.height as i64,
+                        &hash,
+                        node.id,
+                        &parent.parent_hash,
+                    )?;
 
                     Block::set_valid(&self.db_conn, &hash, node.id)?;
                     changed |= rows > 0;
@@ -2125,6 +2149,9 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
             {
                 for vin in &tx.input {
                     let txid = &vin.previous_output.txid;
+                    if txid.to_hex() == COINBASE_ADDR.to_string() {
+                        continue;
+                    }
 
                     let tx = match Transaction::get(&self.db_conn, txid.to_hex()) {
                         Ok(Some(tx)) => {
@@ -2164,7 +2191,7 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
 
                                     tx
                                 }
-                                Err(_) => {
+                                Err(e) => {
                                     debug!("Could not fetch transaction info! {:?}", txid);
                                     return;
                                 }

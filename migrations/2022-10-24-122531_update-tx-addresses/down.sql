@@ -8,3 +8,6 @@ CREATE TABLE transaction_addresses (
 	address varchar not null,
 	PRIMARY KEY(hash, txid, address)
 );
+
+ALTER TABLE chaintips
+DROP COLUMN parent_block;

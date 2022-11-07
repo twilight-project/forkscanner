@@ -38,6 +38,7 @@ pub struct Chaintip {
     pub block: String,
     pub height: i64,
     pub parent_chaintip: Option<i64>,
+    pub parent_block: Option<String>,
 }
 
 impl Chaintip {
@@ -125,6 +126,7 @@ impl Chaintip {
         block_height: i64,
         hash: &String,
         node_id: i64,
+        parent_hash: &Option<String>,
     ) -> QueryResult<usize> {
         use crate::schema::chaintips::dsl::*;
         diesel::insert_into(chaintips)
@@ -133,6 +135,7 @@ impl Chaintip {
                 block.eq(hash),
                 height.eq(block_height),
                 status.eq("invalid"),
+                parent_block.eq(parent_hash),
             ))
             .execute(conn)
     }
@@ -143,6 +146,7 @@ impl Chaintip {
         block_height: i64,
         hash: &String,
         node_id: i64,
+        parent_hash: &Option<String>,
     ) -> QueryResult<usize> {
         use crate::schema::chaintips::dsl::*;
         diesel::insert_into(chaintips)
@@ -151,6 +155,7 @@ impl Chaintip {
                 block.eq(hash),
                 height.eq(block_height),
                 status.eq("valid-fork"),
+                parent_block.eq(parent_hash),
             ))
             .execute(conn)
     }
@@ -161,6 +166,7 @@ impl Chaintip {
         block_height: i64,
         hash: &String,
         node_id: i64,
+        parent_hash: &Option<String>,
     ) -> QueryResult<usize> {
         use crate::schema::chaintips::dsl::*;
         let tip = chaintips
@@ -192,6 +198,7 @@ impl Chaintip {
                     status.eq("active"),
                     block.eq(hash),
                     height.eq(block_height),
+                    parent_block.eq(parent_hash),
                 ))
                 .execute(conn),
             Err(e) => Err(e),
