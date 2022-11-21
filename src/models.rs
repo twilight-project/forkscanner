@@ -212,25 +212,30 @@ pub struct Height {
     pub height: i64,
 }
 
-#[derive(Debug, AsChangeset, QueryableByName, Queryable, Insertable)]
+#[derive(Clone, Debug, AsChangeset, QueryableByName, Queryable, Insertable, Serialize)]
 #[table_name = "transaction_addresses"]
 pub struct TransactionAddress {
     pub created_at: DateTime<Utc>,
     pub txid: String,
-    pub address: String,
-    pub direction: String,
+    pub incoming: String,
+    pub outgoing: String,
+    pub satoshis: i64,
 }
 
 impl TransactionAddress {
-    pub fn insert(conn: &PgConnection, data: Vec<(String, String, String)>) -> QueryResult<usize> {
+    pub fn insert(
+        conn: &PgConnection,
+        data: Vec<(String, String, String, u64)>,
+    ) -> QueryResult<usize> {
         use crate::schema::transaction_addresses::dsl::*;
         let tx_addrs: Vec<_> = data
             .into_iter()
-            .map(|(id, tx_address, dir)| TransactionAddress {
+            .map(|(id, in_address, out_address, sats)| TransactionAddress {
                 created_at: Utc::now(),
                 txid: id,
-                address: tx_address,
-                direction: dir,
+                incoming: in_address,
+                outgoing: out_address,
+                satoshis: sats as i64,
             })
             .collect();
 
@@ -1352,8 +1357,7 @@ impl Watched {
             .execute(conn)
     }
 
-    pub fn fetch(conn: &PgConnection) -> QueryResult<Vec<Transaction>> {
-        use crate::schema::transaction::dsl as tdsl;
+    pub fn fetch(conn: &PgConnection) -> QueryResult<Vec<TransactionAddress>> {
         use crate::schema::transaction_addresses::dsl as tadsl;
         use crate::schema::watched::dsl as wdsl;
         use diesel::dsl::any;
@@ -1363,26 +1367,18 @@ impl Watched {
 
         let from_time = Utc::now() - chrono::Duration::minutes(WATCH_WINDOW);
 
-        let transactions: Vec<(DateTime<Utc>, String, String, String)> =
-            tadsl::transaction_addresses
-                .filter(
-                    tadsl::address
-                        .eq(any(watched))
-                        .and(tadsl::created_at.gt(from_time)),
-                )
-                .load(conn)?;
-
-        let mut tx_ids = Vec::new();
-
-        for (_, id, _, _) in transactions.into_iter() {
-            tx_ids.push(id);
-        }
-
-        let transactions: Vec<_> = tdsl::transaction
-            .filter(tdsl::txid.eq_any(tx_ids))
-            .load(conn)?;
-
-        Ok(transactions)
+        tadsl::transaction_addresses
+            .filter(
+                tadsl::incoming
+                    .eq(any(&watched))
+                    .and(tadsl::created_at.gt(from_time)),
+            )
+            .or_filter(
+                tadsl::outgoing
+                    .eq(any(&watched))
+                    .and(tadsl::created_at.gt(from_time)),
+            )
+            .load(conn)
     }
 }
 

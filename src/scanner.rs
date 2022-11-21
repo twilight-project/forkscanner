@@ -74,7 +74,7 @@ pub enum ScannerMessage {
     StaleCandidateUpdate,
     TipUpdateFailed(String),
     TipUpdated(Vec<String>),
-    WatchedAddress(Vec<Transaction>),
+    WatchedAddress(Vec<TransactionAddress>),
 }
 
 /// Command types from api to forkscanner.
@@ -848,24 +848,21 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
                 GetChainTipsResultStatus::Active => {
                     create_block_and_ancestors(client, &self.db_conn, false, &hash, node.id)?;
 
-                    let parent = Block::get(&self.db_conn, &hash)?;
+                    let block = Block::get(&self.db_conn, &hash)?;
 
                     let rows = Chaintip::set_active_tip(
                         &self.db_conn,
                         tip.height as i64,
                         &hash,
                         node.id,
-                        &parent.parent_hash,
+                        &block.parent_hash,
                     )?;
 
                     Block::set_valid(&self.db_conn, &hash, node.id)?;
                     changed |= rows > 0;
-                }
-            }
-
-            if self.address_watcher_mode != WatcherMode::None {
-                if let Ok(block) = Block::get(&self.db_conn, &hash) {
-                    self.fetch_transactions(&block);
+                    if self.address_watcher_mode != WatcherMode::None {
+                        self.fetch_transactions(&block);
+                    }
                 }
             }
         }
@@ -1020,7 +1017,7 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
     }
 
     // get raw transaction hex for each watched address tx
-    fn watched_address_checks(&self) -> Vec<Transaction> {
+    fn watched_address_checks(&self) -> Vec<TransactionAddress> {
         // Clear expired watch entries
         if let Err(e) = Watched::clear(&self.db_conn) {
             error!("Watchlist query error {:?}", e);
@@ -2144,16 +2141,14 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
         for (idx, tx) in block_info.txdata.iter().enumerate() {
             let hex = serialize_hex(tx);
 
-            if self.address_watcher_mode == WatcherMode::Outputs
-                || self.address_watcher_mode == WatcherMode::All
-            {
+            if self.address_watcher_mode != WatcherMode::None {
                 for vin in &tx.input {
                     let txid = &vin.previous_output.txid;
                     if txid.to_hex() == COINBASE_ADDR.to_string() {
                         continue;
                     }
 
-                    let tx = match Transaction::get(&self.db_conn, txid.to_hex()) {
+                    let intx = match Transaction::get(&self.db_conn, txid.to_hex()) {
                         Ok(Some(tx)) => {
                             let tx_bytes: Vec<u8> =
                                 FromHex::from_hex(&tx.hex).expect("Invalid hex format!");
@@ -2176,6 +2171,7 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
 
                                     let hex = serialize_hex(&tx);
 
+                                    let value = tx.output.iter().fold(0, |a, amt| a + amt.value);
                                     if let Err(e) = Transaction::create(
                                         &self.db_conn,
                                         false,
@@ -2183,7 +2179,7 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
                                         0,
                                         &tx.txid().to_hex(),
                                         &hex,
-                                        0.0,
+                                        value as f64,
                                     ) {
                                         error!("Failed to insert transaction! {:?}", e);
                                         return;
@@ -2206,21 +2202,20 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
                         }
                     };
 
-                    if let Some(tx) = tx {
-                        let spk = &tx.output[vin.previous_output.vout as usize].script_pubkey;
-                        let address = spk.script_hash().to_string();
-                        tx_addrs.push((tx.txid().to_hex(), address, "outgoing".into()));
+                    if let Some(intx) = intx {
+                        let spk = &intx.output[vin.previous_output.vout as usize].script_pubkey;
+                        for out in &tx.output {
+                            let opk = &out.script_pubkey;
+                            let to_address = opk.script_hash().to_string();
+                            let from_address = spk.script_hash().to_string();
+                            tx_addrs.push((
+                                intx.txid().to_hex(),
+                                to_address,
+                                from_address,
+                                out.value,
+                            ));
+                        }
                     }
-                }
-            }
-
-            if self.address_watcher_mode == WatcherMode::Inputs
-                || self.address_watcher_mode == WatcherMode::All
-            {
-                for vout in &tx.output {
-                    let spk = &vout.script_pubkey;
-                    let address = spk.script_hash().to_string();
-                    tx_addrs.push((tx.txid().to_hex(), address, "incoming".into()));
                 }
             }
 
@@ -2585,7 +2580,11 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
                     }
                 }
                 Err(e) => {
-                    error!("Client connection error {:?}", e);
+                    error!(
+                        "Client connection error for {}: {:?}",
+                        client.unwrap().node_id,
+                        e
+                    );
                     continue;
                 }
             };

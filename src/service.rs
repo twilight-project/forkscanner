@@ -1,6 +1,6 @@
 use crate::{
     scanner::BtcClient, serde_bigdecimal, Block, Chaintip, ConflictingBlock, Lags, Node, Peer,
-    ScannerCommand, ScannerMessage, StaleCandidate, Transaction, Watched,
+    ScannerCommand, ScannerMessage, StaleCandidate, Transaction, TransactionAddress, Watched,
 };
 use bigdecimal::BigDecimal;
 use bitcoin::consensus::encode::serialize_hex;
@@ -737,14 +737,15 @@ fn handle_watched_addresses(
     Watched::insert(&conn, watches).expect("Could not insert watchlist!");
 
     info!("New address activity");
-    let send_update =
-        move |transactions: Vec<Transaction>, sink: &Sink| -> std::result::Result<(), WsError> {
-            let resp = transactions
-                .into_iter()
-                .map(|tx| serde_json::to_value(tx).expect("Could not serialize transaction"))
-                .collect();
-            Ok(sink.notify(Params::Array(resp))?)
-        };
+    let send_update = move |transactions: Vec<TransactionAddress>,
+                            sink: &Sink|
+          -> std::result::Result<(), WsError> {
+        let resp = transactions
+            .into_iter()
+            .map(|tx| serde_json::to_value(tx).expect("Could not serialize transaction"))
+            .collect();
+        Ok(sink.notify(Params::Array(resp))?)
+    };
 
     thread::spawn(move || loop {
         if exit.load(Ordering::SeqCst) {
