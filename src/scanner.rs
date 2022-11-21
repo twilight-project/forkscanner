@@ -244,11 +244,7 @@ pub trait BtcClient: Sized {
     fn get_tx_out_set_info(&self) -> Result<GetTxOutSetInfoResult, bitcoincore_rpc::Error>;
     fn set_network_active(&self, active: bool)
         -> Result<serde_json::Value, bitcoincore_rpc::Error>;
-    fn submit_block(
-        &self,
-        hex: String,
-        hash: &btc::BlockHash,
-    ) -> Result<serde_json::Value, bitcoincore_rpc::Error>;
+    fn submit_block_hex(&self, hex: String) -> Result<(), bitcoincore_rpc::Error>;
     fn submit_header(&self, header: String) -> Result<serde_json::Value, bitcoincore_rpc::Error>;
     fn invalidate_block(&self, hash: &btc::BlockHash) -> Result<(), bitcoincore_rpc::Error>;
     fn reconsider_block(&self, hash: &btc::BlockHash) -> Result<(), bitcoincore_rpc::Error>;
@@ -351,7 +347,7 @@ impl BtcClient for Client {
     }
 
     fn get_tx_out_set_info(&self) -> Result<GetTxOutSetInfoResult, bitcoincore_rpc::Error> {
-        RpcApi::get_tx_out_set_info(self)
+        RpcApi::get_tx_out_set_info(self, None, None, None)
     }
 
     fn set_network_active(
@@ -361,16 +357,8 @@ impl BtcClient for Client {
         RpcApi::call::<serde_json::Value>(self, "setnetworkactive", &[active.into()])
     }
 
-    fn submit_block(
-        &self,
-        hex: String,
-        hash: &btc::BlockHash,
-    ) -> Result<serde_json::Value, bitcoincore_rpc::Error> {
-        RpcApi::call::<serde_json::Value>(
-            self,
-            "submitblock",
-            &[hex.into(), hash.to_string().into()],
-        )
+    fn submit_block_hex(&self, hex: String) -> Result<(), bitcoincore_rpc::Error> {
+        RpcApi::submit_block_hex(self, &hex)
     }
 
     fn submit_header(&self, header: String) -> Result<serde_json::Value, bitcoincore_rpc::Error> {
@@ -491,7 +479,7 @@ fn create_block_and_ancestors<BC: BtcClient>(
 
             let mut amount = 0;
             for vout in coinbase_info.vout.iter() {
-                amount += vout.value.as_sat();
+                amount += vout.value.to_sat();
             }
 
             let max_inflation =
@@ -755,10 +743,10 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
                 let rates = template
                     .transactions
                     .iter()
-                    .map(|tx| tx.fee.as_sat() as i32 / (tx.weight as i32 / 4))
+                    .map(|tx| tx.fee.to_sat() as i32 / (tx.weight as i32 / 4))
                     .collect();
 
-                let total = BigDecimal::from(template.coinbase_value.as_sat())
+                let total = BigDecimal::from(template.coinbase_value.to_sat())
                     - calc_max_inflation(height).expect("Could not get max_inflation")
                         / SATOSHI_TO_BTC;
 
@@ -1881,7 +1869,7 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
                     }
                 })
                 .fold((0.0, vec![]), |(mut amt, mut by), b| {
-                    amt += b.0.vout.iter().fold(0.0, |a, b| a + b.value.as_btc());
+                    amt += b.0.vout.iter().fold(0.0, |a, b| a + b.value.to_btc());
                     by.push(b.1.txid.to_string());
                     (amt, by)
                 });
@@ -1916,7 +1904,7 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
 
                         let same = !txouts.iter().zip(otherouts).any(|(l, r)| {
                             l.script_pub_key != r.script_pub_key
-                                || (l.value.as_btc() - r.value.as_btc()).abs() > 0.0001
+                                || (l.value.to_btc() - r.value.to_btc()).abs() > 0.0001
                         });
                         if same {
                             Some((tx.clone(), long_map.get(txout).unwrap().clone()))
@@ -1926,7 +1914,7 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
                     }
                 })
                 .fold((0.0, vec![]), |(mut amt, mut by), b| {
-                    amt += b.0.vout.iter().fold(0.0, |a, b| a + b.value.as_btc());
+                    amt += b.0.vout.iter().fold(0.0, |a, b| a + b.value.to_btc());
                     by.push(b.1.txid.to_string());
                     (amt, by)
                 });
@@ -2287,7 +2275,7 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
                 {
                     if code == BLOCK_NOT_FOUND {
                         if let Ok(hex) = node.client().get_block_hex(&hash) {
-                            match mirror.submit_block(hex, &hash) {
+                            match mirror.submit_block_hex(hex) {
                                 Ok(_) => (),
                                 Err(e) => {
                                     error!("Could not submit block {:?}", e);
@@ -2532,7 +2520,7 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
                     let node = self.clients.iter().find(|c| c.node_id == originally_seen);
 
                     if let Some(node) = node {
-                        if let Err(e) = node.client().submit_block(b, &hash) {
+                        if let Err(e) = node.client().submit_block_hex(b) {
                             error!("Could not submit block {:?}", e);
                             continue;
                         }
@@ -2641,7 +2629,7 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
                         .next()
                     {
                         Some(client) => {
-                            if let Err(e) = client.client().submit_block(block_hex, &hash) {
+                            if let Err(e) = client.client().submit_block_hex(block_hex) {
                                 error!("Could not submit block to client! {:?}", e);
                                 continue;
                             }

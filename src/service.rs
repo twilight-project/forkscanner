@@ -362,10 +362,9 @@ fn submit_block(conn: Conn, params: Params) -> Result<Value> {
                 let auth = Auth::UserPass(node.rpc_user.clone(), node.rpc_pass.clone());
 
                 if let Ok(client) = Client::new(&node.rpc_host, auth) {
-                    let hash = upload.block.block_hash();
                     let block_hex = serialize_hex(&upload.block);
 
-                    match client.submit_block(block_hex, &hash) {
+                    match BtcClient::submit_block_hex(&client, block_hex) {
                         Ok(_) => Ok("OK".into()),
                         Err(e) => {
                             let errmsg = format!("Call to submit block failed. {:?}", e);
