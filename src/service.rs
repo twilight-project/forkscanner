@@ -533,6 +533,35 @@ fn get_parent(conn: Conn, params: Params) -> Result<Value> {
     }
 }
 
+fn get_latest_blocks(conn: Conn, params: Params) -> Result<Value> {
+    match params.parse::<Window>() {
+        Ok(Window { window }) => {
+            if let Ok(result) = Block::get_latest(&conn) {
+                let blocks = match result.parents(&conn, window) {
+                    Ok(blocks) => blocks,
+                    Err(_) => return Err(JsonRpcError::internal_error()),
+                };
+
+                let results: Vec<_> = blocks
+                    .into_iter()
+                    .map(|b| BlockResult::from_block(b))
+                    .collect();
+
+                match serde_json::to_value(results) {
+                    Ok(s) => Ok(s),
+                    Err(_) => Err(JsonRpcError::internal_error()),
+                }
+            } else {
+                Err(JsonRpcError::internal_error())
+            }
+        }
+        Err(args) => {
+            let err = JsonRpcError::invalid_params(format!("Invalid parameters, {:?}", args));
+            Err(err)
+        }
+    }
+}
+
 fn get_block(conn: Conn, params: Params) -> Result<Value> {
     match params.parse::<BlockQuery>() {
         Ok(q) => match q {
@@ -1011,6 +1040,12 @@ pub fn run_server(
         io.add_sync_method("get_block", move |params: Params| {
             let conn = p.get().unwrap();
             get_block(conn, params)
+        });
+
+        let p = pool.clone();
+        io.add_sync_method("get_latest_blocks", move |params: Params| {
+            let conn = p.get().unwrap();
+            get_latest_blocks(conn, params)
         });
 
         let p = pool.clone();

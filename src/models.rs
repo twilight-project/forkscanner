@@ -217,8 +217,8 @@ pub struct Height {
 pub struct TransactionAddress {
     pub created_at: DateTime<Utc>,
     pub txid: String,
-    pub incoming: String,
-    pub outgoing: String,
+    pub receiving: String,
+    pub sending: String,
     pub satoshis: i64,
 }
 
@@ -233,8 +233,8 @@ impl TransactionAddress {
             .map(|(id, in_address, out_address, sats)| TransactionAddress {
                 created_at: Utc::now(),
                 txid: id,
-                incoming: in_address,
-                outgoing: out_address,
+                receiving: in_address,
+                sending: out_address,
                 satoshis: sats as i64,
             })
             .collect();
@@ -673,6 +673,25 @@ impl Block {
         transaction
             .filter(is_coinbase.eq(false).and(block_id.eq_any(block_ids)))
             .load(conn)
+    }
+
+    /// Fetch the ancestry of the current block, up to n blocks
+    pub fn parents(&self, conn: &PgConnection, limit: i64) -> QueryResult<Vec<Block>> {
+        let raw_query = format!(
+            "
+            WITH RECURSIVE rec_query AS (
+                SELECT * FROM blocks WHERE hash = '{}'
+                UNION ALL
+                SELECT b.* FROM blocks b INNER JOIN rec_query r ON r.parent_hash = b.hash
+            ) SELECT * FROM rec_query
+			WHERE height >= {}
+			ORDER BY height ASC;
+        ",
+            self.hash,
+            self.height - limit
+        );
+
+        diesel::sql_query(raw_query).load(conn)
     }
 
     /// Fetch the entire list of descendants for the current block.
@@ -1369,12 +1388,12 @@ impl Watched {
 
         tadsl::transaction_addresses
             .filter(
-                tadsl::incoming
+                tadsl::receiving
                     .eq(any(&watched))
                     .and(tadsl::created_at.gt(from_time)),
             )
             .or_filter(
-                tadsl::outgoing
+                tadsl::sending
                     .eq(any(&watched))
                     .and(tadsl::created_at.gt(from_time)),
             )

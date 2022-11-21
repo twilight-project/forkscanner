@@ -47,6 +47,9 @@ This needs to be run on a node with bitcoin running.
 - `remove_node`: { id: int }
   Removes a node from forkscanner's list.
 
+- `get_latest_blocks`: params { window: int } 
+  Get latest block and `window` of its ancestors.
+
 - `get_block`: params { hash: string } OR { height: int } 
   Get a block by hash or height.
 
@@ -179,6 +182,41 @@ Response:
 		"stale_branch_root": "00000000000000000006ead1cff09f279f7beb31a7290c2a603b0776d98dc334",
 	}
   ]
+}
+```
+
+`get_latest_blocks`:
+
+POST
+```json
+    {"jsonrpc": "2.0", "id": 2, "method": "get_latest_blocks", "params": { "window": 3 }}
+```
+
+Response:
+```json
+{
+  "jsonrpc": "2.0",
+  "result": [
+      {
+       "coinbase_message": [ "..." ],
+       "connected": true,
+       "first_seen_by": 14,
+       "hash": "000000000000000000003094bc83d3ce080501c91f7c8475823fd7b596f47ec3",
+       "headers_only": false,
+       "height": 764128,
+       "lowest_template_fee_rate": null,
+       "parent_hash": "00000000000000000005800a68941af35a27384ef27f7b452fa8fb11e3516dfd",
+       "pool_name": "AntPool",
+       "template_txs_fee_diff": null,
+       "total_fee": "0.09501143",
+       "tx_omitted_fee_rates": null,
+       "txids": [ "..." ],
+       "txids_added": null,
+       "txids_omitted": null,
+       "work": "000000000000000000000000000000000000000039e7f3d3e31e2b28c861d509"
+     },
+  ],
+  "id": 1
 }
 ```
 
