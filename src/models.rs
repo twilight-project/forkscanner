@@ -216,6 +216,7 @@ pub struct Height {
 #[table_name = "transaction_addresses"]
 pub struct TransactionAddress {
     pub created_at: DateTime<Utc>,
+    pub block: String,
     pub txid: String,
     pub receiving: String,
     pub sending: String,
@@ -225,6 +226,7 @@ pub struct TransactionAddress {
 impl TransactionAddress {
     pub fn insert(
         conn: &PgConnection,
+        block_hash: String,
         data: Vec<(String, String, String, u64)>,
     ) -> QueryResult<usize> {
         use crate::schema::transaction_addresses::dsl::*;
@@ -232,6 +234,7 @@ impl TransactionAddress {
             .into_iter()
             .map(|(id, in_address, out_address, sats)| TransactionAddress {
                 created_at: Utc::now(),
+                block: block_hash.clone(),
                 txid: id,
                 receiving: in_address,
                 sending: out_address,
@@ -239,13 +242,21 @@ impl TransactionAddress {
             })
             .collect();
 
-        for chunk in tx_addrs.as_slice().chunks(16384) {
+        for chunk in tx_addrs.as_slice().chunks(8192) {
             let _ = diesel::insert_into(transaction_addresses)
                 .values(chunk)
                 .on_conflict_do_nothing()
                 .execute(conn)?;
         }
         Ok(tx_addrs.len())
+    }
+
+    pub fn inputs_processed(conn: &PgConnection, block_hash: String) -> QueryResult<bool> {
+        use crate::schema::transaction_addresses::dsl::*;
+        let result: Vec<TransactionAddress> = transaction_addresses
+            .filter(block.eq(block_hash))
+            .load(conn)?;
+        Ok(result.len() > 0)
     }
 }
 

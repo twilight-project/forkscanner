@@ -26,7 +26,7 @@ use diesel::Connection;
 use hex::FromHex;
 use jsonrpc::error::Error as JsonRpcError;
 use jsonrpc::error::RpcError;
-use log::{debug, error, info, warn};
+use log::{debug, error, info, trace, warn};
 #[cfg(test)]
 use mockall::*;
 use rayon::prelude::*;
@@ -37,7 +37,9 @@ use std::{
     str::FromStr,
 };
 use thiserror::Error;
+use threadpool::ThreadPool;
 
+const N_WORKERS: usize = 1;
 const MAX_ANCESTRY_DEPTH: usize = 100;
 const MAX_BLOCK_DEPTH: i64 = 10;
 const BLOCK_NOT_FOUND: i32 = -5;
@@ -608,6 +610,123 @@ fn find_fork_point(
     }
 }
 
+fn fetch_transactions<BC: BtcClient>(
+    node: &BC,
+    db_conn: &PgConnection,
+    block_hash: &String,
+    fetch_inputs: bool,
+) {
+    let processed = Transaction::block_processed(db_conn, block_hash);
+    let inputs = TransactionAddress::inputs_processed(db_conn, block_hash.clone());
+
+    if !fetch_inputs && (processed.is_err() || processed.unwrap()) {
+        return;
+    } else if fetch_inputs && (inputs.is_err() || inputs.unwrap()) {
+        return;
+    }
+
+    let hash = btc::BlockHash::from_str(block_hash).unwrap();
+    let block_info = match node.get_block(&hash) {
+        Ok(bi) => bi,
+        Err(e) => {
+            error!("RPC call failed {:?}", e);
+            return;
+        }
+    };
+
+    let mut tx_addrs = Vec::new();
+    info!("Fetching transactions for {}", block_hash);
+    for (idx, tx) in block_info.txdata.iter().enumerate() {
+        trace!("Fetching {} of {} txs", idx, block_info.txdata.len());
+        let hex = serialize_hex(tx);
+
+        if fetch_inputs {
+            for vin in &tx.input {
+                let txid = &vin.previous_output.txid;
+                if txid.to_hex() == COINBASE_ADDR.to_string() {
+                    continue;
+                }
+
+                let intx = match Transaction::get(db_conn, txid.to_hex()) {
+                    Ok(Some(tx)) => {
+                        let tx_bytes: Vec<u8> =
+                            FromHex::from_hex(&tx.hex).expect("Invalid hex format!");
+                        Some(deserialize(&tx_bytes).unwrap())
+                    }
+                    Ok(None) => match node.get_raw_transaction_info(txid, None) {
+                        Ok(tx) => {
+                            let tx = match tx.transaction() {
+                                Ok(tx) => tx,
+                                Err(e) => {
+                                    error!("Invalid tx format! {:?}", e);
+                                    return;
+                                }
+                            };
+
+                            let hex = serialize_hex(&tx);
+
+                            let value = tx.output.iter().fold(0, |a, amt| a + amt.value);
+                            if let Err(e) = Transaction::create(
+                                db_conn,
+                                false,
+                                block_hash.to_string(),
+                                0,
+                                &tx.txid().to_hex(),
+                                &hex,
+                                value as f64,
+                            ) {
+                                error!("Failed to insert transaction! {:?}", e);
+                                return;
+                            }
+
+                            Some(tx)
+                        }
+                        Err(e) => {
+                            error!(
+                                "Could not fetch transaction info! tx: {:?} e: {:?}",
+                                txid, e
+                            );
+                            None
+                        }
+                    },
+                    Err(e) => {
+                        error!("Transaction query failed! {:?}", e);
+                        return;
+                    }
+                };
+
+                if let Some(intx) = intx {
+                    let spk = &intx.output[vin.previous_output.vout as usize].script_pubkey;
+                    for out in &tx.output {
+                        let opk = &out.script_pubkey;
+                        let to_address = opk.script_hash().to_string();
+                        let from_address = spk.script_hash().to_string();
+                        tx_addrs.push((intx.txid().to_hex(), to_address, from_address, out.value));
+                    }
+                }
+            }
+        }
+
+        let value = tx.output.iter().fold(0, |a, amt| a + amt.value);
+        if let Err(e) = Transaction::create(
+            db_conn,
+            false,
+            block_hash.clone(),
+            idx,
+            &tx.txid().to_hex(),
+            &hex,
+            value as f64,
+        ) {
+            error!("Could not insert transaction {:?}", e);
+        }
+    }
+    trace!("inserting {} txs", tx_addrs.len());
+
+    if let Err(e) = TransactionAddress::insert(db_conn, block_hash.clone(), tx_addrs) {
+        error!("Database update failed: {:?}", e);
+    }
+}
+
 /// Holds connection info for a bitcoin node that forkscanner is
 /// connected to.
 pub struct ScannerClient<BC: BtcClient> {
@@ -655,22 +774,29 @@ pub struct ForkScanner<BC: BtcClient + std::fmt::Debug> {
     notify_tx: Sender<ScannerMessage>,
     command: Receiver<ScannerCommand>,
     address_watcher_mode: WatcherMode,
+    _pool: ThreadPool,
+    work_tx: Sender<String>,
 }
 
 impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
     pub fn new(
-        db_conn: PgConnection,
+        db_url: String,
         mode: WatcherMode,
     ) -> ForkScannerResult<(
         ForkScanner<BC>,
         Receiver<ScannerMessage>,
         Sender<ScannerCommand>,
     )> {
+        let db_conn = PgConnection::establish(&db_url).expect("Connection failed");
+
         let node_list = Node::list(&db_conn)?;
 
         let mut clients = Vec::new();
         let mut archive_node = None;
         let mut found_archive = false;
+        let mut archive_host = None;
+        let mut archive_auth = None;
+        let mut archive_id = None;
 
         for node in &node_list {
             let host = format!("http://{}:{}", node.rpc_host, node.rpc_port);
@@ -691,10 +817,16 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
             if archive_node.is_none() {
                 let client = ScannerClient::new(node.id, host.clone(), None, auth.clone())?;
                 archive_node = Some(client);
+                archive_host = Some(host.clone());
+                archive_auth = Some(auth.clone());
+                archive_id = Some(node.id);
             } else if node.archive {
                 let client = ScannerClient::new(node.id, host.clone(), None, auth.clone())?;
                 archive_node = Some(client);
                 found_archive = true;
+                archive_host = Some(host.clone());
+                archive_auth = Some(auth.clone());
+                archive_id = Some(node.id);
             }
 
             let client = ScannerClient::new(node.id, host, mirror_host, auth)?;
@@ -708,6 +840,30 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
             warn!("No archive node was found, using first node as fallback!");
         }
 
+        let pool = ThreadPool::new(N_WORKERS);
+        let (work_tx, work_rx) = unbounded();
+
+        for _ in 0..N_WORKERS {
+            let rx = work_rx.clone();
+            let url = db_url.clone();
+            let id = archive_id.clone();
+            let host = archive_host.clone();
+            let auth = archive_auth.clone();
+
+            pool.execute(move || {
+                let node =
+                    ScannerClient::<BC>::new(id.unwrap(), host.unwrap(), None, auth.unwrap())
+                        .expect("Could not start archive node client!");
+
+                let db_conn = PgConnection::establish(&url).expect("Connection failed");
+
+                while let Ok(msg) = rx.recv() {
+                    info!("Running fetch transactions for: {}", msg);
+                    fetch_transactions(node.client(), &db_conn, &msg, true);
+                }
+            });
+        }
+
         Ok((
             ForkScanner {
                 archive_node: archive_node.unwrap(),
@@ -717,6 +873,8 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
                 notify_tx,
                 command: cmd_rx,
                 address_watcher_mode: mode,
+                _pool: pool,
+                work_tx,
             },
             notify_rx,
             cmd_tx,
@@ -849,7 +1007,9 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
                     Block::set_valid(&self.db_conn, &hash, node.id)?;
                     changed |= rows > 0;
                     if self.address_watcher_mode != WatcherMode::None {
-                        self.fetch_transactions(&block);
+                        if let Err(_) = self.work_tx.send(block.hash.clone()) {
+                            error!("Fetch tx channel closed!");
+                        }
                     }
                 }
             }
@@ -1668,6 +1828,7 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
             }
         };
 
+        let node = self.archive_node.client();
         for mut candidate in candidates {
             let blocks = match Block::get_at_height(&self.db_conn, candidate.height) {
                 Ok(b) => b,
@@ -1678,7 +1839,7 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
             };
 
             for block in blocks {
-                self.fetch_transactions(&block);
+                fetch_transactions(node, &self.db_conn, &block.hash, false);
                 let descendants = match block.descendants(&self.db_conn, Some(DOUBLE_SPEND_RANGE)) {
                     Ok(d) => d,
                     Err(e) => {
@@ -1688,7 +1849,7 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
                 };
 
                 for desc in descendants {
-                    self.fetch_transactions(&desc);
+                    fetch_transactions(node, &self.db_conn, &desc.hash, false);
                 }
             }
 
@@ -2102,127 +2263,6 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
                 error!("Database error {:?}", e);
                 continue;
             }
-        }
-    }
-
-    // get transactions for a block and save info to database.
-    fn fetch_transactions(&self, block: &Block) {
-        let processed = Transaction::block_processed(&self.db_conn, &block.hash);
-
-        if processed.is_err() || processed.unwrap() {
-            return;
-        }
-
-        let node = self.clients.iter().next().unwrap().clone();
-
-        let hash = btc::BlockHash::from_str(&block.hash).unwrap();
-        let block_info = match node.client().get_block(&hash) {
-            Ok(bi) => bi,
-            Err(e) => {
-                error!("RPC call failed {:?}", e);
-                return;
-            }
-        };
-
-        let mut tx_addrs = Vec::new();
-        info!("Fetching transactions for {}", block.hash);
-        for (idx, tx) in block_info.txdata.iter().enumerate() {
-            let hex = serialize_hex(tx);
-
-            if self.address_watcher_mode != WatcherMode::None {
-                for vin in &tx.input {
-                    let txid = &vin.previous_output.txid;
-                    if txid.to_hex() == COINBASE_ADDR.to_string() {
-                        continue;
-                    }
-
-                    let intx = match Transaction::get(&self.db_conn, txid.to_hex()) {
-                        Ok(Some(tx)) => {
-                            let tx_bytes: Vec<u8> =
-                                FromHex::from_hex(&tx.hex).expect("Invalid hex format!");
-                            Some(deserialize(&tx_bytes).unwrap())
-                        }
-                        Ok(None) => {
-                            match self
-                                .archive_node
-                                .client()
-                                .get_raw_transaction_info(txid, None)
-                            {
-                                Ok(tx) => {
-                                    let tx = match tx.transaction() {
-                                        Ok(tx) => tx,
-                                        Err(e) => {
-                                            error!("Invalid tx format! {:?}", e);
-                                            return;
-                                        }
-                                    };
-
-                                    let hex = serialize_hex(&tx);
-
-                                    let value = tx.output.iter().fold(0, |a, amt| a + amt.value);
-                                    if let Err(e) = Transaction::create(
-                                        &self.db_conn,
-                                        false,
-                                        block.hash.to_string(),
-                                        0,
-                                        &tx.txid().to_hex(),
-                                        &hex,
-                                        value as f64,
-                                    ) {
-                                        error!("Failed to insert transaction! {:?}", e);
-                                        return;
-                                    }
-
-                                    Some(tx)
-                                }
-                                Err(e) => {
-                                    error!(
-                                        "Could not fetch transaction info! tx: {:?} e: {:?}",
-                                        txid, e
-                                    );
-                                    None
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            error!("Transaction query failed! {:?}", e);
-                            return;
-                        }
-                    };
-
-                    if let Some(intx) = intx {
-                        let spk = &intx.output[vin.previous_output.vout as usize].script_pubkey;
-                        for out in &tx.output {
-                            let opk = &out.script_pubkey;
-                            let to_address = opk.script_hash().to_string();
-                            let from_address = spk.script_hash().to_string();
-                            tx_addrs.push((
-                                intx.txid().to_hex(),
-                                to_address,
-                                from_address,
-                                out.value,
-                            ));
-                        }
-                    }
-                }
-            }
-
-            let value = tx.output.iter().fold(0, |a, amt| a + amt.value);
-            if let Err(e) = Transaction::create(
-                &self.db_conn,
-                false,
-                block.hash.to_string(),
-                idx,
-                &tx.txid().to_hex(),
-                &hex,
-                value as f64,
-            ) {
-                error!("Could not insert transaction {:?}", e);
-            }
-        }
-
-        if let Err(e) = TransactionAddress::insert(&self.db_conn, tx_addrs) {
-            error!("Database update failed: {:?}", e);
         }
     }
 

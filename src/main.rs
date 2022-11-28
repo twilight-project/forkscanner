@@ -1,6 +1,4 @@
 use bitcoincore_rpc::Client;
-use diesel::prelude::PgConnection;
-use diesel::Connection;
 use forkscanner::run_server;
 use forkscanner::{ForkScanner, WatcherMode};
 use log::info;
@@ -36,11 +34,11 @@ fn main() {
         .init();
 
     let db_url = std::env::var("DATABASE_URL").expect("No DB url");
-    let db_conn = PgConnection::establish(&db_url).expect("Connection failed");
     let opt = Opt::from_args();
 
-    let (scanner, receiver, command) = ForkScanner::<Client>::new(db_conn, opt.watch_addresses)
-        .expect("Launching forkscanner failed");
+    let (scanner, receiver, command) =
+        ForkScanner::<Client>::new(db_url.clone(), opt.watch_addresses)
+            .expect("Launching forkscanner failed");
     let duration = std::time::Duration::from_millis(10_000);
 
     let _handle = std::thread::spawn(move || loop {
