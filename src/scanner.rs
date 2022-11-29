@@ -615,6 +615,7 @@ fn fetch_transactions<BC: BtcClient>(
     db_conn: &PgConnection,
     block_hash: &String,
     fetch_inputs: bool,
+    mode: WatcherMode,
 ) {
     let processed = Transaction::block_processed(db_conn, block_hash);
     let inputs = TransactionAddress::inputs_processed(db_conn, block_hash.clone());
@@ -641,68 +642,82 @@ fn fetch_transactions<BC: BtcClient>(
         let hex = serialize_hex(tx);
 
         if fetch_inputs {
-            for vin in &tx.input {
-                let txid = &vin.previous_output.txid;
-                if txid.to_hex() == COINBASE_ADDR.to_string() {
-                    continue;
-                }
-
-                let intx = match Transaction::get(db_conn, txid.to_hex()) {
-                    Ok(Some(tx)) => {
-                        let tx_bytes: Vec<u8> =
-                            FromHex::from_hex(&tx.hex).expect("Invalid hex format!");
-                        Some(deserialize(&tx_bytes).unwrap())
+            if WatcherMode::Inputs == mode || WatcherMode::All == mode {
+                for vin in &tx.input {
+                    let txid = &vin.previous_output.txid;
+                    if txid.to_hex() == COINBASE_ADDR.to_string() {
+                        continue;
                     }
-                    Ok(None) => match node.get_raw_transaction_info(txid, None) {
-                        Ok(tx) => {
-                            let tx = match tx.transaction() {
-                                Ok(tx) => tx,
-                                Err(e) => {
-                                    error!("Invalid tx format! {:?}", e);
+
+                    let intx = match Transaction::get(db_conn, txid.to_hex()) {
+                        Ok(Some(tx)) => {
+                            let tx_bytes: Vec<u8> =
+                                FromHex::from_hex(&tx.hex).expect("Invalid hex format!");
+                            Some(deserialize(&tx_bytes).unwrap())
+                        }
+                        Ok(None) => match node.get_raw_transaction_info(txid, None) {
+                            Ok(tx) => {
+                                let tx = match tx.transaction() {
+                                    Ok(tx) => tx,
+                                    Err(e) => {
+                                        error!("Invalid tx format! {:?}", e);
+                                        return;
+                                    }
+                                };
+
+                                let hex = serialize_hex(&tx);
+
+                                let value = tx.output.iter().fold(0, |a, amt| a + amt.value);
+                                if let Err(e) = Transaction::create(
+                                    db_conn,
+                                    false,
+                                    block_hash.to_string(),
+                                    0,
+                                    &tx.txid().to_hex(),
+                                    &hex,
+                                    value as f64,
+                                ) {
+                                    error!("Failed to insert transaction! {:?}", e);
                                     return;
                                 }
-                            };
 
-                            let hex = serialize_hex(&tx);
-
-                            let value = tx.output.iter().fold(0, |a, amt| a + amt.value);
-                            if let Err(e) = Transaction::create(
-                                db_conn,
-                                false,
-                                block_hash.to_string(),
-                                0,
-                                &tx.txid().to_hex(),
-                                &hex,
-                                value as f64,
-                            ) {
-                                error!("Failed to insert transaction! {:?}", e);
-                                return;
+                                Some(tx)
                             }
-
-                            Some(tx)
-                        }
+                            Err(e) => {
+                                error!(
+                                    "Could not fetch transaction info! tx: {:?} e: {:?}",
+                                    txid, e
+                                );
+                                None
+                            }
+                        },
                         Err(e) => {
-                            error!(
-                                "Could not fetch transaction info! tx: {:?} e: {:?}",
-                                txid, e
-                            );
-                            None
+                            error!("Transaction query failed! {:?}", e);
+                            return;
                         }
-                    },
-                    Err(e) => {
-                        error!("Transaction query failed! {:?}", e);
-                        return;
-                    }
-                };
+                    };
 
-                if let Some(intx) = intx {
-                    let spk = &intx.output[vin.previous_output.vout as usize].script_pubkey;
-                    for out in &tx.output {
-                        let opk = &out.script_pubkey;
-                        let to_address = opk.script_hash().to_string();
-                        let from_address = spk.script_hash().to_string();
-                        tx_addrs.push((intx.txid().to_hex(), to_address, from_address, out.value));
+                    if let Some(intx) = intx {
+                        let spk = &intx.output[vin.previous_output.vout as usize].script_pubkey;
+                        for out in &tx.output {
+                            let opk = &out.script_pubkey;
+                            let to_address = opk.script_hash().to_string();
+                            let from_address = spk.script_hash().to_string();
+                            tx_addrs.push((
+                                tx.txid().to_hex(),
+                                to_address,
+                                from_address,
+                                out.value,
+                            ));
+                        }
                     }
+                }
+            } else if mode == WatcherMode::All || mode == WatcherMode::Outputs {
+                for out in &tx.output {
+                    let opk = &out.script_pubkey;
+                    let to_address = opk.script_hash().to_string();
+                    let from_address = "".into();
+                    tx_addrs.push((tx.txid().to_hex(), to_address, from_address, out.value));
                 }
             }
         }
@@ -859,7 +874,7 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
 
                 while let Ok(msg) = rx.recv() {
                     info!("Running fetch transactions for: {}", msg);
-                    fetch_transactions(node.client(), &db_conn, &msg, true);
+                    fetch_transactions(node.client(), &db_conn, &msg, true, mode);
                 }
             });
         }
@@ -1839,7 +1854,13 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
             };
 
             for block in blocks {
-                fetch_transactions(node, &self.db_conn, &block.hash, false);
+                fetch_transactions(
+                    node,
+                    &self.db_conn,
+                    &block.hash,
+                    false,
+                    self.address_watcher_mode,
+                );
                 let descendants = match block.descendants(&self.db_conn, Some(DOUBLE_SPEND_RANGE)) {
                     Ok(d) => d,
                     Err(e) => {
@@ -1849,7 +1870,13 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
                 };
 
                 for desc in descendants {
-                    fetch_transactions(node, &self.db_conn, &desc.hash, false);
+                    fetch_transactions(
+                        node,
+                        &self.db_conn,
+                        &desc.hash,
+                        false,
+                        self.address_watcher_mode,
+                    );
                 }
             }
 

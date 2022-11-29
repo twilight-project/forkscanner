@@ -37,7 +37,7 @@ type ManagedPool = r2d2::Pool<ConnectionManager<PgConnection>>;
 
 pub type ModeError = &'static str;
 
-#[derive(Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub enum WatcherMode {
     None,
     Inputs,
