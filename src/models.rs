@@ -216,6 +216,7 @@ pub struct Height {
 #[table_name = "transaction_addresses"]
 pub struct TransactionAddress {
     pub created_at: DateTime<Utc>,
+    pub notified_at: Option<DateTime<Utc>>,
     pub block: String,
     pub txid: String,
     pub receiving: String,
@@ -224,6 +225,15 @@ pub struct TransactionAddress {
 }
 
 impl TransactionAddress {
+    pub fn clear(conn: &PgConnection) -> QueryResult<usize> {
+        use crate::schema::transaction_addresses::dsl::*;
+        let from_time = Utc::now() - chrono::Duration::minutes(WATCH_WINDOW);
+
+        diesel::delete(transaction_addresses)
+            .filter(created_at.lt(from_time))
+            .execute(conn)
+    }
+
     pub fn insert(
         conn: &PgConnection,
         block_hash: String,
@@ -234,6 +244,7 @@ impl TransactionAddress {
             .into_iter()
             .map(|(id, in_address, out_address, sats)| TransactionAddress {
                 created_at: Utc::now(),
+                notified_at: None,
                 block: block_hash.clone(),
                 txid: id,
                 receiving: in_address,
@@ -1397,18 +1408,30 @@ impl Watched {
 
         let from_time = Utc::now() - chrono::Duration::minutes(WATCH_WINDOW);
 
-        tadsl::transaction_addresses
+        let addrs = tadsl::transaction_addresses
             .filter(
                 tadsl::receiving
                     .eq(any(&watched))
+                    .and(tadsl::notified_at.is_not_null())
                     .and(tadsl::created_at.gt(from_time)),
             )
             .or_filter(
                 tadsl::sending
                     .eq(any(&watched))
+                    .and(tadsl::notified_at.is_not_null())
                     .and(tadsl::created_at.gt(from_time)),
             )
-            .load(conn)
+            .load(conn)?;
+
+        diesel::update(
+            tadsl::transaction_addresses
+                .filter(tadsl::receiving.eq(any(&watched)))
+                .or_filter(tadsl::sending.eq(any(&watched))),
+        )
+        .set(tadsl::notified_at.eq(Utc::now()))
+        .execute(conn)?;
+
+        Ok(addrs)
     }
 }
 

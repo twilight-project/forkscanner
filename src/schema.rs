@@ -189,6 +189,7 @@ diesel::table! {
 diesel::table! {
     transaction_addresses (block, txid, receiving, sending) {
         created_at -> Timestamptz,
+        notified_at -> Nullable<Timestamptz>,
         block -> Varchar,
         txid -> Varchar,
         receiving -> Varchar,

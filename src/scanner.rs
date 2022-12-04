@@ -4,11 +4,7 @@ use crate::{
     TransactionAddress, TxOutset, Watched, WatcherMode,
 };
 use bigdecimal::{BigDecimal, FromPrimitive};
-use bitcoin::{
-    consensus::encode::{deserialize, serialize_hex},
-    util::amount::Amount,
-};
-use bitcoin_hashes::hex::ToHex;
+use bitcoin::{consensus::encode::serialize_hex, util::amount::Amount};
 use bitcoin_hashes::{sha256d, Hash};
 use bitcoincore_rpc::bitcoin as btc;
 use bitcoincore_rpc::bitcoincore_rpc_json::{
@@ -23,7 +19,6 @@ use chrono::prelude::*;
 use crossbeam::channel::{unbounded, Receiver, Sender, TryRecvError};
 use diesel::prelude::PgConnection;
 use diesel::Connection;
-use hex::FromHex;
 use jsonrpc::error::Error as JsonRpcError;
 use jsonrpc::error::RpcError;
 use log::{debug, error, info, trace, warn};
@@ -112,7 +107,7 @@ pub struct FullBlock {
 #[allow(unused)]
 pub struct JsonTransaction {
     hash: String,
-    hex: String,
+    hex: Option<String>,
     locktime: usize,
     size: usize,
     txid: String,
@@ -134,7 +129,7 @@ pub struct Vin {
     txinwitness: Option<Vec<String>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[allow(unused)]
 pub struct Vout {
@@ -150,7 +145,7 @@ pub struct ScriptSig {
     hex: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[allow(unused)]
 pub struct ScriptPubKey {
@@ -158,7 +153,7 @@ pub struct ScriptPubKey {
     hex: String,
     req_sigs: Option<usize>,
     r#type: String,
-    addresses: Option<Vec<String>>,
+    address: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -238,6 +233,7 @@ pub trait BtcClient: Sized {
     fn get_block(&self, hash: &btc::BlockHash) -> Result<btc::Block, bitcoincore_rpc::Error>;
     fn get_block_hex(&self, hash: &btc::BlockHash) -> Result<String, bitcoincore_rpc::Error>;
     fn get_peer_info(&self) -> Result<Vec<PeerInfo>, bitcoincore_rpc::Error>;
+    fn get_transaction(&self, txid: &btc::Txid) -> Result<JsonTransaction, bitcoincore_rpc::Error>;
     fn get_raw_transaction_info<'a>(
         &self,
         txid: &btc::Txid,
@@ -338,6 +334,17 @@ impl BtcClient for Client {
 
     fn get_peer_info(&self) -> Result<Vec<PeerInfo>, bitcoincore_rpc::Error> {
         RpcApi::call(self, "getpeerinfo", &[])
+    }
+
+    fn get_transaction(&self, txid: &btc::Txid) -> Result<JsonTransaction, bitcoincore_rpc::Error> {
+        RpcApi::call::<JsonTransaction>(
+            self,
+            "getrawtransaction",
+            &[
+                serde_json::Value::String(txid.to_string()),
+                serde_json::Value::Bool(true),
+            ],
+        )
     }
 
     fn get_raw_transaction_info(
@@ -626,8 +633,7 @@ fn fetch_transactions<BC: BtcClient>(
         return;
     }
 
-    let hash = btc::BlockHash::from_str(block_hash).unwrap();
-    let block_info = match node.get_block(&hash) {
+    let block_info = match node.get_block_verbose(block_hash.to_string()) {
         Ok(bi) => bi,
         Err(e) => {
             error!("RPC call failed {:?}", e);
@@ -636,101 +642,101 @@ fn fetch_transactions<BC: BtcClient>(
     };
 
     let mut tx_addrs = Vec::new();
+    let num_txs = block_info.tx.len();
+
     info!("Fetching transactions for {}", block_hash);
-    for (idx, tx) in block_info.txdata.iter().enumerate() {
-        trace!("Fetching {} of {} txs", idx, block_info.txdata.len());
-        let hex = serialize_hex(tx);
+    for (idx, tx) in block_info.tx.into_iter().enumerate() {
+        trace!("Fetching {} of {} txs", idx, num_txs);
+
+        let JsonTransaction {
+            hex,
+            txid,
+            vin,
+            vout,
+            ..
+        } = tx;
+
+        let value = vout.iter().fold(0.0, |a, amt| a + amt.value);
 
         if fetch_inputs {
             if WatcherMode::Inputs == mode || WatcherMode::All == mode {
-                for vin in &tx.input {
-                    let txid = &vin.previous_output.txid;
-                    if txid.to_hex() == COINBASE_ADDR.to_string() {
+                for txin in vin {
+                    let Vin {
+                        txid,
+                        vout: vout_idx,
+                        ..
+                    } = txin;
+
+                    let txid = txid.unwrap_or(COINBASE_ADDR.to_string());
+                    if txid == COINBASE_ADDR.to_string() {
+                        continue;
+                    }
+                    if vout_idx.is_none() {
+                        error!("No vout index for transaction input!");
                         continue;
                     }
 
-                    let intx = match Transaction::get(db_conn, txid.to_hex()) {
-                        Ok(Some(tx)) => {
-                            let tx_bytes: Vec<u8> =
-                                FromHex::from_hex(&tx.hex).expect("Invalid hex format!");
-                            Some(deserialize(&tx_bytes).unwrap())
-                        }
-                        Ok(None) => match node.get_raw_transaction_info(txid, None) {
-                            Ok(tx) => {
-                                let tx = match tx.transaction() {
-                                    Ok(tx) => tx,
-                                    Err(e) => {
-                                        error!("Invalid tx format! {:?}", e);
-                                        return;
-                                    }
-                                };
-
-                                let hex = serialize_hex(&tx);
-
-                                let value = tx.output.iter().fold(0, |a, amt| a + amt.value);
-                                if let Err(e) = Transaction::create(
-                                    db_conn,
-                                    false,
-                                    block_hash.to_string(),
-                                    0,
-                                    &tx.txid().to_hex(),
-                                    &hex,
-                                    value as f64,
-                                ) {
-                                    error!("Failed to insert transaction! {:?}", e);
-                                    return;
-                                }
-
-                                Some(tx)
-                            }
-                            Err(e) => {
-                                error!(
-                                    "Could not fetch transaction info! tx: {:?} e: {:?}",
-                                    txid, e
-                                );
-                                None
-                            }
-                        },
+                    let txidarg = btc::Txid::from_str(&txid).unwrap();
+                    let intx = match node.get_transaction(&txidarg) {
+                        Ok(tx) => tx,
                         Err(e) => {
-                            error!("Transaction query failed! {:?}", e);
-                            return;
+                            error!("Could not fetch raw transaction info! {:?}", e);
+                            continue;
                         }
                     };
 
-                    if let Some(intx) = intx {
-                        let spk = &intx.output[vin.previous_output.vout as usize].script_pubkey;
-                        for out in &tx.output {
-                            let opk = &out.script_pubkey;
-                            let to_address = opk.script_hash().to_string();
-                            let from_address = spk.script_hash().to_string();
-                            tx_addrs.push((
-                                tx.txid().to_hex(),
-                                to_address,
-                                from_address,
-                                out.value,
-                            ));
-                        }
+                    let txout = &intx.vout[vout_idx.unwrap()];
+                    let hex_encoded = hex::encode(&txout.script_pub_key.hex);
+                    let from_address = txout
+                        .script_pub_key
+                        .address
+                        .clone()
+                        .unwrap_or(hex_encoded.clone());
+
+                    for out in vout.clone() {
+                        let Vout {
+                            script_pub_key: ScriptPubKey { address, hex, .. },
+                            value,
+                            ..
+                        } = out;
+
+                        let to_address = address.unwrap_or(hex);
+                        tx_addrs.push((
+                            txid.clone(),
+                            to_address,
+                            from_address.clone(),
+                            Amount::from_btc(value).unwrap().to_sat(),
+                        ));
                     }
                 }
-            } else if mode == WatcherMode::All || mode == WatcherMode::Outputs {
-                for out in &tx.output {
-                    let opk = &out.script_pubkey;
-                    let to_address = opk.script_hash().to_string();
+            } else if mode == WatcherMode::Outputs {
+                for out in vout {
+                    let Vout {
+                        script_pub_key: ScriptPubKey { address, hex, .. },
+                        value,
+                        ..
+                    } = out;
+
+                    let to_address = address.unwrap_or(hex);
                     let from_address = "".into();
-                    tx_addrs.push((tx.txid().to_hex(), to_address, from_address, out.value));
+                    tx_addrs.push((
+                        txid.clone(),
+                        to_address,
+                        from_address,
+                        Amount::from_btc(value).unwrap().to_sat(),
+                    ));
                 }
             }
         }
 
-        let value = tx.output.iter().fold(0, |a, amt| a + amt.value);
         if let Err(e) = Transaction::create(
             db_conn,
             false,
             block_hash.clone(),
             idx,
-            &tx.txid().to_hex(),
-            &hex,
-            value as f64,
+            &txid,
+            &hex.unwrap(),
+            value,
         ) {
             error!("Could not insert transaction {:?}", e);
         }
@@ -1181,6 +1187,8 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
 
     // get raw transaction hex for each watched address tx
     fn watched_address_checks(&self) -> Vec<TransactionAddress> {
+        let _ = TransactionAddress::clear(&self.db_conn);
+
         // Clear expired watch entries
         if let Err(e) = Watched::clear(&self.db_conn) {
             error!("Watchlist query error {:?}", e);
