@@ -231,7 +231,7 @@ impl TransactionAddress {
         let from_time = Utc::now() - chrono::Duration::minutes(TWO_HOURS);
 
         diesel::delete(transaction_addresses)
-            .filter(created_at.lt(from_time).and(notified_at.is_not_null()))
+            .filter(created_at.lt(from_time).and(notified_at.is_null()))
             .execute(conn)
     }
 
