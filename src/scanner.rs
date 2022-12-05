@@ -25,7 +25,7 @@ use log::{debug, error, info, trace, warn};
 #[cfg(test)]
 use mockall::*;
 use rayon::prelude::*;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     iter::{once, FromIterator},
@@ -49,6 +49,33 @@ const COINBASE_ADDR: &str = "000000000000000000000000000000000000000000000000000
 
 type ForkScannerResult<T> = Result<T, ForkScannerError>;
 
+#[derive(Clone, Serialize)]
+pub struct WatchedTx {
+    pub created_at: DateTime<Utc>,
+    pub notified_at: Option<DateTime<Utc>>,
+    pub block: String,
+    pub source_tx: Vec<(String, String)>,
+    pub txid: String,
+    pub receiving: String,
+    pub sending: String,
+    pub satoshis: i64,
+}
+
+impl WatchedTx {
+    pub fn from_tx(tx: &TransactionAddress) -> WatchedTx {
+        WatchedTx {
+            created_at: tx.created_at.clone(),
+            notified_at: tx.notified_at.clone(),
+            block: tx.block.clone(),
+            source_tx: Vec::new(),
+            txid: tx.txid.clone(),
+            receiving: tx.receiving.clone(),
+            sending: tx.sending.clone(),
+            satoshis: tx.satoshis.clone(),
+        }
+    }
+}
+
 /// Types for the pool info fetched from MINER_POOL_INFO.
 #[derive(Debug, Deserialize)]
 pub struct MinerPool {
@@ -71,7 +98,7 @@ pub enum ScannerMessage {
     StaleCandidateUpdate,
     TipUpdateFailed(String),
     TipUpdated(Vec<String>),
-    WatchedAddress(Vec<TransactionAddress>),
+    WatchedAddress(Vec<WatchedTx>),
 }
 
 /// Command types from api to forkscanner.
@@ -103,7 +130,7 @@ pub struct FullBlock {
     weight: serde_json::Value,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[allow(unused)]
 pub struct JsonTransaction {
     hash: String,
@@ -118,7 +145,7 @@ pub struct JsonTransaction {
     weight: usize,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[allow(unused)]
 pub struct Vin {
@@ -138,7 +165,7 @@ pub struct Vout {
     script_pub_key: ScriptPubKey,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[allow(unused)]
 pub struct ScriptSig {
     asm: String,
@@ -233,7 +260,7 @@ pub trait BtcClient: Sized {
     fn get_block(&self, hash: &btc::BlockHash) -> Result<btc::Block, bitcoincore_rpc::Error>;
     fn get_block_hex(&self, hash: &btc::BlockHash) -> Result<String, bitcoincore_rpc::Error>;
     fn get_peer_info(&self) -> Result<Vec<PeerInfo>, bitcoincore_rpc::Error>;
-    fn get_transaction(&self, txid: &btc::Txid) -> Result<JsonTransaction, bitcoincore_rpc::Error>;
+    fn get_transaction(&self, txid: &String) -> Result<JsonTransaction, bitcoincore_rpc::Error>;
     fn get_raw_transaction_info<'a>(
         &self,
         txid: &btc::Txid,
@@ -336,12 +363,12 @@ impl BtcClient for Client {
         RpcApi::call(self, "getpeerinfo", &[])
     }
 
-    fn get_transaction(&self, txid: &btc::Txid) -> Result<JsonTransaction, bitcoincore_rpc::Error> {
+    fn get_transaction(&self, txid: &String) -> Result<JsonTransaction, bitcoincore_rpc::Error> {
         RpcApi::call::<JsonTransaction>(
             self,
             "getrawtransaction",
             &[
-                serde_json::Value::String(txid.to_string()),
+                serde_json::Value::String(txid.clone()),
                 serde_json::Value::Bool(true),
             ],
         )
@@ -676,8 +703,7 @@ fn fetch_transactions<BC: BtcClient>(
                         continue;
                     }
 
-                    let txidarg = btc::Txid::from_str(&txid).unwrap();
-                    let intx = match node.get_transaction(&txidarg) {
+                    let intx = match node.get_transaction(&txid) {
                         Ok(tx) => tx,
                         Err(e) => {
                             error!("Could not fetch raw transaction info! {:?}", e);
@@ -1186,7 +1212,7 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
     }
 
     // get raw transaction hex for each watched address tx
-    fn watched_address_checks(&self) -> Vec<TransactionAddress> {
+    fn watched_address_checks(&self) -> Vec<WatchedTx> {
         let _ = TransactionAddress::clear(&self.db_conn);
 
         // Clear expired watch entries
@@ -1196,7 +1222,57 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
         }
 
         match Watched::fetch(&self.db_conn) {
-            Ok(transactions) => transactions,
+            Ok(transactions) => {
+                let mut cache = HashMap::new();
+                let mut watched_txs = Vec::with_capacity(transactions.len());
+
+                for tx in transactions {
+                    let mut watched_tx = WatchedTx::from_tx(&tx);
+
+                    let tx = if cache.contains_key(&tx.txid) {
+                        cache.get(&tx.txid).unwrap()
+                    } else {
+                        let tx = match self.archive_node.client().get_transaction(&tx.txid) {
+                            Ok(tx) => tx,
+                            Err(e) => {
+                                error!("Connection to archive node failed {:?}", e);
+                                continue;
+                            }
+                        };
+                        cache.insert(tx.txid.clone(), tx.clone());
+                        cache.get(&tx.txid).unwrap()
+                    }
+                    .clone();
+
+                    for vin in &tx.vin {
+                        if vin.txid.is_none() {
+                            continue;
+                        }
+                        let txid = vin.txid.clone().unwrap();
+                        let vout = vin.vout.unwrap();
+
+                        let x = if cache.contains_key(&txid) {
+                            cache.get(&txid).unwrap()
+                        } else {
+                            let tx = match self.archive_node.client().get_transaction(&txid) {
+                                Ok(tx) => tx,
+                                Err(e) => {
+                                    error!("Connection to archive node failed {:?}", e);
+                                    continue;
+                                }
+                            };
+                            cache.insert(tx.txid.clone(), tx.clone());
+                            cache.get(&tx.txid).unwrap()
+                        };
+                        let addr = x.vout[vout].script_pub_key.address.clone().unwrap();
+
+                        watched_tx.source_tx.push((txid, addr));
+                    }
+
+                    watched_txs.push(watched_tx);
+                }
+                watched_txs
+            }
             Err(e) => {
                 error!("An error occured fetching watch list {:?})", e);
                 vec![]
