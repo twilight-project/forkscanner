@@ -16,6 +16,7 @@ use crate::schema::{
 use crate::MinerPoolInfo;
 
 const WATCH_WINDOW: i64 = 30;
+const TWO_HOURS: i64 = 7200;
 
 pub fn serde_bigdecimal<S>(decimal: &Option<BigDecimal>, s: S) -> Result<S::Ok, S::Error>
 where
@@ -227,10 +228,10 @@ pub struct TransactionAddress {
 impl TransactionAddress {
     pub fn clear(conn: &PgConnection) -> QueryResult<usize> {
         use crate::schema::transaction_addresses::dsl::*;
-        let from_time = Utc::now() - chrono::Duration::minutes(WATCH_WINDOW);
+        let from_time = Utc::now() - chrono::Duration::minutes(TWO_HOURS);
 
         diesel::delete(transaction_addresses)
-            .filter(created_at.lt(from_time))
+            .filter(created_at.lt(from_time).and(notified_at.is_not_null()))
             .execute(conn)
     }
 
