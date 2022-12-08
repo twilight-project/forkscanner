@@ -10,6 +10,7 @@ CREATE TABLE transaction_addresses (
 	receiving varchar not null,
 	sending varchar not null,
 	satoshis bigint not null,
+	height bigint not null,
 	PRIMARY KEY(block, txid, receiving, sending)
 );
 

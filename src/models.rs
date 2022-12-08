@@ -223,6 +223,7 @@ pub struct TransactionAddress {
     pub receiving: String,
     pub sending: String,
     pub satoshis: i64,
+	pub height: i64,
 }
 
 impl TransactionAddress {
@@ -238,6 +239,7 @@ impl TransactionAddress {
     pub fn insert(
         conn: &PgConnection,
         block_hash: String,
+		block_height: i64,
         data: Vec<(String, String, String, u64)>,
     ) -> QueryResult<usize> {
         use crate::schema::transaction_addresses::dsl::*;
@@ -251,6 +253,7 @@ impl TransactionAddress {
                 receiving: in_address,
                 sending: out_address,
                 satoshis: sats as i64,
+				height: block_height,
             })
             .collect();
 

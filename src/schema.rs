@@ -195,6 +195,7 @@ diesel::table! {
         receiving -> Varchar,
         sending -> Varchar,
         satoshis -> Int8,
+        height -> Int8,
     }
 }
 

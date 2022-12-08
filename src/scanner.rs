@@ -59,6 +59,7 @@ pub struct WatchedTx {
     pub receiving: String,
     pub sending: String,
     pub satoshis: i64,
+	pub height: i64,
 }
 
 impl WatchedTx {
@@ -72,6 +73,7 @@ impl WatchedTx {
             receiving: tx.receiving.clone(),
             sending: tx.sending.clone(),
             satoshis: tx.satoshis.clone(),
+			height: tx.height,
         }
     }
 }
@@ -115,7 +117,7 @@ pub struct FullBlock {
     confirmations: serde_json::Value,
     difficulty: serde_json::Value,
     hash: serde_json::Value,
-    height: serde_json::Value,
+    height: i64,
     mediantime: serde_json::Value,
     merkleroot: serde_json::Value,
     n_tx: serde_json::Value,
@@ -769,7 +771,7 @@ fn fetch_transactions<BC: BtcClient>(
     }
     trace!("inserting {} txs", tx_addrs.len());
 
-    if let Err(e) = TransactionAddress::insert(db_conn, block_hash.clone(), tx_addrs) {
+    if let Err(e) = TransactionAddress::insert(db_conn, block_hash.clone(), block_info.height, tx_addrs) {
         error!("Database update failed: {:?}", e);
     }
 }

@@ -71,7 +71,9 @@ This needs to be run on a node with bitcoin running.
 - `get_peers`: params: { "id": 8 }
    Query a nodes active peer list.
 
-- `update_watched_addresses`: params: { "remove": [ string ], "add": [ (string, date) ] }
+- `add_watched_addresses`: params: { "add": [ {"address": "string", "watch_until": "iso date" } ] }
+
+- `remove_watched_addresses`: params: { "remove": [ string ] }
    Query a nodes active peer list.
 ```
 

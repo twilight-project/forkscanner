@@ -113,9 +113,19 @@ struct NodeArgs {
 }
 
 #[derive(Debug, Deserialize)]
-struct WatchedAddressUpdate {
+struct RemoveWatchedAddress {
     remove: Vec<String>,
-    add: Vec<(String, DateTime<Utc>)>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Watch {
+    address: String,
+	watch_until: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AddWatchedAddress {
+    add: Vec<Watch>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -332,19 +342,36 @@ fn tx_is_active(conn: Conn, params: Params) -> Result<Value> {
     }
 }
 
-// update watched addresses
-fn update_watched_addresses(conn: Conn, params: Params) -> Result<Value> {
-    match params.parse::<WatchedAddressUpdate>() {
+// add watched addresses
+fn add_watched_addresses(conn: Conn, params: Params) -> Result<Value> {
+    match params.parse::<AddWatchedAddress>() {
         Ok(updates) => {
-            let WatchedAddressUpdate { remove, add } = updates;
+            let AddWatchedAddress { add } = updates;
+
+			let addrs = add.into_iter().map(|Watch { address, watch_until }| (address, watch_until)).collect();
+
+            if let Err(_) = Watched::insert(&conn, addrs) {
+                return Err(JsonRpcError::internal_error());
+            }
+
+            Ok("OK".into())
+        }
+        Err(args) => {
+            let err = JsonRpcError::invalid_params(format!("Invalid parameters, {:?}", args));
+            Err(err)
+        }
+    }
+}
+
+// remove watched addresses
+fn remove_watched_addresses(conn: Conn, params: Params) -> Result<Value> {
+    match params.parse::<RemoveWatchedAddress>() {
+        Ok(updates) => {
+            let RemoveWatchedAddress { remove } = updates;
 
             if let Err(_) = Watched::remove(&conn, remove) {
                 return Err(JsonRpcError::internal_error());
             };
-
-            if let Err(_) = Watched::insert(&conn, add) {
-                return Err(JsonRpcError::internal_error());
-            }
 
             Ok("OK".into())
         }
@@ -751,19 +778,8 @@ fn handle_validation_subscribe(
 fn handle_watched_addresses(
     exit: Arc<AtomicBool>,
     receiver: Receiver<ScannerMessage>,
-    watch: Vec<String>,
-    watch_until: DateTime<Utc>,
-    pool: ManagedPool,
     sink: Sink,
 ) {
-    let conn = pool.get().expect("Connection pool failure");
-
-    let watches: Vec<_> = watch
-        .into_iter()
-        .map(|w| (w, watch_until.clone()))
-        .collect();
-    Watched::insert(&conn, watches).expect("Could not insert watchlist!");
-
     info!("New address activity");
     let send_update =
         move |transactions: Vec<WatchedTx>, sink: &Sink| -> std::result::Result<(), WsError> {
@@ -1092,9 +1108,15 @@ pub fn run_server(
         });
 
         let p = pool.clone();
-        io.add_sync_method("update_watched_addresses", move |params: Params| {
+        io.add_sync_method("remove_watched_addresses", move |params: Params| {
             let conn = p.get().unwrap();
-            update_watched_addresses(conn, params)
+            remove_watched_addresses(conn, params)
+        });
+
+        let p = pool.clone();
+        io.add_sync_method("add_watched_addresses", move |params: Params| {
+            let conn = p.get().unwrap();
+            add_watched_addresses(conn, params)
         });
 
         let server = hts::ServerBuilder::new(io)
@@ -1512,20 +1534,31 @@ pub fn run_server(
                     info!("Subscribe to watched address checks");
                     let mut rng = rand::rngs::OsRng::default();
 
-                    let WatchAddress { watch, watch_until } = match params.parse() {
-                        Ok(parm) => parm,
-                        Err(e) => {
-                            subscriber
-								.reject(Error {
-									code: ErrorCode::ParseError,
-									message: format!("Invalid parameters. Expected list of addresses to watch. {:?}", e)
-										.into(),
-									data: None,
-								})
-								.unwrap();
-                            return;
-                        }
-                    };
+                    if params != Params::None {
+						let WatchAddress { watch, watch_until } = match params.parse() {
+							Ok(parm) => parm,
+							Err(e) => {
+								subscriber
+									.reject(Error {
+										code: ErrorCode::ParseError,
+										message: format!("Invalid parameters. Expected list of addresses to watch. {:?}", e)
+											.into(),
+										data: None,
+									})
+									.unwrap();
+								return;
+							}
+						};
+						let conn = pool4.get().expect("Connection pool failure");
+
+						let watches: Vec<_> = watch
+							.into_iter()
+							.map(|w| (w, watch_until.clone()))
+							.collect();
+
+						Watched::insert(&conn, watches).expect("Could not insert watchlist!");
+					}
+
 
                     let kill_switch = Arc::new(AtomicBool::new(false));
                     let sub_id = SubscriptionId::Number(rng.gen());
@@ -1546,9 +1579,6 @@ pub fn run_server(
                     handle_watched_addresses(
                         kill_switch,
                         notify_rx,
-                        watch,
-                        watch_until,
-                        pool4.clone(),
                         sink,
                     )
                 },
