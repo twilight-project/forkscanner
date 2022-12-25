@@ -29,7 +29,15 @@ where
 }
 
 #[derive(
-    Clone, Deserialize, Serialize, Debug, AsChangeset, QueryableByName, Queryable, Insertable,
+    Clone,
+    Deserialize,
+    Serialize,
+    Debug,
+    Default,
+    AsChangeset,
+    QueryableByName,
+    Queryable,
+    Insertable,
 )]
 #[table_name = "chaintips"]
 pub struct Chaintip {
@@ -81,7 +89,9 @@ impl Chaintip {
 
         let laggers: Vec<i64> = ldsl::lags.select(ldsl::node_id).load::<i64>(conn)?;
 
-        chaintips.filter(node.ne_all(laggers)).load(conn)
+        chaintips
+            .filter(status.eq("active").and(node.ne_all(laggers)))
+            .load(conn)
     }
 
     /// List all active tips.
@@ -219,11 +229,13 @@ pub struct TransactionAddress {
     pub created_at: DateTime<Utc>,
     pub notified_at: Option<DateTime<Utc>>,
     pub block: String,
-    pub txid: String,
+    pub receiving_txid: String,
+    pub sending_txid: String,
+    pub sending_vout: i64,
     pub receiving: String,
     pub sending: String,
     pub satoshis: i64,
-	pub height: i64,
+    pub height: i64,
 }
 
 impl TransactionAddress {
@@ -239,21 +251,32 @@ impl TransactionAddress {
     pub fn insert(
         conn: &PgConnection,
         block_hash: String,
-		block_height: i64,
-        data: Vec<(String, String, String, u64)>,
+        block_height: i64,
+        data: Vec<(String, String, Vec<(String, usize, String)>, u64)>,
     ) -> QueryResult<usize> {
         use crate::schema::transaction_addresses::dsl::*;
+
+        let created = Utc::now();
+
         let tx_addrs: Vec<_> = data
             .into_iter()
-            .map(|(id, in_address, out_address, sats)| TransactionAddress {
-                created_at: Utc::now(),
-                notified_at: None,
-                block: block_hash.clone(),
-                txid: id,
-                receiving: in_address,
-                sending: out_address,
-                satoshis: sats as i64,
-				height: block_height,
+            .flat_map(|(id, in_address, sender_info, sats)| {
+                let b_hash = block_hash.clone();
+
+                sender_info
+                    .into_iter()
+                    .map(move |(s_txid, s_vout, sender)| TransactionAddress {
+                        created_at: created.clone(),
+                        notified_at: None,
+                        block: b_hash.clone(),
+                        receiving_txid: id.clone(),
+                        sending_txid: s_txid,
+                        sending_vout: s_vout as i64,
+                        receiving: in_address.clone(),
+                        sending: sender,
+                        satoshis: sats as i64,
+                        height: block_height,
+                    })
             })
             .collect();
 
@@ -1364,6 +1387,12 @@ pub struct Watched {
 }
 
 impl Watched {
+    pub fn load(conn: &PgConnection) -> QueryResult<Vec<Watched>> {
+        use crate::schema::watched::dsl::*;
+
+        watched.load(conn)
+    }
+
     pub fn insert(
         conn: &PgConnection,
         watches: Vec<(String, DateTime<Utc>)>,
@@ -1416,13 +1445,13 @@ impl Watched {
             .filter(
                 tadsl::receiving
                     .eq(any(&watched))
-                    .and(tadsl::notified_at.is_not_null())
+                    .and(tadsl::notified_at.is_null())
                     .and(tadsl::created_at.gt(from_time)),
             )
             .or_filter(
                 tadsl::sending
                     .eq(any(&watched))
-                    .and(tadsl::notified_at.is_not_null())
+                    .and(tadsl::notified_at.is_null())
                     .and(tadsl::created_at.gt(from_time)),
             )
             .load(conn)?;

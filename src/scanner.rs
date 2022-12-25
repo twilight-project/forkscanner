@@ -25,7 +25,7 @@ use log::{debug, error, info, trace, warn};
 #[cfg(test)]
 use mockall::*;
 use rayon::prelude::*;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::{
     collections::{HashMap, HashSet},
     iter::{once, FromIterator},
@@ -45,38 +45,8 @@ const REACHABLE_CHECK_INTERVAL: i64 = 10;
 const MINER_POOL_INFO: &str =
     "https://raw.githubusercontent.com/0xB10C/known-mining-pools/master/pools.json";
 const SATOSHI_TO_BTC: i64 = 100_000_000;
-const COINBASE_ADDR: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 type ForkScannerResult<T> = Result<T, ForkScannerError>;
-
-#[derive(Clone, Serialize)]
-pub struct WatchedTx {
-    pub created_at: DateTime<Utc>,
-    pub notified_at: Option<DateTime<Utc>>,
-    pub block: String,
-    pub source_tx: Vec<(String, String)>,
-    pub txid: String,
-    pub receiving: String,
-    pub sending: String,
-    pub satoshis: i64,
-	pub height: i64,
-}
-
-impl WatchedTx {
-    pub fn from_tx(tx: &TransactionAddress) -> WatchedTx {
-        WatchedTx {
-            created_at: tx.created_at.clone(),
-            notified_at: tx.notified_at.clone(),
-            block: tx.block.clone(),
-            source_tx: Vec::new(),
-            txid: tx.txid.clone(),
-            receiving: tx.receiving.clone(),
-            sending: tx.sending.clone(),
-            satoshis: tx.satoshis.clone(),
-			height: tx.height,
-        }
-    }
-}
 
 /// Types for the pool info fetched from MINER_POOL_INFO.
 #[derive(Debug, Deserialize)]
@@ -96,11 +66,11 @@ pub enum ScannerMessage {
     LaggingNodes(Vec<Lags>),
     NewChaintip,
     NewBlockConflicts(Vec<ConflictingBlock>),
-    AllChaintips(Vec<Chaintip>),
+    ActiveTip(Chaintip),
     StaleCandidateUpdate,
     TipUpdateFailed(String),
     TipUpdated(Vec<String>),
-    WatchedAddress(Vec<WatchedTx>),
+    WatchedAddress(Vec<TransactionAddress>),
 }
 
 /// Command types from api to forkscanner.
@@ -651,7 +621,6 @@ fn fetch_transactions<BC: BtcClient>(
     db_conn: &PgConnection,
     block_hash: &String,
     fetch_inputs: bool,
-    mode: WatcherMode,
 ) {
     let processed = Transaction::block_processed(db_conn, block_hash);
     let inputs = TransactionAddress::inputs_processed(db_conn, block_hash.clone());
@@ -661,6 +630,14 @@ fn fetch_transactions<BC: BtcClient>(
     } else if fetch_inputs && (inputs.is_err() || inputs.unwrap()) {
         return;
     }
+
+    let watchlist = match Watched::load(db_conn) {
+        Ok(list) => HashSet::<String>::from_iter(list.into_iter().map(|l| l.address)),
+        Err(e) => {
+            error!("Watchlist load error {:?}", e);
+            Default::default()
+        }
+    };
 
     let block_info = match node.get_block_verbose(block_hash.to_string()) {
         Ok(bi) => bi,
@@ -688,72 +665,54 @@ fn fetch_transactions<BC: BtcClient>(
         let value = vout.iter().fold(0.0, |a, amt| a + amt.value);
 
         if fetch_inputs {
-            if WatcherMode::Inputs == mode || WatcherMode::All == mode {
-                for txin in vin {
-                    let Vin {
-                        txid,
-                        vout: vout_idx,
-                        ..
-                    } = txin;
+            let mut cache = HashMap::new();
 
-                    let txid = txid.unwrap_or(COINBASE_ADDR.to_string());
-                    if txid == COINBASE_ADDR.to_string() {
+            for out in vout {
+                let Vout {
+                    script_pub_key: ScriptPubKey { address, hex, .. },
+                    value,
+                    ..
+                } = out;
+
+                let to_address = address.unwrap_or(hex);
+
+                if !watchlist.contains(&to_address) {
+                    continue;
+                }
+
+                let mut inputs = Vec::with_capacity(vin.len());
+
+                for v in &vin {
+                    if v.txid.is_none() {
                         continue;
                     }
-                    if vout_idx.is_none() {
-                        error!("No vout index for transaction input!");
-                        continue;
-                    }
+                    let txid = v.txid.clone().unwrap();
+                    let vout = v.vout.unwrap();
 
-                    let intx = match node.get_transaction(&txid) {
-                        Ok(tx) => tx,
-                        Err(e) => {
-                            error!("Could not fetch raw transaction info! {:?}", e);
-                            continue;
-                        }
+                    let x = if cache.contains_key(&txid) {
+                        cache.get(&txid).unwrap()
+                    } else {
+                        let tx = match node.get_transaction(&txid) {
+                            Ok(tx) => tx,
+                            Err(e) => {
+                                error!("Connection to archive node failed {:?}", e);
+                                continue;
+                            }
+                        };
+                        cache.insert(tx.txid.clone(), tx.clone());
+                        cache.get(&tx.txid).unwrap()
                     };
+                    let addr = x.vout[vout].script_pub_key.address.clone().unwrap();
 
-                    let txout = &intx.vout[vout_idx.unwrap()];
-                    let hex_encoded = hex::encode(&txout.script_pub_key.hex);
-                    let from_address = txout
-                        .script_pub_key
-                        .address
-                        .clone()
-                        .unwrap_or(hex_encoded.clone());
-
-                    for out in vout.clone() {
-                        let Vout {
-                            script_pub_key: ScriptPubKey { address, hex, .. },
-                            value,
-                            ..
-                        } = out;
-
-                        let to_address = address.unwrap_or(hex);
-                        tx_addrs.push((
-                            txid.clone(),
-                            to_address,
-                            from_address.clone(),
-                            Amount::from_btc(value).unwrap().to_sat(),
-                        ));
-                    }
+                    inputs.push((txid, vout, addr));
                 }
-            } else if mode == WatcherMode::Outputs {
-                for out in vout {
-                    let Vout {
-                        script_pub_key: ScriptPubKey { address, hex, .. },
-                        value,
-                        ..
-                    } = out;
 
-                    let to_address = address.unwrap_or(hex);
-                    let from_address = "".into();
-                    tx_addrs.push((
-                        txid.clone(),
-                        to_address,
-                        from_address,
-                        Amount::from_btc(value).unwrap().to_sat(),
-                    ));
-                }
+                tx_addrs.push((
+                    txid.clone(),
+                    to_address,
+                    inputs,
+                    Amount::from_btc(value).unwrap().to_sat(),
+                ));
             }
         }
 
@@ -771,7 +730,9 @@ fn fetch_transactions<BC: BtcClient>(
     }
     trace!("inserting {} txs", tx_addrs.len());
 
-    if let Err(e) = TransactionAddress::insert(db_conn, block_hash.clone(), block_info.height, tx_addrs) {
+    if let Err(e) =
+        TransactionAddress::insert(db_conn, block_hash.clone(), block_info.height, tx_addrs)
+    {
         error!("Database update failed: {:?}", e);
     }
 }
@@ -908,7 +869,7 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
 
                 while let Ok(msg) = rx.recv() {
                     info!("Running fetch transactions for: {}", msg);
-                    fetch_transactions(node.client(), &db_conn, &msg, true, mode);
+                    fetch_transactions(node.client(), &db_conn, &msg, true);
                 }
             });
         }
@@ -1214,67 +1175,9 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
     }
 
     // get raw transaction hex for each watched address tx
-    fn watched_address_checks(&self) -> Vec<WatchedTx> {
-        let _ = TransactionAddress::clear(&self.db_conn);
-
-        // Clear expired watch entries
-        if let Err(e) = Watched::clear(&self.db_conn) {
-            error!("Watchlist query error {:?}", e);
-            return vec![];
-        }
-
+    fn watched_address_checks(&self) -> Vec<TransactionAddress> {
         match Watched::fetch(&self.db_conn) {
-            Ok(transactions) => {
-                let mut cache = HashMap::new();
-                let mut watched_txs = Vec::with_capacity(transactions.len());
-
-                for tx in transactions {
-                    let mut watched_tx = WatchedTx::from_tx(&tx);
-
-                    let tx = if cache.contains_key(&tx.txid) {
-                        cache.get(&tx.txid).unwrap()
-                    } else {
-                        let tx = match self.archive_node.client().get_transaction(&tx.txid) {
-                            Ok(tx) => tx,
-                            Err(e) => {
-                                error!("Connection to archive node failed {:?}", e);
-                                continue;
-                            }
-                        };
-                        cache.insert(tx.txid.clone(), tx.clone());
-                        cache.get(&tx.txid).unwrap()
-                    }
-                    .clone();
-
-                    for vin in &tx.vin {
-                        if vin.txid.is_none() {
-                            continue;
-                        }
-                        let txid = vin.txid.clone().unwrap();
-                        let vout = vin.vout.unwrap();
-
-                        let x = if cache.contains_key(&txid) {
-                            cache.get(&txid).unwrap()
-                        } else {
-                            let tx = match self.archive_node.client().get_transaction(&txid) {
-                                Ok(tx) => tx,
-                                Err(e) => {
-                                    error!("Connection to archive node failed {:?}", e);
-                                    continue;
-                                }
-                            };
-                            cache.insert(tx.txid.clone(), tx.clone());
-                            cache.get(&tx.txid).unwrap()
-                        };
-                        let addr = x.vout[vout].script_pub_key.address.clone().unwrap();
-
-                        watched_tx.source_tx.push((txid, addr));
-                    }
-
-                    watched_txs.push(watched_tx);
-                }
-                watched_txs
-            }
+            Ok(transactions) => transactions,
             Err(e) => {
                 error!("An error occured fetching watch list {:?})", e);
                 vec![]
@@ -1331,6 +1234,11 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
     // for new blocks, and fetch ancestors up to MAX_BLOCK_HEIGHT postgres
     // will do the rest for us.
     pub fn run(&self) {
+        // Clear expired watch entries
+        if let Err(e) = Watched::clear(&self.db_conn) {
+            error!("Watchlist query error {:?}", e);
+        }
+
         // update the miner pools info
         match ureq::get(MINER_POOL_INFO).call() {
             Ok(info) => {
@@ -1594,7 +1502,7 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
                     let tip = tips.into_iter().find(|item| item.block == top).unwrap();
 
                     self.notify_tx
-                        .send(ScannerMessage::AllChaintips(vec![tip]))
+                        .send(ScannerMessage::ActiveTip(tip))
                         .expect("Channel closed");
                 }
             }
@@ -1940,13 +1848,7 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
             };
 
             for block in blocks {
-                fetch_transactions(
-                    node,
-                    &self.db_conn,
-                    &block.hash,
-                    false,
-                    self.address_watcher_mode,
-                );
+                fetch_transactions(node, &self.db_conn, &block.hash, false);
                 let descendants = match block.descendants(&self.db_conn, Some(DOUBLE_SPEND_RANGE)) {
                     Ok(d) => d,
                     Err(e) => {
@@ -1956,13 +1858,7 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
                 };
 
                 for desc in descendants {
-                    fetch_transactions(
-                        node,
-                        &self.db_conn,
-                        &desc.hash,
-                        false,
-                        self.address_watcher_mode,
-                    );
+                    fetch_transactions(node, &self.db_conn, &desc.hash, false);
                 }
             }
 

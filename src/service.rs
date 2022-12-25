@@ -1,6 +1,6 @@
 use crate::{
     scanner::BtcClient, serde_bigdecimal, Block, Chaintip, ConflictingBlock, Lags, Node, Peer,
-    ScannerCommand, ScannerMessage, StaleCandidate, Transaction, Watched, WatchedTx,
+    ScannerCommand, ScannerMessage, StaleCandidate, Transaction, TransactionAddress, Watched,
 };
 use bigdecimal::BigDecimal;
 use bitcoin::consensus::encode::serialize_hex;
@@ -120,7 +120,7 @@ struct RemoveWatchedAddress {
 #[derive(Debug, Deserialize)]
 struct Watch {
     address: String,
-	watch_until: DateTime<Utc>,
+    watch_until: DateTime<Utc>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -278,7 +278,7 @@ impl BlockResult {
     }
 }
 
-fn validation_checks(conn: Conn, window: i64) -> Result<Value> {
+fn validation_checks(conn: Conn, window: i64) -> Result<Option<Value>> {
     let tips = Chaintip::list_active(&conn);
 
     if tips.is_err() {
@@ -309,9 +309,13 @@ fn validation_checks(conn: Conn, window: i64) -> Result<Value> {
         .collect();
 
     info!("{} stale candidates in window {}", checks.len(), window);
-    match serde_json::to_value(checks) {
-        Ok(t) => Ok(t),
-        Err(_) => Err(JsonRpcError::internal_error()),
+    if checks.len() > 0 {
+        match serde_json::to_value(checks) {
+            Ok(t) => Ok(Some(t)),
+            Err(_) => Err(JsonRpcError::internal_error()),
+        }
+    } else {
+        Ok(None)
     }
 }
 
@@ -348,7 +352,15 @@ fn add_watched_addresses(conn: Conn, params: Params) -> Result<Value> {
         Ok(updates) => {
             let AddWatchedAddress { add } = updates;
 
-			let addrs = add.into_iter().map(|Watch { address, watch_until }| (address, watch_until)).collect();
+            let addrs = add
+                .into_iter()
+                .map(
+                    |Watch {
+                         address,
+                         watch_until,
+                     }| (address, watch_until),
+                )
+                .collect();
 
             if let Err(_) = Watched::insert(&conn, addrs) {
                 return Err(JsonRpcError::internal_error());
@@ -526,7 +538,10 @@ fn get_block_from_peer(conn: Conn, params: Params) -> Result<Value> {
 
 fn get_stale_candidates(conn: Conn, params: Params) -> Result<Value> {
     match params.parse::<Window>() {
-        Ok(q) => Ok(validation_checks(conn, q.window)?),
+        Ok(q) => match validation_checks(conn, q.window)? {
+            Some(c) => Ok(c),
+            None => Ok(Value::Array(vec![])),
+        },
         Err(args) => {
             let err = JsonRpcError::invalid_params(format!("Invalid parameters, {:?}", args));
             Err(err)
@@ -736,7 +751,8 @@ fn handle_validation_subscribe(
     let send_update = move |pool: &ManagedPool, sink: &Sink| -> std::result::Result<(), WsError> {
         let conn = pool.get()?;
         match validation_checks(conn, window) {
-            Ok(resp) => Ok(sink.notify(Params::Array(vec![resp]))?),
+            Ok(Some(resp)) => Ok(sink.notify(Params::Array(vec![resp]))?),
+            Ok(None) => Ok(()),
             Err(_) => Ok(sink.notify(Params::Array(vec![
                 "Failed to update validation checks".into()
             ]))?),
@@ -775,20 +791,17 @@ fn handle_validation_subscribe(
 }
 
 // Notify of watched address activity
-fn handle_watched_addresses(
-    exit: Arc<AtomicBool>,
-    receiver: Receiver<ScannerMessage>,
-    sink: Sink,
-) {
+fn handle_watched_addresses(exit: Arc<AtomicBool>, receiver: Receiver<ScannerMessage>, sink: Sink) {
     info!("New address activity");
-    let send_update =
-        move |transactions: Vec<WatchedTx>, sink: &Sink| -> std::result::Result<(), WsError> {
-            let resp = transactions
-                .into_iter()
-                .map(|tx| serde_json::to_value(tx).expect("Could not serialize transaction"))
-                .collect();
-            Ok(sink.notify(Params::Array(resp))?)
-        };
+    let send_update = move |transactions: Vec<TransactionAddress>,
+                            sink: &Sink|
+          -> std::result::Result<(), WsError> {
+        let resp = transactions
+            .into_iter()
+            .map(|tx| serde_json::to_value(tx).expect("Could not serialize transaction"))
+            .collect();
+        Ok(sink.notify(Params::Array(resp))?)
+    };
 
     thread::spawn(move || loop {
         if exit.load(Ordering::SeqCst) {
@@ -954,26 +967,25 @@ fn handle_subscribe_forks(
 fn handle_subscribe(
     exit: Arc<AtomicBool>,
     receiver: Receiver<ScannerMessage>,
-    tips: Arc<RwLock<Vec<Chaintip>>>,
+    tip: Arc<RwLock<Chaintip>>,
     _: Params,
     sink: Sink,
 ) {
     info!("New subscription");
-    fn send_update(
-        tips: &Arc<RwLock<Vec<Chaintip>>>,
-        sink: &Sink,
-    ) -> std::result::Result<(), WsError> {
-        let values = tips.read().expect("Lock poisoned").clone();
-        let tips: Vec<_> = values
-            .into_iter()
-            .map(|tip| serde_json::to_value(tip).expect("JSON serde failed"))
-            .collect();
+    fn send_update(tip: &Arc<RwLock<Chaintip>>, sink: &Sink) -> std::result::Result<(), WsError> {
+        let value = tip.read().expect("Lock poisoned").clone();
 
-        Ok(sink.notify(Params::Array(tips))?)
+        if value.block == "" {
+            Ok(())
+        } else {
+            let latest = serde_json::to_value(value).expect("JSON serde failed");
+
+            Ok(sink.notify(Params::Array(vec![latest]))?)
+        }
     }
 
     thread::spawn(move || {
-        if let Err(e) = send_update(&tips, &sink) {
+        if let Err(e) = send_update(&tip, &sink) {
             error!("Error sending chaintips to initialize client {:?}", e);
         }
 
@@ -983,8 +995,8 @@ fn handle_subscribe(
             }
 
             match receiver.recv_timeout(time::Duration::from_millis(5000)) {
-                Ok(ScannerMessage::NewChaintip) => {
-                    if let Err(e) = send_update(&tips, &sink) {
+                Ok(ScannerMessage::ActiveTip(_)) => {
+                    if let Err(e) = send_update(&tip, &sink) {
                         error!("Error sending chaintips to client {:?}", e);
                     }
                 }
@@ -1015,13 +1027,13 @@ pub fn run_server(
     command: Sender<ScannerCommand>,
 ) {
     let manager = ConnectionManager::<PgConnection>::new(db_url);
-    let tips = Arc::new(RwLock::new(vec![]));
+    let tip = Arc::new(RwLock::new(Chaintip::default()));
     let pool = r2d2::Pool::builder()
         .build(manager)
         .expect("Connection pool");
     let pool2 = pool.clone();
 
-    let tips1 = tips.clone();
+    let tip1 = tip.clone();
     let l1 = listen.clone();
 
     // set up some rpc endpoints
@@ -1233,15 +1245,21 @@ pub fn run_server(
                     subs.retain(|sub| sub.send(ScannerMessage::StaleCandidateUpdate).is_ok());
                 }
             }
-            Ok(ScannerMessage::AllChaintips(mut t)) => {
+            Ok(ScannerMessage::ActiveTip(mut t)) => {
                 debug!("New chaintips {:?}", t);
-                std::mem::swap(&mut t, &mut tips.write().expect("Lock poisoned"));
+                let mut last = tip.write().expect("Lock poisoned");
+                std::mem::swap(&mut t, &mut last);
+
+                if t.block == last.block {
+                    continue;
+                }
+
                 if let Some(subs) = subscriptions2
                     .lock()
                     .expect("Lock poisoned")
                     .get_mut("active_fork")
                 {
-                    subs.retain(|sub| sub.send(ScannerMessage::NewChaintip).is_ok());
+                    subs.retain(|sub| sub.send(ScannerMessage::ActiveTip(t.clone())).is_ok());
                 }
             }
             Err(e) => {
@@ -1310,7 +1328,7 @@ pub fn run_server(
                             .push(notify_tx);
                     }
 
-                    handle_subscribe(kill_switch, notify_rx, tips1.clone(), params, sink)
+                    handle_subscribe(kill_switch, notify_rx, tip1.clone(), params, sink)
                 },
             ),
             ("unsubscribe_active_fork", move |id: SubscriptionId, _| {
@@ -1535,10 +1553,10 @@ pub fn run_server(
                     let mut rng = rand::rngs::OsRng::default();
 
                     if params != Params::None {
-						let WatchAddress { watch, watch_until } = match params.parse() {
-							Ok(parm) => parm,
-							Err(e) => {
-								subscriber
+                        let WatchAddress { watch, watch_until } = match params.parse() {
+                            Ok(parm) => parm,
+                            Err(e) => {
+                                subscriber
 									.reject(Error {
 										code: ErrorCode::ParseError,
 										message: format!("Invalid parameters. Expected list of addresses to watch. {:?}", e)
@@ -1546,19 +1564,18 @@ pub fn run_server(
 										data: None,
 									})
 									.unwrap();
-								return;
-							}
-						};
-						let conn = pool4.get().expect("Connection pool failure");
+                                return;
+                            }
+                        };
+                        let conn = pool4.get().expect("Connection pool failure");
 
-						let watches: Vec<_> = watch
-							.into_iter()
-							.map(|w| (w, watch_until.clone()))
-							.collect();
+                        let watches: Vec<_> = watch
+                            .into_iter()
+                            .map(|w| (w, watch_until.clone()))
+                            .collect();
 
-						Watched::insert(&conn, watches).expect("Could not insert watchlist!");
-					}
-
+                        Watched::insert(&conn, watches).expect("Could not insert watchlist!");
+                    }
 
                     let kill_switch = Arc::new(AtomicBool::new(false));
                     let sub_id = SubscriptionId::Number(rng.gen());
@@ -1576,11 +1593,7 @@ pub fn run_server(
                             .push(notify_tx);
                     }
 
-                    handle_watched_addresses(
-                        kill_switch,
-                        notify_rx,
-                        sink,
-                    )
+                    handle_watched_addresses(kill_switch, notify_rx, sink)
                 },
             ),
             (

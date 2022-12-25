@@ -6,12 +6,14 @@ CREATE TABLE transaction_addresses (
     created_at timestamptz not null,
 	notified_at timestamptz,
 	block varchar not null,
-	txid varchar not null,
+	receiving_txid varchar not null,
+	sending_txid varchar not null,
+	sending_vout bigint not null,
 	receiving varchar not null,
 	sending varchar not null,
 	satoshis bigint not null,
 	height bigint not null,
-	PRIMARY KEY(block, txid, receiving, sending)
+	PRIMARY KEY(block, receiving, sending, sending_vout)
 );
 
 ALTER TABLE chaintips
