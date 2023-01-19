@@ -1458,7 +1458,13 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
                         ) {
                             Ok(fee_rates) => {
                                 for mut fee_rate in
-                                    tx_pos_omitted.into_iter().map(|i| fee_rates[i].clone())
+                                    tx_pos_omitted.into_iter().filter_map(|i| {
+									    if fee_rates.get(i).is_some() {
+											Some(fee_rates[i].clone())
+										} else {
+										    None
+										}
+									})
                                 {
                                     fee_rate.omitted = true;
                                     if let Err(e) = fee_rate.update(&self.db_conn) {
