@@ -232,6 +232,7 @@ pub struct TransactionAddress {
     pub receiving_txid: String,
     pub sending_txid: String,
     pub sending_vout: i64,
+    pub sending_amount: i64,
     pub receiving: String,
     pub sending: String,
     pub satoshis: i64,
@@ -252,7 +253,7 @@ impl TransactionAddress {
         conn: &PgConnection,
         block_hash: String,
         block_height: i64,
-        data: Vec<(String, String, Vec<(String, usize, String)>, u64)>,
+        data: Vec<(String, String, Vec<(String, usize, String, i64)>, u64)>,
     ) -> QueryResult<usize> {
         use crate::schema::transaction_addresses::dsl::*;
 
@@ -265,13 +266,14 @@ impl TransactionAddress {
 
                 sender_info
                     .into_iter()
-                    .map(move |(s_txid, s_vout, sender)| TransactionAddress {
+                    .map(move |(s_txid, s_vout, sender, value)| TransactionAddress {
                         created_at: created.clone(),
                         notified_at: None,
                         block: b_hash.clone(),
                         receiving_txid: id.clone(),
                         sending_txid: s_txid,
                         sending_vout: s_vout as i64,
+                        sending_amount: value,
                         receiving: in_address.clone(),
                         sending: sender,
                         satoshis: sats as i64,
@@ -1386,6 +1388,24 @@ pub struct Watched {
     pub watch_until: DateTime<Utc>,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+pub struct WatchedTransaction {
+    pub block: String,
+    pub receiving_txid: String,
+    pub sending_txinputs: Vec<TxIn>,
+    pub receiving: String,
+    pub satoshis: i64,
+    pub height: i64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct TxIn {
+    pub txid: String,
+    pub vout: i64,
+    pub amount: i64,
+    pub address: String,
+}
+
 impl Watched {
     pub fn load(conn: &PgConnection) -> QueryResult<Vec<Watched>> {
         use crate::schema::watched::dsl::*;
@@ -1431,7 +1451,7 @@ impl Watched {
             .execute(conn)
     }
 
-    pub fn fetch(conn: &PgConnection) -> QueryResult<Vec<TransactionAddress>> {
+    pub fn fetch(conn: &PgConnection) -> QueryResult<Vec<WatchedTransaction>> {
         use crate::schema::transaction_addresses::dsl as tadsl;
         use crate::schema::watched::dsl as wdsl;
         use diesel::dsl::any;
@@ -1441,20 +1461,97 @@ impl Watched {
 
         let from_time = Utc::now() - chrono::Duration::minutes(WATCH_WINDOW);
 
-        let addrs = tadsl::transaction_addresses
+        let mut recv_addrs: Vec<TransactionAddress> = tadsl::transaction_addresses
             .filter(
                 tadsl::receiving
                     .eq(any(&watched))
                     .and(tadsl::notified_at.is_null())
                     .and(tadsl::created_at.gt(from_time)),
             )
-            .or_filter(
+            .load(conn)?;
+
+        let mut addrs: HashMap<String, WatchedTransaction> = HashMap::new();
+
+        for addr in recv_addrs.drain(..) {
+            let TransactionAddress {
+                block,
+                receiving,
+                sending_txid,
+                sending_vout,
+                sending_amount,
+                sending,
+                satoshis,
+                height,
+                receiving_txid,
+                ..
+            } = addr;
+            let txin = TxIn {
+                txid: sending_txid,
+                vout: sending_vout,
+                amount: sending_amount,
+                address: sending,
+            };
+
+            addrs
+                .entry(receiving.clone())
+                .and_modify(|e| {
+                    // txid, vout, amount, addr
+                    e.sending_txinputs.push(txin.clone());
+                })
+                .or_insert(WatchedTransaction {
+                    block,
+                    receiving_txid,
+                    sending_txinputs: vec![txin.clone()],
+                    receiving,
+                    satoshis,
+                    height,
+                });
+        }
+
+        let mut send_addrs: Vec<TransactionAddress> = tadsl::transaction_addresses
+            .filter(
                 tadsl::sending
                     .eq(any(&watched))
                     .and(tadsl::notified_at.is_null())
                     .and(tadsl::created_at.gt(from_time)),
             )
             .load(conn)?;
+
+        for addr in send_addrs.drain(..) {
+            let TransactionAddress {
+                block,
+                receiving,
+                sending_txid,
+                sending_vout,
+                sending_amount,
+                sending,
+                satoshis,
+                height,
+                receiving_txid,
+                ..
+            } = addr;
+            let txin = TxIn {
+                txid: sending_txid,
+                vout: sending_vout,
+                amount: sending_amount,
+                address: sending,
+            };
+
+            addrs
+                .entry(receiving.clone())
+                .and_modify(|e| {
+                    // txid, vout, amount, addr
+                    e.sending_txinputs.push(txin.clone());
+                })
+                .or_insert(WatchedTransaction {
+                    block,
+                    receiving_txid,
+                    sending_txinputs: vec![txin.clone()],
+                    receiving,
+                    satoshis,
+                    height,
+                });
+        }
 
         diesel::update(
             tadsl::transaction_addresses
@@ -1464,7 +1561,7 @@ impl Watched {
         .set(tadsl::notified_at.eq(Utc::now()))
         .execute(conn)?;
 
-        Ok(addrs)
+        Ok(addrs.into_values().collect())
     }
 }
 

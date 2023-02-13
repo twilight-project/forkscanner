@@ -1,7 +1,7 @@
 use crate::{
     Block, BlockTemplate, Chaintip, ConflictingBlock, FeeRate, InflatedBlock, InvalidBlock, Lags,
     NewPeer, Node, Peer, Pool, SoftForks, StaleCandidate, StaleCandidateChildren, Transaction,
-    TransactionAddress, TxOutset, Watched, WatcherMode,
+    TransactionAddress, TxOutset, Watched, WatchedTransaction, WatcherMode,
 };
 use bigdecimal::{BigDecimal, FromPrimitive};
 use bitcoin::{consensus::encode::serialize_hex, util::amount::Amount};
@@ -70,7 +70,7 @@ pub enum ScannerMessage {
     StaleCandidateUpdate,
     TipUpdateFailed(String),
     TipUpdated(Vec<String>),
-    WatchedAddress(Vec<TransactionAddress>),
+    WatchedAddress(Vec<WatchedTransaction>),
 }
 
 /// Command types from api to forkscanner.
@@ -703,8 +703,9 @@ fn fetch_transactions<BC: BtcClient>(
                         cache.get(&tx.txid).unwrap()
                     };
                     let addr = x.vout[vout].script_pub_key.address.clone().unwrap();
+                    let sats = Amount::from_btc(x.vout[vout].value).unwrap().to_sat();
 
-                    inputs.push((txid, vout, addr));
+                    inputs.push((txid, vout, addr, sats as i64));
                 }
 
                 tx_addrs.push((
@@ -1175,7 +1176,7 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
     }
 
     // get raw transaction hex for each watched address tx
-    fn watched_address_checks(&self) -> Vec<TransactionAddress> {
+    fn watched_address_checks(&self) -> Vec<WatchedTransaction> {
         match Watched::fetch(&self.db_conn) {
             Ok(transactions) => transactions,
             Err(e) => {
@@ -1457,15 +1458,13 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
                             latest_template.node_id,
                         ) {
                             Ok(fee_rates) => {
-                                for mut fee_rate in
-                                    tx_pos_omitted.into_iter().filter_map(|i| {
-									    if fee_rates.get(i).is_some() {
-											Some(fee_rates[i].clone())
-										} else {
-										    None
-										}
-									})
-                                {
+                                for mut fee_rate in tx_pos_omitted.into_iter().filter_map(|i| {
+                                    if fee_rates.get(i).is_some() {
+                                        Some(fee_rates[i].clone())
+                                    } else {
+                                        None
+                                    }
+                                }) {
                                     fee_rate.omitted = true;
                                     if let Err(e) = fee_rate.update(&self.db_conn) {
                                         error!("Fee rate update failed {e:?}");

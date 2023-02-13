@@ -194,6 +194,7 @@ diesel::table! {
         receiving_txid -> Varchar,
         sending_txid -> Varchar,
         sending_vout -> Int8,
+        sending_amount -> Int8,
         receiving -> Varchar,
         sending -> Varchar,
         satoshis -> Int8,

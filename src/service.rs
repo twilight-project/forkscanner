@@ -1,6 +1,6 @@
 use crate::{
     scanner::BtcClient, serde_bigdecimal, Block, Chaintip, ConflictingBlock, Lags, Node, Peer,
-    ScannerCommand, ScannerMessage, StaleCandidate, Transaction, TransactionAddress, Watched,
+    ScannerCommand, ScannerMessage, StaleCandidate, Transaction, Watched, WatchedTransaction,
 };
 use bigdecimal::BigDecimal;
 use bitcoin::consensus::encode::serialize_hex;
@@ -793,7 +793,7 @@ fn handle_validation_subscribe(
 // Notify of watched address activity
 fn handle_watched_addresses(exit: Arc<AtomicBool>, receiver: Receiver<ScannerMessage>, sink: Sink) {
     info!("New address activity");
-    let send_update = move |transactions: Vec<TransactionAddress>,
+    let send_update = move |transactions: Vec<WatchedTransaction>,
                             sink: &Sink|
           -> std::result::Result<(), WsError> {
         let resp = transactions
