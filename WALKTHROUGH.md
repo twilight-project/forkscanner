@@ -1,4 +1,4 @@
-i# Forkscanner walk-through
+# Forkscanner walk-through
 
 ## Requirements
 - a laptop
