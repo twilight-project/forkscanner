@@ -1,10 +1,10 @@
 ---
 services:
-  api:
+  scanner:
     image: scanner
     env_file: .env
     depends_on:
-      database:
+      postgres:
         condition: service_healthy
     ports:
       - "8339:8339"
@@ -17,8 +17,8 @@ services:
       POSTGRES_PASSWORD: forkscanner
       POSTGRES_USER: forkscanner
       POSTGRES_DB: forkscanner
-	ports:
-	  - "5432:5432"
+    ports:
+      - "5432:5432"
     volumes:
       - db-data:/var/lib/postgresql/data
     healthcheck:
