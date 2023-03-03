@@ -95,3 +95,5 @@ Subscription id:  8034008713957604000
 Got forks method: []
 Subscription id:  10962735622574234000
 ```
+
+List of websocket/rpcs are (README.md)[here]
