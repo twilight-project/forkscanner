@@ -32,6 +32,7 @@ cargo install diesel_cli --no-default-features --features postgres
 ```console
 git clone https://github.com/twilight-project/forkscanner.git
 cd forkscanner
+git checkout scanner-walkthrough
 docker-compose up -d postgres
 ```
 
@@ -43,7 +44,7 @@ psql postgres://forkscanner:forkscanner@localhost:5432/forkscanner -f scripts/se
 ```
 
 ```console
-docker-compose up -d forkscanner
+docker-compose up -d scanner
 ```
 
 This should bring up postgres, and then the scanner.
