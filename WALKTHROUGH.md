@@ -28,7 +28,7 @@ Runs on top of the scanner, when scanner detects various conditions (e.g. chaint
 cargo install diesel_cli --no-default-features --features postgres
 ```
 
-## Get it running
+## Get the database running
 ```console
 git clone https://github.com/twilight-project/forkscanner.git
 cd forkscanner
@@ -67,8 +67,11 @@ The nodes we will be connecting to are:
     ('archive', '137.184.186.227', 8332, 'bitcoin', 'Persario_1', false, '167.71.141.175', 8332),
     ('archive', '143.244.136.166', 8332, 'bitcoin', 'Persario_1', false, NULL, NULL);
  ```
+ 
+ ## Build and start the scanner
 
 ```console
+docker-compose build
 docker-compose up -d scanner
 ```
 
