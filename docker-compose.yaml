@@ -2,7 +2,9 @@
 services:
   scanner:
     image: scanner
-    env_file: .env
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
     depends_on:
       postgres:
         condition: service_healthy
@@ -11,6 +13,8 @@ services:
       - "8340:8340"
     volumes:
       - log-data:/log
+    networks:
+      - scanner
   postgres:
     image: postgres
     environment:
@@ -26,6 +30,10 @@ services:
       interval: 10s
       timeout: 3s
       retries: 3
+    networks:
+      - scanner
 volumes:
   log-data:
   db-data:
+networks:
+  scanner:
