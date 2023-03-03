@@ -60,6 +60,14 @@ psql postgres://forkscanner:forkscanner@localhost:5432/forkscanner -f scripts/se
 Mirror node is necessary, to check chaintips that are marked as valid-headers, but the node hasn't seen a full block for. We disable p2p on this node
 and submit the full block to it to see if it validates.
 
+The nodes we will be connecting to are:
+
+```sql
+     ('archive', '143.244.138.170', 8332, 'bitcoin', 'Persario_1', true, NULL, NULL),
+    ('archive', '137.184.186.227', 8332, 'bitcoin', 'Persario_1', false, '167.71.141.175', 8332),
+    ('archive', '143.244.136.166', 8332, 'bitcoin', 'Persario_1', false, NULL, NULL);
+ ```
+
 ```console
 docker-compose up -d scanner
 ```
