@@ -6,6 +6,7 @@
 - rust
 - docker, docker-compose
 - nodejs
+- libpq5
 
 ## Components
 
