@@ -3,6 +3,7 @@ i# Forkscanner walk-through
 ## Requirements
 - a laptop
 - git
+- rust
 - docker, docker-compose
 - nodejs
 
@@ -18,12 +19,31 @@ The main component. This runs periodically, fetching chaintip information from b
 ### RPC/websocket
 Runs on top of the scanner, when scanner detects various conditions (e.g. chaintip updates, nodes are lagging behind) it will notify websocket subscribers.
 
+## Set up
+- make sure you have rust installed, with diesel_cli
+- get rust here: https://rustup.rs
+- Install diesel cli tool:
+
+```console
+cargo install diesel_cli --no-default-features --features postgres
+```
+
 ## Get it running
 ```console
 git clone https://github.com/twilight-project/forkscanner.git
 cd forkscanner
-git checkout scanner-walkthrough
-docker
+docker-compose up -d postgres
+```
+
+Run the migrations:
+
+```console
+diesel migration run
+psql postgres://forkscanner:forkscanner@localhost:5432/forkscanner -f scripts/setup.sql
+```
+
+```console
+docker-compose up -d forkscanner
 ```
 
 This should bring up postgres, and then the scanner.

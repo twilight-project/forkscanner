@@ -17,6 +17,8 @@ services:
       POSTGRES_PASSWORD: forkscanner
       POSTGRES_USER: forkscanner
       POSTGRES_DB: forkscanner
+	ports:
+	  - "5432:5432"
     volumes:
       - db-data:/var/lib/postgresql/data
     healthcheck:
