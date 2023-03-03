@@ -48,14 +48,17 @@ psql postgres://forkscanner:forkscanner@localhost:5432/forkscanner -f scripts/se
  (node, rpc_host, rpc_port, rpc_user, rpc_pass, archive, mirror_host, mirror_rpc_port)
  ```
  
- - node a string name for the node
- - rpc_host hostname/IP
- - rpc_port rpc port
- - rpc_user username for btc node
- - rpc_pass password
- - archive boolean, false indicates it's a pruned node
- - mirror_host optional, used for rollback checks
- - mirror_port port number for mirror node
+ - node: a string name for the node
+ - rpc_host: hostname/IP
+ - rpc_port: rpc port
+ - rpc_user: username for btc node
+ - rpc_pass: password
+ - archive: boolean, false indicates it's a pruned node
+ - mirror_host: optional, used for rollback checks
+ - mirror_port: port number for mirror node
+
+Mirror node is necessary, to check chaintips that are marked as valid-headers, but the node hasn't seen a full block for. We disable p2p on this node
+and submit the full block to it to see if it validates.
 
 ```console
 docker-compose up -d scanner
