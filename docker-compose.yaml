@@ -1,0 +1,29 @@
+---
+services:
+  api:
+    image: scanner
+    env_file: .env
+    depends_on:
+      database:
+        condition: service_healthy
+    ports:
+      - "8339:8339"
+      - "8340:8340"
+    volumes:
+      - log-data:/log
+  postgres:
+    image: postgres
+    environment:
+      POSTGRES_PASSWORD: forkscanner
+      POSTGRES_USER: forkscanner
+      POSTGRES_DB: forkscanner
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready", "-d", "relayer", "-U", "relayer"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+volumes:
+  log-data:
+  db-data:

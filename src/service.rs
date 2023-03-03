@@ -362,7 +362,8 @@ fn add_watched_addresses(conn: Conn, params: Params) -> Result<Value> {
                 )
                 .collect();
 
-            if let Err(_) = Watched::insert(&conn, addrs) {
+            if let Err(e) = Watched::insert(&conn, addrs) {
+			    error!("Watched insert {:?}", e);
                 return Err(JsonRpcError::internal_error());
             }
 
