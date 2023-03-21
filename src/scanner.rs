@@ -42,7 +42,7 @@ const STALE_WINDOW: i64 = 100;
 const DOUBLE_SPEND_RANGE: i64 = 30;
 const REACHABLE_CHECK_INTERVAL: i64 = 10;
 const MINER_POOL_INFO: &str =
-    "https://raw.githubusercontent.com/0xB10C/known-mining-pools/master/pools.json";
+    "https://raw.githubusercontent.com/bitcoin-data/mining-pools/generated/pools.json";
 const SATOSHI_TO_BTC: i64 = 100_000_000;
 
 type ForkScannerResult<T> = Result<T, ForkScannerError>;

@@ -533,8 +533,7 @@ We will need to create a new DB table called pool for this. Schema is shared bel
 
 - In the main service for forkscanner, send a get request to below URL to get a json of active pools and save them in DB according to schema provided.
 
-https://raw.githubusercontent.com/0xB10C/known-mining-pools/master/pools.json
-
+https://raw.githubusercontent.com/bitcoin-data/mining-pools/generated/pools.json
 
 ### Perform Calculations.
 
