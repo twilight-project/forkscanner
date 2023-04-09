@@ -232,6 +232,7 @@ pub struct TransactionAddress {
     pub receiving_txid: String,
     pub sending_txid: String,
     pub sending_vout: i64,
+    pub receiving_vout: i64,
     pub sending_amount: i64,
     pub receiving: String,
     pub sending: String,
@@ -253,7 +254,7 @@ impl TransactionAddress {
         conn: &PgConnection,
         block_hash: String,
         block_height: i64,
-        data: Vec<(String, String, Vec<(String, usize, String, i64)>, u64)>,
+        data: Vec<(String, String, Vec<(String, usize, usize, String, i64)>, u64)>,
     ) -> QueryResult<usize> {
         use crate::schema::transaction_addresses::dsl::*;
 
@@ -266,13 +267,14 @@ impl TransactionAddress {
 
                 sender_info
                     .into_iter()
-                    .map(move |(s_txid, s_vout, sender, value)| TransactionAddress {
+                    .map(move |(s_txid, s_vout, r_vout, sender, value)| TransactionAddress {
                         created_at: created.clone(),
                         notified_at: None,
                         block: b_hash.clone(),
                         receiving_txid: id.clone(),
                         sending_txid: s_txid,
                         sending_vout: s_vout as i64,
+                        receiving_vout: r_vout as i64,
                         sending_amount: value,
                         receiving: in_address.clone(),
                         sending: sender,
@@ -1392,6 +1394,7 @@ pub struct Watched {
 pub struct WatchedTransaction {
     pub block: String,
     pub receiving_txid: String,
+	pub receiving_vout: i64,
     pub sending_txinputs: Vec<TxIn>,
     pub receiving: String,
     pub satoshis: i64,
@@ -1478,6 +1481,7 @@ impl Watched {
                 receiving,
                 sending_txid,
                 sending_vout,
+				receiving_vout,
                 sending_amount,
                 sending,
                 satoshis,
@@ -1501,6 +1505,7 @@ impl Watched {
                 .or_insert(WatchedTransaction {
                     block,
                     receiving_txid,
+					receiving_vout,
                     sending_txinputs: vec![txin.clone()],
                     receiving,
                     satoshis,
@@ -1523,6 +1528,7 @@ impl Watched {
                 receiving,
                 sending_txid,
                 sending_vout,
+				receiving_vout,
                 sending_amount,
                 sending,
                 satoshis,
@@ -1546,6 +1552,7 @@ impl Watched {
                 .or_insert(WatchedTransaction {
                     block,
                     receiving_txid,
+					receiving_vout,
                     sending_txinputs: vec![txin.clone()],
                     receiving,
                     satoshis,
