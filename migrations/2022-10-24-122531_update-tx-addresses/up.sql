@@ -9,6 +9,7 @@ CREATE TABLE transaction_addresses (
 	receiving_txid varchar not null,
 	sending_txid varchar not null,
 	sending_vout bigint not null,
+	receiving_vout bigint not null,
 	sending_amount bigint not null,
 	receiving varchar not null,
 	sending varchar not null,

@@ -671,7 +671,7 @@ fn fetch_transactions<BC: BtcClient>(
                 let Vout {
                     script_pub_key: ScriptPubKey { address, hex, .. },
                     value,
-                    ..
+					n,
                 } = out;
 
                 let to_address = address.unwrap_or(hex);
@@ -705,7 +705,7 @@ fn fetch_transactions<BC: BtcClient>(
                     let addr = x.vout[vout].script_pub_key.address.clone().unwrap();
                     let sats = Amount::from_btc(x.vout[vout].value).unwrap().to_sat();
 
-                    inputs.push((txid, vout, addr, sats as i64));
+                    inputs.push((txid, vout, n, addr, sats as i64));
                 }
 
                 tx_addrs.push((
