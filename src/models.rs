@@ -943,6 +943,8 @@ impl Block {
 
         diesel::insert_into(invalid_blocks)
             .values(block)
+			.on_conflict(hash)
+			.do_nothing()
             .execute(conn)
     }
 
