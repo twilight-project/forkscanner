@@ -1007,7 +1007,7 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
 
                     let block = Block::get(&self.db_conn, &hash)?;
 
-                    let rows = Chaintip::set_active_tip(
+                    let tx_from = Chaintip::set_active_tip(
                         &self.db_conn,
                         tip.height as i64,
                         &hash,
@@ -1016,11 +1016,14 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
                     )?;
 
                     Block::set_valid(&self.db_conn, &hash, node.id)?;
-                    changed |= rows > 0;
+                    changed |= tx_from > 0;
                     if self.address_watcher_mode != WatcherMode::None {
-                        if let Err(_) = self.work_tx.send(block.hash.clone()) {
-                            error!("Fetch tx channel closed!");
-                        }
+					    let mut blocks = block.parents(&self.db_conn, block.height - tx_from)?;
+						for block in blocks.drain(..) {
+							if let Err(_) = self.work_tx.send(block.hash) {
+								error!("Fetch tx channel closed!");
+							}
+						}
                     }
                 }
             }

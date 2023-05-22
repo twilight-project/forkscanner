@@ -15,7 +15,7 @@ use crate::schema::{
 };
 use crate::MinerPoolInfo;
 
-const WATCH_WINDOW: i64 = 30;
+const WATCH_WINDOW: i64 = 60;
 const TWO_HOURS: i64 = 7200;
 
 pub fn serde_bigdecimal<S>(decimal: &Option<BigDecimal>, s: S) -> Result<S::Ok, S::Error>
@@ -172,13 +172,14 @@ impl Chaintip {
     }
 
     /// Update or create the active tip entry for a node.
+	/// Returns previous active tip height.
     pub fn set_active_tip(
         conn: &PgConnection,
         block_height: i64,
         hash: &String,
         node_id: i64,
         parent_hash: &Option<String>,
-    ) -> QueryResult<usize> {
+    ) -> QueryResult<i64> {
         use crate::schema::chaintips::dsl::*;
         let tip = chaintips
             .filter(status.eq("active").and(node.eq(node_id)))
@@ -198,20 +199,24 @@ impl Chaintip {
                             height.eq(block_height),
                             parent_chaintip.eq::<Option<i64>>(None),
                         ))
-                        .execute(conn)
+                        .execute(conn)?;
+					Ok(tip.height + 1)
                 } else {
                     Ok(0)
                 }
             }
-            Err(diesel::result::Error::NotFound) => diesel::insert_into(chaintips)
-                .values((
-                    node.eq(node_id),
-                    status.eq("active"),
-                    block.eq(hash),
-                    height.eq(block_height),
-                    parent_block.eq(parent_hash),
-                ))
-                .execute(conn),
+            Err(diesel::result::Error::NotFound) => {
+				diesel::insert_into(chaintips)
+					.values((
+						node.eq(node_id),
+						status.eq("active"),
+						block.eq(hash),
+						height.eq(block_height),
+						parent_block.eq(parent_hash),
+					))
+					.execute(conn)?;
+				Ok(block_height)
+			}
             Err(e) => Err(e),
         }
     }
