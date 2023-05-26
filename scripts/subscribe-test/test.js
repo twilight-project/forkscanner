@@ -2,7 +2,7 @@ const WebSocket = require('websocket').w3cwebsocket;
 
 var subscriptions = {};
 
-const ws = new WebSocket('ws://my-coin-server:8340');
+const ws = new WebSocket('ws://localhost:8340');
 ws.addEventListener('open', () => {
   console.log('Sending request');
 
@@ -64,7 +64,7 @@ ws.addEventListener('open', () => {
               "79e652b17217f6373e75bff99795d968c0869565",
               "dc93087ba95211a518349ef51d391aaf00ac34ba",
           ],
-          watch_until: "2022-09-30T00:00:00",
+          watch_until: "2030-09-30T00:00:00.0Z",
       }
   }));
 });

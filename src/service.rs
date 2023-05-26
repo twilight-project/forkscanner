@@ -15,7 +15,7 @@ use jsonrpc_core::*;
 use jsonrpc_http_server as hts;
 use jsonrpc_pubsub::{PubSubHandler, Session, Sink, Subscriber, SubscriptionId};
 use jsonrpc_ws_server as wss;
-use log::{debug, error, info};
+use log::{debug, error, info, trace};
 use r2d2::PooledConnection;
 use r2d2_diesel::ConnectionManager;
 use rand::Rng;
@@ -780,7 +780,7 @@ fn handle_validation_subscribe(
                 }
                 Ok(_) => {}
                 Err(RecvTimeoutError::Timeout) => {
-                    info!("No chaintip updates");
+                    trace!("No chaintip updates");
                 }
                 Err(e) => {
                     error!("Error! {:?}", e);
@@ -816,7 +816,7 @@ fn handle_watched_addresses(exit: Arc<AtomicBool>, receiver: Receiver<ScannerMes
             }
             Ok(_) => {}
             Err(RecvTimeoutError::Timeout) => {
-                info!("No lagging node updates");
+                trace!("No lagging node updates");
             }
             Err(e) => {
                 error!("Error! {:?}", e);
@@ -853,7 +853,7 @@ fn handle_lagging_nodes_subscribe(
             }
             Ok(_) => {}
             Err(RecvTimeoutError::Timeout) => {
-                info!("No lagging node updates");
+                trace!("No lagging node updates");
             }
             Err(e) => {
                 error!("Error! {:?}", e);
@@ -892,7 +892,7 @@ fn handle_invalid_block_subscribe(
             }
             Ok(_) => {}
             Err(RecvTimeoutError::Timeout) => {
-                info!("No block conflict updates");
+                trace!("No block conflict updates");
             }
             Err(e) => {
                 error!("Error! {:?}", e);
@@ -953,7 +953,7 @@ fn handle_subscribe_forks(
                 }
                 Ok(_) => {}
                 Err(RecvTimeoutError::Timeout) => {
-                    info!("No chaintip updates");
+                    trace!("No chaintip updates");
                 }
                 Err(e) => {
                     error!("Error! {:?}", e);
@@ -1002,7 +1002,7 @@ fn handle_subscribe(
                 }
                 Ok(_) => {}
                 Err(RecvTimeoutError::Timeout) => {
-                    info!("No chaintip updates");
+                    trace!("No chaintip updates");
                 }
                 Err(e) => {
                     error!("Error! {:?}", e);

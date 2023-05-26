@@ -43,7 +43,7 @@ const STALE_WINDOW: i64 = 100;
 const DOUBLE_SPEND_RANGE: i64 = 30;
 const REACHABLE_CHECK_INTERVAL: i64 = 10;
 const MINER_POOL_INFO: &str =
-    "https://raw.githubusercontent.com/0xB10C/known-mining-pools/master/pools.json";
+    "https://raw.githubusercontent.com/bitcoin-data/mining-pools/generated/pools.json";
 const SATOSHI_TO_BTC: i64 = 100_000_000;
 
 type ForkScannerResult<T> = Result<T, ForkScannerError>;
@@ -2535,7 +2535,7 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
             }
         };
 
-        let mut headers_only_blocks = match Block::headers_only(&self.db_conn, tip_height - 40_000)
+        let mut headers_only_blocks = match Block::headers_only(&self.db_conn, tip_height - MAX_ANCESTRY_DEPTH as i64)
         {
             Ok(blocks) if blocks.len() == 0 => return,
             Ok(blocks) => blocks,
