@@ -671,7 +671,7 @@ fn fetch_transactions<BC: BtcClient>(
                 let Vout {
                     script_pub_key: ScriptPubKey { address, hex, .. },
                     value,
-					n,
+                    n,
                 } = out;
 
                 let to_address = address.unwrap_or(hex);
@@ -1018,12 +1018,12 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
                     Block::set_valid(&self.db_conn, &hash, node.id)?;
                     changed |= tx_from > 0;
                     if self.address_watcher_mode != WatcherMode::None {
-					    let mut blocks = block.parents(&self.db_conn, block.height - tx_from)?;
-						for block in blocks.drain(..) {
-							if let Err(_) = self.work_tx.send(block.hash) {
-								error!("Fetch tx channel closed!");
-							}
-						}
+                        let mut blocks = block.parents(&self.db_conn, MAX_BLOCK_DEPTH)?;
+                        for block in blocks.drain(..) {
+                            if let Err(_) = self.work_tx.send(block.hash) {
+                                error!("Fetch tx channel closed!");
+                            }
+                        }
                     }
                 }
             }
@@ -2535,15 +2535,15 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
             }
         };
 
-        let mut headers_only_blocks = match Block::headers_only(&self.db_conn, tip_height - MAX_ANCESTRY_DEPTH as i64)
-        {
-            Ok(blocks) if blocks.len() == 0 => return,
-            Ok(blocks) => blocks,
-            Err(e) => {
-                error!("Header query failed {:?}", e);
-                return;
-            }
-        };
+        let mut headers_only_blocks =
+            match Block::headers_only(&self.db_conn, tip_height - MAX_ANCESTRY_DEPTH as i64) {
+                Ok(blocks) if blocks.len() == 0 => return,
+                Ok(blocks) => blocks,
+                Err(e) => {
+                    error!("Header query failed {:?}", e);
+                    return;
+                }
+            };
 
         info!(
             "There are {} headers only blocks to fetch",

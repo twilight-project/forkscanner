@@ -172,7 +172,7 @@ impl Chaintip {
     }
 
     /// Update or create the active tip entry for a node.
-	/// Returns previous active tip height.
+    /// Returns previous active tip height.
     pub fn set_active_tip(
         conn: &PgConnection,
         block_height: i64,
@@ -200,23 +200,23 @@ impl Chaintip {
                             parent_chaintip.eq::<Option<i64>>(None),
                         ))
                         .execute(conn)?;
-					Ok(tip.height + 1)
+                    Ok(tip.height + 1)
                 } else {
                     Ok(0)
                 }
             }
             Err(diesel::result::Error::NotFound) => {
-				diesel::insert_into(chaintips)
-					.values((
-						node.eq(node_id),
-						status.eq("active"),
-						block.eq(hash),
-						height.eq(block_height),
-						parent_block.eq(parent_hash),
-					))
-					.execute(conn)?;
-				Ok(block_height)
-			}
+                diesel::insert_into(chaintips)
+                    .values((
+                        node.eq(node_id),
+                        status.eq("active"),
+                        block.eq(hash),
+                        height.eq(block_height),
+                        parent_block.eq(parent_hash),
+                    ))
+                    .execute(conn)?;
+                Ok(block_height)
+            }
             Err(e) => Err(e),
         }
     }
@@ -259,7 +259,12 @@ impl TransactionAddress {
         conn: &PgConnection,
         block_hash: String,
         block_height: i64,
-        data: Vec<(String, String, Vec<(String, usize, usize, String, i64)>, u64)>,
+        data: Vec<(
+            String,
+            String,
+            Vec<(String, usize, usize, String, i64)>,
+            u64,
+        )>,
     ) -> QueryResult<usize> {
         use crate::schema::transaction_addresses::dsl::*;
 
@@ -272,20 +277,22 @@ impl TransactionAddress {
 
                 sender_info
                     .into_iter()
-                    .map(move |(s_txid, s_vout, r_vout, sender, value)| TransactionAddress {
-                        created_at: created.clone(),
-                        notified_at: None,
-                        block: b_hash.clone(),
-                        receiving_txid: id.clone(),
-                        sending_txid: s_txid,
-                        sending_vout: s_vout as i64,
-                        receiving_vout: r_vout as i64,
-                        sending_amount: value,
-                        receiving: in_address.clone(),
-                        sending: sender,
-                        satoshis: sats as i64,
-                        height: block_height,
-                    })
+                    .map(
+                        move |(s_txid, s_vout, r_vout, sender, value)| TransactionAddress {
+                            created_at: created.clone(),
+                            notified_at: None,
+                            block: b_hash.clone(),
+                            receiving_txid: id.clone(),
+                            sending_txid: s_txid,
+                            sending_vout: s_vout as i64,
+                            receiving_vout: r_vout as i64,
+                            sending_amount: value,
+                            receiving: in_address.clone(),
+                            sending: sender,
+                            satoshis: sats as i64,
+                            height: block_height,
+                        },
+                    )
             })
             .collect();
 
@@ -948,7 +955,7 @@ impl Block {
 
         diesel::insert_into(invalid_blocks)
             .values(block)
-			.on_conflict_do_nothing()
+            .on_conflict_do_nothing()
             .execute(conn)
     }
 
@@ -1400,7 +1407,7 @@ pub struct Watched {
 pub struct WatchedTransaction {
     pub block: String,
     pub receiving_txid: String,
-	pub receiving_vout: i64,
+    pub receiving_vout: i64,
     pub sending_txinputs: Vec<TxIn>,
     pub receiving: String,
     pub satoshis: i64,
@@ -1487,7 +1494,7 @@ impl Watched {
                 receiving,
                 sending_txid,
                 sending_vout,
-				receiving_vout,
+                receiving_vout,
                 sending_amount,
                 sending,
                 satoshis,
@@ -1511,7 +1518,7 @@ impl Watched {
                 .or_insert(WatchedTransaction {
                     block,
                     receiving_txid,
-					receiving_vout,
+                    receiving_vout,
                     sending_txinputs: vec![txin.clone()],
                     receiving,
                     satoshis,
@@ -1534,7 +1541,7 @@ impl Watched {
                 receiving,
                 sending_txid,
                 sending_vout,
-				receiving_vout,
+                receiving_vout,
                 sending_amount,
                 sending,
                 satoshis,
@@ -1558,7 +1565,7 @@ impl Watched {
                 .or_insert(WatchedTransaction {
                     block,
                     receiving_txid,
-					receiving_vout,
+                    receiving_vout,
                     sending_txinputs: vec![txin.clone()],
                     receiving,
                     satoshis,
@@ -1568,8 +1575,16 @@ impl Watched {
 
         diesel::update(
             tadsl::transaction_addresses
-                .filter(tadsl::receiving.eq(any(&watched)))
-                .or_filter(tadsl::sending.eq(any(&watched))),
+                .filter(
+                    tadsl::receiving
+                        .eq(any(&watched))
+                        .and(tadsl::notified_at.is_null()),
+                )
+                .or_filter(
+                    tadsl::sending
+                        .eq(any(&watched))
+                        .and(tadsl::notified_at.is_null()),
+                ),
         )
         .set(tadsl::notified_at.eq(Utc::now()))
         .execute(conn)?;
