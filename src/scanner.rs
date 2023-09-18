@@ -4,7 +4,7 @@ use crate::{
     TransactionAddress, TxOutset, Watched, WatchedTransaction, WatcherMode,
 };
 use bigdecimal::{BigDecimal, FromPrimitive};
-use bitcoin::{blockdata::block::Header, consensus::encode::serialize_hex, Amount};
+use bitcoin::{BlockHash, blockdata::block::Header, consensus::encode::serialize_hex, Amount};
 use bitcoin_hashes::{sha256d, Hash};
 use bitcoincore_rpc::bitcoin as btc;
 use bitcoincore_rpc::bitcoincore_rpc_json::{

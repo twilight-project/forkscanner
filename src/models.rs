@@ -270,8 +270,6 @@ impl TransactionAddress {
 
         let created = Utc::now();
 
-        use log::debug;
-        debug!("THERE ARE {} being inserting", data.len());
         let tx_addrs: Vec<_> = data
             .into_iter()
             .flat_map(|(id, in_address, sender_info, sats)| {
@@ -298,7 +296,6 @@ impl TransactionAddress {
             })
             .collect();
 
-        debug!("WITH NOM ROEZE AS {:?}", tx_addrs.len());
         for chunk in tx_addrs.as_slice().chunks(8192) {
             let _ = diesel::insert_into(transaction_addresses)
                 .values(chunk)
