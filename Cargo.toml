@@ -7,16 +7,16 @@ edition = "2018"
 
 [dependencies]
 bigdecimal = "0.1.2"
-bitcoin = "0.29"
+bitcoin = { version = "0.30", features = ["serde"] }
 bitcoin_hashes = "0.10"
-bitcoincore-rpc = "0.16"
+bitcoincore-rpc = "0.17"
 chrono = { version = "0.4", features = ["serde"] }
 counter = "0.5"
 crossbeam = "0.8"
 diesel = { version = "1.4", features = ["chrono", "numeric", "postgres"] }
 dotenv = "0.15"
 hex = "0.4"
-jsonrpc = "0.12"
+jsonrpc = { version = "0.14", features = ["simple_http"] }
 jsonrpc-core = "18.0" #{ path = "../jsonrpc/core" }
 jsonrpc-pubsub = "18.0" #{ path = "../jsonrpc/pubsub" }
 jsonrpc-http-server = "18.0" #{ path = "../jsonrpc/http" }
@@ -36,3 +36,4 @@ tracing-appender = "0.2"
 tracing-log = { version = "0.1", features = ["env_logger"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ureq = "2.4"
+env_logger = "0.10.0"

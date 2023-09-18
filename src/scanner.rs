@@ -4,14 +4,14 @@ use crate::{
     TransactionAddress, TxOutset, Watched, WatchedTransaction, WatcherMode,
 };
 use bigdecimal::{BigDecimal, FromPrimitive};
-use bitcoin::{consensus::encode::serialize_hex, util::amount::Amount};
+use bitcoin::{blockdata::block::Header, consensus::encode::serialize_hex, Amount};
 use bitcoin_hashes::{sha256d, Hash};
 use bitcoincore_rpc::bitcoin as btc;
 use bitcoincore_rpc::bitcoincore_rpc_json::{
     GetBlockHeaderResult, GetBlockResult, GetBlockTemplateCapabilities, GetBlockTemplateModes,
     GetBlockTemplateResult, GetBlockTemplateRules, GetBlockchainInfoResult,
-    GetChainTipsResultStatus, GetChainTipsResultTip, GetPeerInfoResultConnectionType,
-    GetPeerInfoResultNetwork, GetRawTransactionResult, GetTxOutSetInfoResult,
+    GetChainTipsResultStatus, GetChainTipsResultTip, GetPeerInfoResult,
+    GetRawTransactionResult, GetTxOutSetInfoResult,
 };
 use bitcoincore_rpc::Error as BitcoinRpcError;
 use bitcoincore_rpc::{Auth, Client, RpcApi};
@@ -82,120 +82,77 @@ pub enum ScannerCommand {
 #[allow(dead_code)]
 #[serde(rename_all = "camelCase")]
 pub struct FullBlock {
-    bits: serde_json::Value,
-    chainwork: serde_json::Value,
-    confirmations: serde_json::Value,
-    difficulty: serde_json::Value,
-    hash: serde_json::Value,
-    height: i64,
-    mediantime: serde_json::Value,
-    merkleroot: serde_json::Value,
-    n_tx: serde_json::Value,
-    nonce: serde_json::Value,
-    previousblockhash: serde_json::Value,
-    size: serde_json::Value,
-    strippedsize: serde_json::Value,
-    time: serde_json::Value,
-    tx: Vec<JsonTransaction>,
-    version: serde_json::Value,
-    version_hex: serde_json::Value,
-    weight: serde_json::Value,
+    pub bits: serde_json::Value,
+    pub chainwork: serde_json::Value,
+    pub confirmations: serde_json::Value,
+    pub difficulty: serde_json::Value,
+    pub hash: serde_json::Value,
+    pub height: i64,
+    pub mediantime: serde_json::Value,
+    pub merkleroot: serde_json::Value,
+    pub n_tx: serde_json::Value,
+    pub nonce: serde_json::Value,
+    pub previousblockhash: serde_json::Value,
+    pub size: serde_json::Value,
+    pub strippedsize: serde_json::Value,
+    pub time: serde_json::Value,
+    pub tx: Vec<JsonTransaction>,
+    pub version: serde_json::Value,
+    pub version_hex: serde_json::Value,
+    pub weight: serde_json::Value,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 #[allow(unused)]
 pub struct JsonTransaction {
-    hash: String,
-    hex: Option<String>,
-    locktime: usize,
-    size: usize,
-    txid: String,
-    version: usize,
-    vin: Vec<Vin>,
-    vout: Vec<Vout>,
-    vsize: usize,
-    weight: usize,
+    pub hash: String,
+    pub hex: Option<String>,
+    pub locktime: usize,
+    pub size: usize,
+    pub txid: String,
+    pub version: usize,
+    pub vin: Vec<Vin>,
+    pub vout: Vec<Vout>,
+    pub vsize: usize,
+    pub weight: usize,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[allow(unused)]
 pub struct Vin {
-    txid: Option<String>,
-    vout: Option<usize>,
-    script_sig: Option<ScriptSig>,
-    sequence: usize,
-    txinwitness: Option<Vec<String>>,
+    pub txid: Option<String>,
+    pub vout: Option<usize>,
+    pub script_sig: Option<ScriptSig>,
+    pub sequence: usize,
+    pub txinwitness: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[allow(unused)]
 pub struct Vout {
-    value: f64,
-    n: usize,
-    script_pub_key: ScriptPubKey,
+    pub value: f64,
+    pub n: usize,
+    pub script_pub_key: ScriptPubKey,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 #[allow(unused)]
 pub struct ScriptSig {
-    asm: String,
-    hex: String,
+    pub asm: String,
+    pub hex: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[allow(unused)]
 pub struct ScriptPubKey {
-    asm: String,
-    hex: String,
-    req_sigs: Option<usize>,
-    r#type: String,
-    address: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[allow(unused)]
-pub struct PeerInfo {
-    pub id: u64,
-    pub addr: String,
-    pub addrbind: String,
-    pub addrlocal: Option<String>,
-    pub network: Option<GetPeerInfoResultNetwork>,
-    pub services: String,
-    pub relaytxes: bool,
-    pub lastsend: u64,
-    pub lastrecv: u64,
-    pub last_transaction: Option<u64>,
-    pub last_block: Option<u64>,
-    pub bytessent: u64,
-    pub bytesrecv: u64,
-    pub conntime: u64,
-    pub timeoffset: i64,
-    pub pingtime: Option<f64>,
-    pub minping: Option<f64>,
-    pub pingwait: Option<f64>,
-    pub version: u64,
-    pub subver: String,
-    pub inbound: bool,
-    pub addnode: Option<bool>,
-    pub startingheight: Option<i64>,
-    pub banscore: Option<i64>,
-    pub synced_headers: Option<i64>,
-    pub synced_blocks: Option<i64>,
-    pub inflight: Option<Vec<u64>>,
-    pub whitelisted: Option<bool>,
-    #[serde(
-        rename = "minfeefilter",
-        default,
-        with = "bitcoin::util::amount::serde::as_btc::opt"
-    )]
-    pub min_fee_filter: Option<Amount>,
-    pub bytessent_per_msg: Option<HashMap<String, u64>>,
-    pub bytesrecv_per_msg: Option<HashMap<String, u64>>,
-    pub connection_type: Option<GetPeerInfoResultConnectionType>,
+    pub asm: String,
+    pub hex: String,
+    pub req_sigs: Option<usize>,
+    pub r#type: String,
+    pub address: Option<String>,
 }
 
 /// Trait defining interface to bitcoin RPC API
@@ -213,7 +170,7 @@ pub trait BtcClient: Sized {
     fn get_block_header(
         &self,
         hash: &btc::BlockHash,
-    ) -> Result<btc::BlockHeader, bitcoincore_rpc::Error>;
+    ) -> Result<Header, bitcoincore_rpc::Error>;
     fn get_block_info(
         &self,
         hash: &btc::BlockHash,
@@ -231,7 +188,7 @@ pub trait BtcClient: Sized {
     ) -> Result<GetBlockHeaderResult, bitcoincore_rpc::Error>;
     fn get_block(&self, hash: &btc::BlockHash) -> Result<btc::Block, bitcoincore_rpc::Error>;
     fn get_block_hex(&self, hash: &btc::BlockHash) -> Result<String, bitcoincore_rpc::Error>;
-    fn get_peer_info(&self) -> Result<Vec<PeerInfo>, bitcoincore_rpc::Error>;
+    fn get_peer_info(&self) -> Result<Vec<GetPeerInfoResult>, bitcoincore_rpc::Error>;
     fn get_transaction(&self, txid: &String) -> Result<JsonTransaction, bitcoincore_rpc::Error>;
     fn get_raw_transaction_info<'a>(
         &self,
@@ -285,7 +242,7 @@ impl BtcClient for Client {
     fn get_block_header(
         &self,
         hash: &btc::BlockHash,
-    ) -> Result<btc::BlockHeader, bitcoincore_rpc::Error> {
+    ) -> Result<Header, bitcoincore_rpc::Error> {
         RpcApi::get_block_header(self, hash)
     }
 
@@ -331,7 +288,7 @@ impl BtcClient for Client {
         RpcApi::get_block_hex(self, hash)
     }
 
-    fn get_peer_info(&self) -> Result<Vec<PeerInfo>, bitcoincore_rpc::Error> {
+    fn get_peer_info(&self) -> Result<Vec<GetPeerInfoResult>, bitcoincore_rpc::Error> {
         RpcApi::call(self, "getpeerinfo", &[])
     }
 
@@ -447,7 +404,11 @@ fn create_block_and_ancestors<BC: BtcClient>(
 
             let hash_bytes: Vec<u8> = once(coinbase_tx)
                 .chain(rest_txs.iter())
-                .flat_map(|tx| tx.as_hash().as_ref().to_vec())
+                .flat_map(|tx| {
+                    let hash = tx.to_raw_hash();
+                    let r: &[u8] = hash.as_ref();
+                    r.to_vec()
+                })
                 .collect();
 
             if coinbase_info.vin.len() == 0 {
@@ -647,12 +608,27 @@ fn fetch_transactions<BC: BtcClient>(
         }
     };
 
+    let bh = match node.get_block_header_info(&BlockHash::from_str(block_hash).expect("Bad hash")) {
+        Ok(h) => h,
+        Err(e) => {
+            error!("Header info error {:?}", e);
+            return;
+        }
+    };
+
+    if let Err(e) = Block::get_or_create(db_conn, false, -1, &bh) {
+        error!("Failed inserting header info to db {:?}", e);
+        return;
+    }
+
     let mut tx_addrs = Vec::new();
     let num_txs = block_info.tx.len();
 
     info!("Fetching transactions for {}", block_hash);
     for (idx, tx) in block_info.tx.into_iter().enumerate() {
-        trace!("Fetching {} of {} txs", idx, num_txs);
+        if idx % 100 == 0 {
+            trace!("Fetching {} of {} txs", idx, num_txs);
+        }
 
         let JsonTransaction {
             hex,
@@ -666,6 +642,14 @@ fn fetch_transactions<BC: BtcClient>(
 
         if fetch_inputs {
             let mut cache = HashMap::new();
+            let out_addrs: HashSet<_> = vout.iter().map(|out| {
+                out.script_pub_key.address.clone().unwrap_or_default()
+            }).collect();
+
+            if watchlist.intersection(&out_addrs).count() == 0 {
+                debug!("No watched addrs in this tx: {:?}", txid);
+                continue;
+            }
 
             for out in vout {
                 let Vout {
@@ -675,10 +659,6 @@ fn fetch_transactions<BC: BtcClient>(
                 } = out;
 
                 let to_address = address.unwrap_or(hex);
-
-                if !watchlist.contains(&to_address) {
-                    continue;
-                }
 
                 let mut inputs = Vec::with_capacity(vin.len());
 
@@ -729,7 +709,7 @@ fn fetch_transactions<BC: BtcClient>(
             error!("Could not insert transaction {:?}", e);
         }
     }
-    trace!("inserting {} txs", tx_addrs.len());
+    debug!("inserting {} txs", tx_addrs.len());
 
     if let Err(e) =
         TransactionAddress::insert(db_conn, block_hash.clone(), block_info.height, tx_addrs)
@@ -907,7 +887,11 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
                 let tx_ids = template
                     .transactions
                     .iter()
-                    .flat_map(|tx| tx.txid.as_hash().as_ref().to_vec())
+                    .flat_map(|tx| {
+                        let hash = tx.txid.to_raw_hash();
+                        let r: &[u8] = hash.as_ref();
+                        r.to_vec()
+                    })
                     .collect();
                 let rates = template
                     .transactions
