@@ -24,7 +24,7 @@ fn main() {
     dotenv::dotenv().expect("Failed loading dotenv");
 
     let log_dir = std::env::var("LOG_DIR").map_or("/var/log".to_string(), |v| v);
-    let file_appender = tracing_appender::rolling::hourly(log_dir, "forkscanner.log").rolling(FixedWindowRoller::builder().build("forkscanner.log", 5).unwrap());
+    let file_appender = tracing_appender::rolling::hourly(log_dir, "forkscanner.log");
     tracing_subscriber::fmt::Subscriber::builder()
         .with_writer(file_appender)
         .with_env_filter(tracing_subscriber::filter::EnvFilter::from_default_env())
