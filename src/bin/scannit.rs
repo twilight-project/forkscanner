@@ -1,8 +1,10 @@
-use bitcoincore_rpc::Client;
 use bitcoin::{Amount, BlockHash};
-use diesel::Connection;
+use bitcoincore_rpc::Client;
 use diesel::prelude::PgConnection;
-use forkscanner::{Block, BtcClient, JsonTransaction, ScriptPubKey, Transaction, TransactionAddress, Vout, Watched};
+use diesel::Connection;
+use forkscanner::{
+    Block, BtcClient, JsonTransaction, ScriptPubKey, Transaction, TransactionAddress, Vout, Watched,
+};
 use jsonrpc::simple_http::SimpleHttpTransport;
 use log::{debug, error, info, trace};
 use std::{
@@ -111,9 +113,10 @@ fn fetch_transactions<BC: BtcClient>(
 
         if fetch_inputs {
             let mut cache = HashMap::new();
-            let out_addrs: HashSet<_> = vout.iter().map(|out| {
-                out.script_pub_key.address.clone().unwrap_or_default()
-            }).collect();
+            let out_addrs: HashSet<_> = vout
+                .iter()
+                .map(|out| out.script_pub_key.address.clone().unwrap_or_default())
+                .collect();
 
             if watchlist.intersection(&out_addrs).count() == 0 {
                 trace!("No watched addrs in this tx {:?}", txid);

@@ -3,6 +3,11 @@ use forkscanner::run_server;
 use forkscanner::{ForkScanner, WatcherMode};
 use log::info;
 use structopt::StructOpt;
+use tracing_rolling_file::base::*;
+use tracing_rolling_file::RollingFileAppender;
+
+const MAX_FILE_COUNT: usize = 12;
+const MAX_FILE_SIZE: u64 = 50 * 1024 * 1024;
 
 #[derive(Debug, StructOpt)]
 #[structopt(name = "forkscanner", about = "A Bitcoin fork monitor.")]
@@ -23,10 +28,18 @@ struct Opt {
 fn main() {
     dotenv::dotenv().expect("Failed loading dotenv");
 
-    let log_dir = std::env::var("LOG_DIR").map_or("/var/log".to_string(), |v| v);
-    let file_appender = tracing_appender::rolling::hourly(log_dir, "forkscanner.log");
+    fn make_appender() -> RollingFileAppender<tracing_rolling_file::RollingConditionBase> {
+        let log_prefix = std::env::var("LOG_PREFIX").map_or("/var/log/forkscanner".to_string(), |v| v);
+        RollingFileAppenderBase::new(
+            log_prefix,
+            RollingConditionBase::new().hourly().max_size(MAX_FILE_SIZE),
+            MAX_FILE_COUNT,
+        )
+        .expect("Could not create file appender")
+    }
+
     tracing_subscriber::fmt::Subscriber::builder()
-        .with_writer(file_appender)
+        .with_writer(make_appender)
         .with_env_filter(tracing_subscriber::filter::EnvFilter::from_default_env())
         .with_ansi(false)
         .with_level(true)

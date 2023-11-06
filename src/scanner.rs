@@ -4,14 +4,14 @@ use crate::{
     TransactionAddress, TxOutset, Watched, WatchedTransaction, WatcherMode,
 };
 use bigdecimal::{BigDecimal, FromPrimitive};
-use bitcoin::{BlockHash, blockdata::block::Header, consensus::encode::serialize_hex, Amount};
+use bitcoin::{blockdata::block::Header, consensus::encode::serialize_hex, Amount, BlockHash};
 use bitcoin_hashes::{sha256d, Hash};
 use bitcoincore_rpc::bitcoin as btc;
 use bitcoincore_rpc::bitcoincore_rpc_json::{
     GetBlockHeaderResult, GetBlockResult, GetBlockTemplateCapabilities, GetBlockTemplateModes,
     GetBlockTemplateResult, GetBlockTemplateRules, GetBlockchainInfoResult,
-    GetChainTipsResultStatus, GetChainTipsResultTip, GetPeerInfoResult,
-    GetRawTransactionResult, GetTxOutSetInfoResult,
+    GetChainTipsResultStatus, GetChainTipsResultTip, GetPeerInfoResult, GetRawTransactionResult,
+    GetTxOutSetInfoResult,
 };
 use bitcoincore_rpc::Error as BitcoinRpcError;
 use bitcoincore_rpc::{Auth, Client, RpcApi};
@@ -167,10 +167,7 @@ pub trait BtcClient: Sized {
         hash: String,
         id: u64,
     ) -> Result<serde_json::Value, bitcoincore_rpc::Error>;
-    fn get_block_header(
-        &self,
-        hash: &btc::BlockHash,
-    ) -> Result<Header, bitcoincore_rpc::Error>;
+    fn get_block_header(&self, hash: &btc::BlockHash) -> Result<Header, bitcoincore_rpc::Error>;
     fn get_block_info(
         &self,
         hash: &btc::BlockHash,
@@ -239,10 +236,7 @@ impl BtcClient for Client {
         )
     }
 
-    fn get_block_header(
-        &self,
-        hash: &btc::BlockHash,
-    ) -> Result<Header, bitcoincore_rpc::Error> {
+    fn get_block_header(&self, hash: &btc::BlockHash) -> Result<Header, bitcoincore_rpc::Error> {
         RpcApi::get_block_header(self, hash)
     }
 
@@ -641,9 +635,10 @@ fn fetch_transactions<BC: BtcClient>(
 
         if fetch_inputs {
             let mut cache = HashMap::new();
-            let out_addrs: HashSet<_> = vout.iter().map(|out| {
-                out.script_pub_key.address.clone().unwrap_or_default()
-            }).collect();
+            let out_addrs: HashSet<_> = vout
+                .iter()
+                .map(|out| out.script_pub_key.address.clone().unwrap_or_default())
+                .collect();
 
             if watchlist.intersection(&out_addrs).count() == 0 {
                 debug!("No watched addrs in this tx: {:?}", txid);

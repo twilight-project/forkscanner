@@ -37,3 +37,4 @@ tracing-log = { version = "0.1", features = ["env_logger"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ureq = "2.4"
 env_logger = "0.10.0"
+tracing-rolling-file = "0.1.2"
