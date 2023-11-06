@@ -624,7 +624,6 @@ fn fetch_transactions<BC: BtcClient>(
     let mut tx_addrs = Vec::new();
     let num_txs = block_info.tx.len();
 
-    info!("Fetching transactions for {}", block_hash);
     for (idx, tx) in block_info.tx.into_iter().enumerate() {
         if idx % 100 == 0 {
             trace!("Fetching {} of {} txs", idx, num_txs);
@@ -849,7 +848,6 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
                 let db_conn = PgConnection::establish(&url).expect("Connection failed");
 
                 while let Ok(msg) = rx.recv() {
-                    info!("Running fetch transactions for: {}", msg);
                     fetch_transactions(node.client(), &db_conn, &msg, true);
                 }
             });
@@ -874,7 +872,6 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
 
     // fetch block templates and calculate fee rates.
     fn fetch_block_templates(&self, client: &BC, node: &Node) {
-        info!("Block templates from {}", node.id);
         match client.get_block_template(
             GetBlockTemplateModes::Template,
             &[GetBlockTemplateRules::SegWit],
@@ -928,7 +925,6 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
         let tips = client.get_chain_tips()?;
 
         let mut changed = false;
-        info!("Node {} has {} chaintips to process", node.id, tips.len());
         for tip in tips {
             let hash = tip.hash.to_string();
 
@@ -1328,7 +1324,6 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
             }
 
             if let Ok(info) = client.client().get_blockchain_info() {
-                info!("Got blockchain info");
                 if let Err(e) =
                     SoftForks::update_or_insert(&self.db_conn, client.node_id, info.softforks)
                 {
@@ -1395,7 +1390,6 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
         }
 
         // get min height block template, and blocks with no fee diffs yet.
-        info!("Fecthing block templates");
         match BlockTemplate::get_min(&self.db_conn) {
             Ok(Some(min_template)) => {
                 if let Ok(blocks) = Block::get_with_fee_no_diffs(&self.db_conn, min_template) {
@@ -1552,7 +1546,6 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
             }
         };
 
-        info!("Checking mirror node reachability");
         for mut mirror in mirrors {
             if let Some(_ts) = mirror.mirror_unreachable_since {
                 let last_poll = mirror.mirror_last_polled.expect("No last_polled");
@@ -1592,7 +1585,6 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
             }
         };
 
-        info!("Inflation checks for {} nodes", mirrors.len());
         mirrors.par_iter().for_each(|mirror| {
             let host = format!(
                 "http://{}:{}",
@@ -1819,7 +1811,6 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
     }
 
     fn process_stale_candidates(&self) {
-        info!("Processing stale candidates");
         // Find top 3.
         let candidates = match StaleCandidate::top_n(&self.db_conn, 3) {
             Ok(c) => c,
@@ -2231,7 +2222,6 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
 
     // find blocks at same height, within a window, and mark them as possibly stale.
     fn find_stale_candidates(&self) {
-        info!("Stale candidate checks");
         let tip_height = match Block::max_height(&self.db_conn) {
             Ok(Some(tip)) => tip,
             _ => return,
@@ -2272,7 +2262,6 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
     // off p2p on this node so the state doesn't change underneath us. Then, if the switch to new
     // chaintip is successful, we check if it would've been a valid tip.
     fn rollback_checks(&self) {
-        info!("Running rollback checks");
         for node in self.clients.iter().filter(|c| c.mirror().is_some()) {
             let mirror = node.mirror().as_ref().unwrap();
             let chaintips = match mirror.get_chain_tips() {

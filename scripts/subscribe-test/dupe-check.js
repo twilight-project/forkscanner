@@ -2,7 +2,7 @@ const WebSocket = require('websocket').w3cwebsocket;
 
 var subscriptions = {}; 
 
-const ws = new WebSocket('ws://66.42.108.221:8340');
+const ws = new WebSocket('ws://localhost:8340');
 ws.addEventListener('open', () => {
   console.log('Sending request');
 
@@ -11,8 +11,10 @@ ws.addEventListener('open', () => {
       id: "watched_address_checks",
       method: "watched_address_checks",
       params: {
-          watch: [ ],
-          watch_until: "2022-09-30T00:00:00Z",
+          watch: [
+              "bcrt1qsexvm8leel8afr3x66pzp6hdweuueqe56yq238"
+          ],
+          watch_until: "2030-09-30T00:00:00Z",
       }   
   }));
 });
@@ -47,16 +49,17 @@ ws.addEventListener('message', (message) => {
           console.log(`Got watched address method`);
           let pras = new Set();
 
-          for (let p of obj.params) {
-              let f = `${p.block}-${p.txid}-${p.sending}-${p.receiving}-${p.satoshis}`;
-              console.log(`KEY: ${f}`);
+console.log(JSON.stringify(obj));
+          //for (let p of obj.params) {
+          //    let f = `${p.block}-${p.txid}-${p.sending}-${p.receiving}-${p.satoshis}`;
+          //    console.log(`KEY: ${f}`);
 
-              if (pras.has(f)) {
-                  console.log(`DUPE FOUND! ${f}`);
-              } else {
-                  pras.add(f);
-              }
-          }
+          //    if (pras.has(f)) {
+          //        console.log(`DUPE FOUND! ${f}`);
+          //    } else {
+          //        pras.add(f);
+          //    }
+          //}
       }
   }
 });

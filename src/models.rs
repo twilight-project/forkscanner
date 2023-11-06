@@ -1486,7 +1486,8 @@ impl Watched {
             )
             .load(conn)?;
 
-        let mut addrs: HashMap<String, WatchedTransaction> = HashMap::new();
+        // recv_address -> receiving_txid -> TxInfo
+        let mut addrs: HashMap<String, HashMap<String, WatchedTransaction>> = HashMap::new();
 
         for addr in recv_addrs.drain(..) {
             let TransactionAddress {
@@ -1511,6 +1512,8 @@ impl Watched {
 
             addrs
                 .entry(receiving.clone())
+                .or_default()
+                .entry(receiving_txid.clone())
                 .and_modify(|e| {
                     // txid, vout, amount, addr
                     e.sending_txinputs.push(txin.clone());
@@ -1558,6 +1561,8 @@ impl Watched {
 
             addrs
                 .entry(receiving.clone())
+                .or_default()
+                .entry(receiving_txid.clone())
                 .and_modify(|e| {
                     // txid, vout, amount, addr
                     e.sending_txinputs.push(txin.clone());
@@ -1589,7 +1594,12 @@ impl Watched {
         .set(tadsl::notified_at.eq(Utc::now()))
         .execute(conn)?;
 
-        Ok(addrs.into_values().collect())
+        let result: Vec<_> = addrs
+            .into_values()
+            .flat_map(|val| val.into_values().collect::<Vec<_>>())
+            .collect();
+
+        Ok(result)
     }
 }
 
