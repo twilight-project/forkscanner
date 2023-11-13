@@ -35,7 +35,7 @@ use thiserror::Error;
 use threadpool::ThreadPool;
 
 const N_WORKERS: usize = 1;
-const MAX_ANCESTRY_DEPTH: usize = 100;
+const MAX_ANCESTRY_DEPTH: usize = 25;
 const MAX_BLOCK_DEPTH: i64 = 10;
 const BLOCK_NOT_FOUND: i32 = -5;
 const BLOCK_NOT_ON_DISK: i32 = -1;
@@ -1213,6 +1213,7 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
     // for new blocks, and fetch ancestors up to MAX_BLOCK_HEIGHT postgres
     // will do the rest for us.
     pub fn run(&self) {
+        let total_start = std::time::Instant::now();
         // Clear expired watch entries
         if let Err(e) = Watched::clear(&self.db_conn) {
             error!("Watchlist query error {:?}", e);
@@ -1298,6 +1299,7 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
             }
         }
 
+        let start = std::time::Instant::now();
         let mut changed = false;
         for (client, node) in self.clients.iter().zip(&self.node_list) {
             if let Ok(peers) = client.client().get_peer_info() {
@@ -1343,6 +1345,7 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
                 }
             };
         }
+        info!("Init client loop takes {} secs", start.elapsed().as_secs());
 
         // We have up to date chaintips, check for lags
         let lags = self.lag_checks();
@@ -1518,18 +1521,21 @@ impl<BC: BtcClient + std::fmt::Debug> ForkScanner<BC> {
             }
         }
 
+        let start = std::time::Instant::now();
         // Now try to fill in missing blocks,
         // check inflation, do rollbacks, and stale candidates.
         self.find_missing_blocks();
         self.inflation_checks();
         self.rollback_checks();
         self.find_stale_candidates();
+        info!("Rollback checks, inflation checks, etc. took {} secs", start.elapsed().as_secs());
 
         // for 3 most recent stale candidates...
         self.process_stale_candidates();
         self.notify_tx
             .send(ScannerMessage::StaleCandidateUpdate)
             .expect("Channel closed");
+        info!("End of run, took {} secs", total_start.elapsed().as_secs());
     }
 
     fn inflation_checks(&self) {
