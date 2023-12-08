@@ -381,11 +381,36 @@ Response:
 }
 ```
 
-`update_watched_addresses`:
+`add_watched_addresses`:
 
 POST
 ```json
-  { "remove": ["cdef9ae998abe7d1c287d741ab9007de848294c0"], "add": [] }
+  {
+    "add": [
+      { "address": "cdef9ae998abe7d1c287d741ab9007de848294c0", "watch_until": "2030-09-30T00:00:00.0Z" },
+      { "address": "db0bda0eed1402f76e4a34602928e3ad8238394c", "watch_until": "2030-09-30T00:00:00.0Z" },
+
+    ]
+  }
+```
+
+Response:
+```json
+{
+  "jsonrpc": "2.0",
+  "result": [
+    "OK"
+  ],
+  "id": 1
+}
+```
+
+
+`remove_watched_addresses`:
+
+POST
+```json
+  { "remove": ["cdef9ae998abe7d1c287d741ab9007de848294c0", "db0bda0eed1402f76e4a34602928e3ad8238394c"] }
 ```
 
 Response:
