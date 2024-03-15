@@ -33,6 +33,11 @@ Initialize the database with diesel migrations tool:
 This needs to be run on a node with bitcoin running.
 `cargo run`
 
+## Build and run For Prod
+run the below command.
+`cargo build --release`
+`<path to the repo>/target/release/forkscanner -a all`
+
 ## RPC endpoints
 ```
 - `get_tips`: params { active_only: bool }
